@@ -86,6 +86,7 @@ beaconctl listen                             # provision the companion's channel
 | Command | What it does |
 |---|---|
 | `channel generate [--force]` | Create the report channel key. Refuses to replace an existing key without `--force`, since every repeater would need updating. |
+| `channel set <hex\|->` `[--force]` | Store a predetermined key (32 hex characters), for example one the repeaters already use. `-` reads it from stdin to keep it out of shell history. Needs `--force` to replace a different existing key. |
 | `channel show` | Print the key again, for provisioning another repeater. |
 | `listen [--port P] [--json] [--count N]` | Connect to the companion, set up the channel, drain its queue and print one line per observation. Entries drained right after connecting are marked `late`. |
 | `simulate [--interval S] [--beacons N] [--repeaters N]` | Run a fake companion on a pseudo-terminal with synthetic reports. Run `beaconctl listen --port <printed path>` in another terminal. |

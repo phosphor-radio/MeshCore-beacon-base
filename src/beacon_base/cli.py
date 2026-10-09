@@ -13,7 +13,7 @@ import sys
 import threading
 
 from . import __version__, wire
-from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, store_channel_key
+from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
 from .ingest import CompanionSession, ConnectionInfo, Handler, ReceivedReport
 from .link import CompanionError
 
@@ -97,6 +97,17 @@ def cmd_channel_generate(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_channel_set(args: argparse.Namespace, cfg: Config) -> int:
+    text = sys.stdin.readline() if args.key == "-" else args.key
+    key = parse_channel_key(text)
+    if cfg.channel_key == key:
+        print(f"{cfg.secrets_path} already holds this key")
+        return 0
+    path = store_channel_key(cfg, key, force=args.force)
+    print(f"saved to {path} (mode 0600)")
+    return 0
+
+
 def cmd_channel_show(args: argparse.Namespace, cfg: Config) -> int:
     if cfg.channel_key is None:
         raise ConfigError("no report channel key; run 'beaconctl channel generate' first")
@@ -140,6 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
     gen = channel.add_parser("generate", help="create a new random channel key")
     gen.add_argument("--force", action="store_true", help="replace an existing key (every repeater must be updated)")
     gen.set_defaults(func=cmd_channel_generate)
+    setk = channel.add_parser("set", help="store a predetermined channel key, for example one already on the repeaters")
+    setk.add_argument("key", help="32 hex characters (16 bytes), or - to read it from stdin and keep it out of shell history")
+    setk.add_argument("--force", action="store_true", help="replace an existing key (every repeater must be updated)")
+    setk.set_defaults(func=cmd_channel_set)
     show = channel.add_parser("show", help="print the channel key, for provisioning a repeater")
     show.set_defaults(func=cmd_channel_show)
 

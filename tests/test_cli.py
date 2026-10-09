@@ -51,6 +51,53 @@ def test_channel_generate_refuses_to_replace(cfg_file, capsys):
     assert capsys.readouterr().out != before
 
 
+KEY = "000102030405060708090a0b0c0d0e0f"
+
+
+def test_channel_set_stores_key_privately(cfg_file, tmp_path, capsys):
+    assert main(["-c", cfg_file, "channel", "set", KEY]) == 0
+    assert stat.S_IMODE((tmp_path / "secrets.toml").stat().st_mode) == 0o600
+    capsys.readouterr()
+    assert main(["-c", cfg_file, "channel", "show"]) == 0
+    assert capsys.readouterr().out.strip() == KEY
+
+
+def test_channel_set_requires_force_to_overwrite(cfg_file, capsys):
+    other = "ff" * 16
+    assert main(["-c", cfg_file, "channel", "set", KEY]) == 0
+    capsys.readouterr()
+    assert main(["-c", cfg_file, "channel", "set", other]) == 2
+    assert "--force" in capsys.readouterr().err
+    main(["-c", cfg_file, "channel", "show"])
+    assert capsys.readouterr().out.strip() == KEY
+    assert main(["-c", cfg_file, "channel", "set", other, "--force"]) == 0
+    capsys.readouterr()
+    main(["-c", cfg_file, "channel", "show"])
+    assert capsys.readouterr().out.strip() == other
+
+
+def test_channel_set_same_key_is_not_an_overwrite(cfg_file, capsys):
+    assert main(["-c", cfg_file, "channel", "set", KEY]) == 0
+    assert main(["-c", cfg_file, "channel", "set", KEY]) == 0
+    assert "already holds" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["zz", "00", "00" * 32, ""])
+def test_channel_set_rejects_bad_keys(cfg_file, tmp_path, capsys, bad):
+    assert main(["-c", cfg_file, "channel", "set", bad]) == 2
+    assert not (tmp_path / "secrets.toml").exists()
+
+
+def test_channel_set_reads_stdin(cfg_file, monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(KEY + "\n"))
+    assert main(["-c", cfg_file, "channel", "set", "-"]) == 0
+    capsys.readouterr()
+    main(["-c", cfg_file, "channel", "show"])
+    assert capsys.readouterr().out.strip() == KEY
+
+
 def test_show_without_key_fails(cfg_file, capsys):
     assert main(["-c", cfg_file, "channel", "show"]) == 2
     assert "channel generate" in capsys.readouterr().err
