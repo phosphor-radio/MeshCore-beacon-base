@@ -1,0 +1,48 @@
+{
+  "format": "beacon_report",
+  "version": 1,
+  "constants": {
+    "data_type": 65470,
+    "id_len": 8,
+    "header_len": 10,
+    "entry_len": 16,
+    "max_entries": 9,
+    "max_group_data_length": 165
+  },
+  "repeater_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "repeater_id": "0001020304050607",
+  "reports": [
+    {"name": "single_entry", "hex": "01000102030405060701a0a1a2a3a4a5a6a7010000009feb930f", "observations": [
+      {"beacon_id": "a0a1a2a3a4a5a6a7", "counter": 1, "rssi": -97, "snr": -21, "batt_mv": 3987}
+    ]},
+    {"name": "extremes", "hex": "010001020304050607021122334455667788ffffffff807fffff99aabbccddeeff00000000007f800000", "observations": [
+      {"beacon_id": "1122334455667788", "counter": 4294967295, "rssi": -128, "snr": 127, "batt_mv": 65535},
+      {"beacon_id": "99aabbccddeeff00", "counter": 0, "rssi": 127, "snr": -128, "batt_mv": 0}
+    ]},
+    {"name": "counter_byte_order", "hex": "0100010203040506070101020304050607080403020100000201", "observations": [
+      {"beacon_id": "0102030405060708", "counter": 16909060, "rssi": 0, "snr": 0, "batt_mv": 258}
+    ]},
+    {"name": "full_batch", "hex": "010001020304050607090001020304050607e8030000c428e40c10111213141516170d040000bf1d480d202122232425262732040000ba12ac0d303132333435363757040000b507100e40414243444546477c040000b0fc740e5051525354555657a1040000abf1d80e6061626364656667c6040000a6e63c0f7071727374757677eb040000a1dba00f8081828384858687100500009cd00410", "observations": [
+      {"beacon_id": "0001020304050607", "counter": 1000, "rssi": -60, "snr": 40, "batt_mv": 3300},
+      {"beacon_id": "1011121314151617", "counter": 1037, "rssi": -65, "snr": 29, "batt_mv": 3400},
+      {"beacon_id": "2021222324252627", "counter": 1074, "rssi": -70, "snr": 18, "batt_mv": 3500},
+      {"beacon_id": "3031323334353637", "counter": 1111, "rssi": -75, "snr": 7, "batt_mv": 3600},
+      {"beacon_id": "4041424344454647", "counter": 1148, "rssi": -80, "snr": -4, "batt_mv": 3700},
+      {"beacon_id": "5051525354555657", "counter": 1185, "rssi": -85, "snr": -15, "batt_mv": 3800},
+      {"beacon_id": "6061626364656667", "counter": 1222, "rssi": -90, "snr": -26, "batt_mv": 3900},
+      {"beacon_id": "7071727374757677", "counter": 1259, "rssi": -95, "snr": -37, "batt_mv": 4000},
+      {"beacon_id": "8081828384858687", "counter": 1296, "rssi": -100, "snr": -48, "batt_mv": 4100}
+    ]}
+  ],
+  "decode_only": [
+    {"name": "reject_empty", "hex": "", "expect_count": -1},
+    {"name": "reject_short_header", "hex": "010001020304050607", "expect_count": -1},
+    {"name": "reject_version_0", "hex": "00000102030405060701a0a1a2a3a4a5a6a7010000009feb930f", "expect_count": -1},
+    {"name": "reject_version_2", "hex": "02000102030405060701a0a1a2a3a4a5a6a7010000009feb930f", "expect_count": -1},
+    {"name": "reject_version_255", "hex": "ff000102030405060701a0a1a2a3a4a5a6a7010000009feb930f", "expect_count": -1},
+    {"name": "reject_count_exceeds_data", "hex": "01000102030405060702a0a1a2a3a4a5a6a7010000009feb930f", "expect_count": -1},
+    {"name": "reject_truncated_entry", "hex": "01000102030405060701a0a1a2a3a4a5a6a7010000009feb93", "expect_count": -1},
+    {"name": "accept_empty_batch", "hex": "01000102030405060700", "expect_count": 0},
+    {"name": "accept_trailing_bytes", "hex": "01000102030405060701a0a1a2a3a4a5a6a7010000009feb930f0000", "expect_count": 1}
+  ]
+}

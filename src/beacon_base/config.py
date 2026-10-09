@@ -1,0 +1,177 @@
+"""Configuration and secrets.
+
+Settings live in a hand-edited TOML file (see ``deploy/config.example.toml``). Secrets that ``beaconctl`` generates, such
+as the report channel key, live in a separate ``secrets.toml`` next to it with mode 0600, so the main file can be shared
+or committed without leaking them.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+CONFIG_ENV = "BEACON_BASE_CONFIG"
+DEFAULT_CONFIG_PATH = Path("~/.config/beacon-base/config.toml")
+SECRETS_FILENAME = "secrets.toml"
+CHANNEL_KEY_LEN = 16
+
+
+class ConfigError(Exception):
+    """Bad or missing configuration. Not retried, the operator must fix it."""
+
+
+@dataclass(frozen=True)
+class RadioConfig:
+    """Radio settings shared by every device in the mesh (project decision 14)."""
+
+    freq_khz: int = 905775
+    bw_hz: int = 62500
+    sf: int = 8
+    cr: int = 6  # 6 means 4/6
+
+
+@dataclass(frozen=True)
+class CompanionConfig:
+    port: str | None = None  # prefer /dev/serial/by-id/..., ttyACM numbers move
+    baud: int = 115200
+    channel_index: int = 1  # slot 0 holds the built-in Public channel
+    channel_name: str = "beacon-reports"
+    manage_radio: bool = False  # apply [radio] to the companion instead of only warning when it differs
+    poll_interval: float = 30.0  # safety-net queue drain, in case a MSG_WAITING push is missed
+    command_timeout: float = 5.0
+
+
+@dataclass(frozen=True)
+class Config:
+    companion: CompanionConfig = field(default_factory=CompanionConfig)
+    radio: RadioConfig = field(default_factory=RadioConfig)
+    channel_key: bytes | None = None
+    config_path: Path | None = None
+    secrets_path: Path | None = None
+
+
+def resolve_config_path(explicit: str | os.PathLike[str] | None) -> tuple[Path, bool]:
+    """Return (path, required). An explicit path or the environment variable must exist, the default may not."""
+    if explicit:
+        return Path(explicit).expanduser(), True
+    env = os.environ.get(CONFIG_ENV)
+    if env:
+        return Path(env).expanduser(), True
+    return DEFAULT_CONFIG_PATH.expanduser(), False
+
+
+def _read_toml(path: Path) -> dict:
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: {e}") from e
+
+
+def parse_channel_key(text: str) -> bytes:
+    text = text.strip()
+    try:
+        key = bytes.fromhex(text)
+    except ValueError:
+        raise ConfigError("channel key must be hexadecimal") from None
+    if len(key) != CHANNEL_KEY_LEN:
+        raise ConfigError(f"channel key must be {CHANNEL_KEY_LEN} bytes ({CHANNEL_KEY_LEN * 2} hex characters)")
+    return key
+
+
+def _section(data: dict, name: str, cls: type, path: Path):
+    raw = data.get(name, {})
+    allowed = set(cls.__dataclass_fields__)
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ConfigError(f"{path}: unknown setting(s) in [{name}]: {', '.join(sorted(unknown))}")
+    try:
+        return cls(**raw)
+    except TypeError as e:
+        raise ConfigError(f"{path}: [{name}]: {e}") from e
+
+
+def secrets_path_for(config_path: Path, data: dict | None = None) -> Path:
+    override = (data or {}).get("secrets_file")
+    if override:
+        return (config_path.parent / override).expanduser()
+    return config_path.parent / SECRETS_FILENAME
+
+
+def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
+    path, required = resolve_config_path(explicit_path)
+    data: dict = {}
+    if path.exists():
+        data = _read_toml(path)
+    elif required:
+        raise ConfigError(f"config file not found: {path}")
+
+    unknown = set(data) - {"companion", "radio", "secrets_file"}
+    if unknown:
+        raise ConfigError(f"{path}: unknown section(s): {', '.join(sorted(unknown))}")
+
+    companion = _section(data, "companion", CompanionConfig, path)
+    radio = _section(data, "radio", RadioConfig, path)
+    if not 0 <= companion.channel_index <= 255:
+        raise ConfigError("companion.channel_index must be 0-255")
+    if not 0 < len(companion.channel_name.encode("utf-8")) < 32:
+        raise ConfigError("companion.channel_name must be 1-31 bytes")
+    if companion.poll_interval <= 0 or companion.command_timeout <= 0:
+        raise ConfigError("companion.poll_interval and companion.command_timeout must be positive")
+
+    spath = secrets_path_for(path, data)
+    key = None
+    if spath.exists():
+        secrets = _read_toml(spath)
+        raw_key = secrets.get("channel", {}).get("key")
+        if raw_key is not None:
+            key = parse_channel_key(str(raw_key))
+    return Config(companion=companion, radio=radio, channel_key=key, config_path=path, secrets_path=spath)
+
+
+def _toml_value(v: object) -> str:
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    raise TypeError(f"unsupported secret value type {type(v).__name__}")
+
+
+def write_secrets(path: Path, data: dict[str, dict[str, str]]) -> None:
+    """Atomically write the secrets file with mode 0600. ``data`` maps section name to string settings."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lines = []
+    for section, values in data.items():
+        lines.append(f"[{section}]")
+        lines.extend(f"{k} = {_toml_value(v)}" for k, v in values.items())
+        lines.append("")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".secrets-")  # created with mode 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def store_channel_key(cfg: Config, key: bytes, force: bool = False) -> Path:
+    """Save the report channel key. Refuses to replace an existing key unless force is set, because changing it means
+    reprovisioning every repeater."""
+    if cfg.secrets_path is None:
+        raise ConfigError("no secrets path")
+    if cfg.channel_key is not None and not force:
+        raise ConfigError(
+            f"a channel key already exists in {cfg.secrets_path}; replacing it means reprovisioning every repeater "
+            "(use --force to do so)"
+        )
+    existing = _read_toml(cfg.secrets_path) if cfg.secrets_path.exists() else {}
+    existing.setdefault("channel", {})["key"] = key.hex()
+    write_secrets(cfg.secrets_path, existing)
+    return cfg.secrets_path

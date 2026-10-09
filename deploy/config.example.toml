@@ -1,0 +1,28 @@
+# beacon-base configuration. Copy to ~/.config/beacon-base/config.toml (or point $BEACON_BASE_CONFIG / -c at it).
+#
+# Secrets (the report channel key) are NOT kept here. 'beaconctl channel generate' writes them to secrets.toml in the
+# same directory with mode 0600. Never commit that file.
+# secrets_file = "secrets.toml"
+
+[companion]
+# Use the stable by-id path, ttyACM numbers move. List candidates with: ls -l /dev/serial/by-id
+port = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:XX-if00"
+baud = 115200
+
+# Channel slot on the companion that carries the beacon reports. Slot 0 holds the built-in Public channel.
+channel_index = 1
+channel_name = "beacon-reports"
+
+# Apply [radio] to the companion on connect. When false, a mismatch is only logged as a warning.
+manage_radio = false
+
+# Safety-net queue drain, in seconds, in case a "messages waiting" notification is missed.
+poll_interval = 30
+command_timeout = 5
+
+# Radio settings shared by every device in the mesh (beacons, repeaters, base).
+[radio]
+freq_khz = 905775
+bw_hz = 62500
+sf = 8
+cr = 6      # 6 means coding rate 4/6

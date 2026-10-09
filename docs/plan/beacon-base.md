@@ -4,7 +4,9 @@ Covers the second half of milestone 3 (base ingest) and all of milestone 4 (allo
 in [beacon-project.md](beacon-project.md), and sets up the architecture for the map UI and location estimation
 (milestone 6) so they slot in without rework.
 
-Status: planning, nothing implemented. Decisions from the 2026-10-08 review are recorded in "Decisions" below.
+Status: B0 done (firmware commit `55fe473a`). B1 is code complete and tested against a fake companion; the hardware check
+(a real repeater report decoded from the XIAO S3 WIO companion) is outstanding. B2 onwards not started. Decisions from the
+2026-10-08 review are recorded in "Decisions" below.
 
 ## Decisions
 
@@ -199,8 +201,9 @@ Beacons have no clock and reports carry no time (decision 7 of the main plan), s
 
 ## Provisioning workflow
 
-- `beaconctl channel generate` creates a random 16-byte key, stores it in the base config (mode 0600, never in git) and
-  prints the hex to paste into each repeater's `beacon.channel`.
+- `beaconctl channel generate` creates a random 16-byte key, stores it in `secrets.toml` next to the base config (mode
+  0600, never in git; kept separate so the hand-edited config can be shared) and prints the hex to paste into each
+  repeater's `beacon.channel`. It refuses to replace an existing key without `--force`. `beaconctl channel show` prints it again.
 - `beaconctl beacon add <name> <pubkey-hex>`; the key comes from the beacon's serial `pubkey` command.
 - `beaconctl repeater add <name> <pubkey-or-prefix> <lat> <lon>`; the key comes from the repeater's CLI.
 - `beaconctl beacon reset <name>`, `... list`, `... status` (last heard, counter, battery, which repeaters hear it).

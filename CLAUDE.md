@@ -9,7 +9,8 @@ repeaters hear them and publish batched reports on a private `GRP_DATA` channel;
 reports through a MeshCore **companion node over USB**, enforces replay protection, stores everything, and serves a map.
 Scale is about 30 beacons and 10 repeaters.
 
-**Status: planning only.** No source code exists yet. The plans are the source of truth:
+**Status: phase B1 (ingest MVP) is code complete**, with the hardware check outstanding; B2 onwards is not started.
+The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -53,16 +54,27 @@ Three processes, one shared SQLite file (WAL) as the only interface. No IPC, no 
   binds to localhost by default.
 - `beaconctl`: CLI for provisioning, status, rejects, reset, clock, listen, simulate.
 
-Planned package layout (from the base plan):
+Package layout (`+` marks planned modules that do not exist yet):
 
 ```
 pyproject.toml, README.md, CLAUDE.md
-docs/              plan/, wire-format.md, operations.md
-src/beacon_base/   wire.py companion.py link.py store.py pipeline.py clock.py estimate.py ingest.py api.py cli.py
-web/               static map UI (Leaflet)
-tests/             unit, fake-companion link tests, fixtures/
-deploy/            systemd units, udev rule, install script
+docs/              plan/, wire-format.md      (+ operations.md)
+src/beacon_base/   wire.py       report decoder/encoder, mirrors the firmware format
+                   companion.py  companion protocol: command builders, response parsers (pure, no I/O)
+                   link.py       serial framing, FrameDecoder resync, CompanionLink request/response
+                   ingest.py     CompanionSession: reconnect loop, channel provisioning, queue drain; Handler hooks
+                   config.py     TOML config + secrets.toml (mode 0600)
+                   cli.py        beaconctl
+                   fake_companion.py, simulate.py   fake companion on a pty and synthetic traffic
+                   (+ store.py pipeline.py clock.py estimate.py api.py)
+web/               (+) static map UI (Leaflet)
+tests/             unit, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
+deploy/            config.example.toml        (+ systemd units, udev rule, install script)
 ```
+
+`CompanionSession` takes a `Handler`; the B2 replay/dedupe pipeline plugs in there (`on_report` receives a
+`ReceivedReport` with `rx_wall`, `rx_mono`, `late`, the companion SNR and the raw payload). `on_synced` fires once the
+offline queue has been drained after connecting.
 
 ## Constraints to keep in mind
 
@@ -83,15 +95,21 @@ deploy/            systemd units, udev rule, install script
 
 ## Build, test, run
 
-Nothing is set up yet. When the skeleton is created (phase B1), keep these conventional entry points and update this
-section with the real commands:
-
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'     # editable install with test deps
-pytest                       # unit, pipeline and fake-companion tests; must not need hardware
-beaconctl listen             # bring-up: print decoded reports from the real companion
+pip install -e '.[dev]'     # editable install; needs pyserial, pytest
+pytest                       # ~70 tests, ~5 s, no hardware needed (fake companion on a pty)
+beaconctl simulate           # fake companion + synthetic reports; prints the pty path to pass to `listen --port`
+beaconctl listen             # real or simulated companion: print decoded reports
 ```
+
+Config is `~/.config/beacon-base/config.toml` (or `-c`, or `$BEACON_BASE_CONFIG`); see `deploy/config.example.toml`.
+`beaconctl channel generate` writes the channel key to `secrets.toml` next to it. Never commit either file; `.gitignore`
+covers `config.toml`/`secrets.toml` at the repo root only, so keep real ones outside the repo.
+
+Hardware: `ls -l /dev/serial/by-id` lists attached boards. Do not open a port or send commands to a board you have not
+been told is the base companion: `listen` provisions a channel slot on whatever answers, and a beacon or repeater on the
+same bus would receive binary frames as CLI input.
 
 The firmware repo builds with PlatformIO, not from here. Environments the base cares about (run in the firmware repo):
 
@@ -104,10 +122,10 @@ The firmware repo builds with PlatformIO, not from here. Environments the base c
 
 ## Wire format and test fixtures
 
-The firmware repo owns the report format; `wire.py` here mirrors it. Phase B0 (not done yet; the firmware repo has no
-golden-vector test today) adds `beacon_report_v1.json` there. Copy it into `tests/fixtures/` with a note of the firmware
-commit it came from, and make the decoder test consume it. Never hand-edit the fixture; regenerate it from the firmware
-repo when the format changes.
+The firmware repo owns the report format; `wire.py` here mirrors it. Phase B0 (done, firmware commit `55fe473a`) added the
+golden-vector test there, and `tests/fixtures/beacon_report_v1.json` is its output; `tests/fixtures/README.md` records the
+commit and how to regenerate. `tests/test_wire.py` consumes it. Never hand-edit the fixture; regenerate it from the
+firmware repo when the format changes. `docs/wire-format.md` documents the format on this side.
 
 ## Working conventions
 
