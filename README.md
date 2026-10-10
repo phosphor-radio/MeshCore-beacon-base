@@ -9,8 +9,8 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > firmware `28bb4985` in the firmware repository) and the repeater onboarding (positions from adverts, discovery and
 > auto-add) are verified on hardware.
 > **In progress:** remote repeater management over the mesh ([docs/plan/repeater-remote.md](docs/plan/repeater-remote.md)).
-> The companion protocol, the ingest heartbeat and the job executor inside `beacon-ingest` are implemented and tested against a
-> fake repeater (RM1, RM2); the `beaconctl repeater remote` commands (RM3) and the hardware check (RM4) are not done yet.
+> The companion protocol, the ingest heartbeat, the job executor inside `beacon-ingest` and the `beaconctl repeater remote` commands
+> are implemented and tested against a fake repeater (RM1-RM3); the hardware check (RM4) is not done yet.
 > No web UI yet (B4) and no packaging (B3) beyond the heartbeat. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
@@ -44,7 +44,7 @@ Three cooperating processes sharing one SQLite database (WAL mode) as their only
 |---|---|
 | `beacon-ingest` | systemd service. Owns the companion's serial port, decodes reports, runs the replay/dedupe pipeline. |
 | `beacon-web` | HTTP API and Leaflet map UI. Separate from ingest, so it can be restarted or left off without losing reports. |
-| `beaconctl` | CLI for provisioning (beacons, repeaters, channel key), status, rejects, reset, clock, simulation. |
+| `beaconctl` | CLI for provisioning (beacons, repeaters, channel key), status, rejects, reset, clock, simulation, and reading or changing repeaters over the mesh. |
 
 Everything must work without hardware: a fake companion and synthetic reports allow the pipeline and UI to be built and
 tested at a desk.
@@ -279,6 +279,71 @@ Stock repeater commands that matter here: `advert` (flood advert now), `set lat`
 `set name`, `get public.key`, and `get` / `set flood.advert.interval <hours>` (3-168, default 47) for how soon a changed
 position or name reaches the base. After a change, `beaconctl status` and `beaconctl repeater list` on the base show what
 arrived.
+
+## Managing repeaters over the mesh
+
+`beaconctl repeater remote` reads or changes a repeater from the base, over the mesh, without a phone or a serial cable. It is a small
+fixed set of operations, not a remote shell: nothing else can be sent. `beaconctl` never talks to the companion itself; it queues a job
+and `beacon-ingest` (which owns the companion) runs it, so **`beacon-ingest` must be running** and the companion connected
+(`beaconctl status` shows both). The design and the firmware behaviour behind it are in
+[docs/plan/repeater-remote.md](docs/plan/repeater-remote.md).
+
+```bash
+beaconctl repeater remote north get all                       # everything below that can be read, in one go
+beaconctl repeater remote north get name
+beaconctl repeater remote north set name Hilltop North        # a name may have spaces
+beaconctl repeater remote north set location 47.123456 -122.335167
+beaconctl repeater remote north set advert.interval 120       # zero-hop advert, minutes: off, or an even number 60-240
+beaconctl repeater remote north set flood.advert.interval 48  # flood advert, hours: off, or 3-168
+beaconctl repeater remote north set beacon.window 45          # seconds, 1-3600
+beaconctl repeater remote north set beacon.names off          # on | off
+beaconctl repeater remote north set beacon.name_refresh 4     # hours, 0-8760
+beaconctl repeater remote north get beacon.stats              # counters since boot, and what changed since the last reading
+beaconctl repeater remote north get beacon.channel            # is it set, its hash, and whether it is this base's channel
+beaconctl repeater remote jobs                                # recent jobs; 'jobs 12' shows one in full
+```
+
+`north` is the repeater's name or its key prefix. Three things are deliberately **not** possible: setting or clearing `beacon.channel`
+(the channel key never crosses the air; use the repeater's serial console), changing a password, and sending any other command.
+
+**The admin password.** The first time, the repeater has to be given its admin password (the stock default is `password`; change it).
+After one successful password login the repeater keeps this base's companion key as an admin in its access list, saved in its flash, so
+later commands need no password, even after the repeater reboots. Supply it with `--password-file FILE` (first line, mode 600),
+`$BEACON_REPEATER_PASSWORD`, or `--ask-password`; an interactive run asks by itself when the repeater says it needs one. It is **never**
+an argument (visible in `ps`), it is at most 15 bytes (the firmware truncates silently), and it is erased from the database as soon as
+ingest picks the job up. If the base's companion is ever replaced, its key changes and every repeater needs the password again.
+
+**What you get back.** A `set` is read back to confirm it (`--no-verify` skips that, and then nothing is recorded). What the repeater
+confirms is also written into the base's record at once, so `repeater list` and `check` do not wait for the next advert: a confirmed
+name, position (`SOURCE` shows `remote`) and `beacon.window`, and the name and window of any `get`. The position recorded is the one you
+sent: `get lat` / `get lon` print a 32-bit float truncated to 7 decimals, so a read-back is about 1 m off and is never recorded. A
+later advert still replaces any of it (last write wins). `beaconctl check` also fails for a repeater whose report channel was read as
+unset or different from this base's.
+
+**Waiting.** The command waits 30 s (`--timeout`); a flooded, multi-hop exchange can be slower. If the repeater has not answered yet it
+says so, exits with 3, and the job carries on (`repeater remote jobs N` shows the result). `--no-wait` queues and returns the number,
+`--json` prints the job. A job not started within 60 s expires, so nothing queued while ingest was down runs later. Exit codes: 0 done,
+1 failed, 2 a mistake in the command, 3 still running.
+
+**When it fails**, the message says why, because the repeater's firmware stays silent about most failures:
+
+| Failure | Meaning |
+|---|---|
+| `no_ingest` | `beacon-ingest` is not running, or its companion is not connected. Nothing is queued. |
+| `clock_untrusted` | The base's clock is not set (`beaconctl time set`). The base moves the companion's clock forward to its own, and must not do that from a wrong clock. |
+| `no_key` | The base has never heard this repeater advertise, so it does not have its full key. |
+| `needs_password` | The repeater does not have this base as an admin yet: give the admin password. |
+| `not_admin` | A password was given but it was the guest password (or this key is not an admin there). |
+| `no_reply` | Wrong password, out of range, a flood not forwarded, or the companion's clock behind what the repeater has seen from it. Tried twice, the second time after resetting the route. |
+| `unsupported` | The repeater does not know the command: not a beacon build, or firmware older than the names work. |
+| `rejected` / `mismatch` | The repeater refused the value, or accepted it and reads back something else. |
+| `interrupted` | Ingest stopped, or lost the companion, while the job was running. The repeater may or may not have acted on it; read it back. |
+
+Things to know in the field. The first change of anything on a fresh repeater turns its zero-hop adverts off (a firmware quirk: any
+save zeroes an interval under 60 minutes), so every `set` reports `advert.interval`; set it to 60-240 if you want them. A changed
+name or position is not advertised at once (the base already has it, being told directly); the repeater's own `advert` command sends one
+now. If floods do not reach a repeater two or more hops away, a repeater with a denied wildcard region or `flood.max.unscoped 0` is
+dropping the base's unscoped flood; see the plan for the fix (a default flood scope on the companion).
 
 ## Roadmap
 

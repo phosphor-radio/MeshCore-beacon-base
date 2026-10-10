@@ -2,6 +2,26 @@
 
 Things that matter when running the base on real hardware. Setup and commands are in the [README](../README.md).
 
+## Managing repeaters from the base
+
+`beaconctl repeater remote` (README, "Managing repeaters over the mesh") needs `beacon-ingest` running with the companion connected,
+and a few things true in the field:
+
+- **The base's clock is set.** The companion's clock only moves forward and an nRF52 companion restarts at May 2024 on every boot.
+  A repeater ignores a login or command stamped earlier than the last it saw from the same key, and says nothing. `beacon-ingest`
+  moves the companion's clock forward to the base's once the base's clock is trusted (`beaconctl time set`, or `clock.assume_synced`),
+  and a remote job is refused (`clock_untrusted`) until then. If the companion is *ahead* of the base (a wrong time was once pushed
+  on it) `beaconctl status` says so; it cannot be set back, so reboot it.
+- **Each repeater has had one password login.** The stock admin password is `password`; change it on the repeater's serial console.
+  After the first login the repeater keeps the base as an admin in its flash. **A replaced companion is a new key**, so every repeater
+  needs the password again.
+- **The mesh forwards the base's floods.** The first message to a repeater is an unscoped flood. A repeater two or more hops away is
+  only reached if the repeaters between forward unscoped floods; if they do not (`region denyf *`, or `flood.max.unscoped 0`) logins fail
+  as `no_reply` until the companion has a default flood scope matching a region those repeaters allow.
+- **The database is private to its user.** A new database file is created mode 600 (a job can hold an admin password for a moment); an
+  existing one is not changed. If `beaconctl` and `beacon-ingest` run as different users, share it deliberately (a group and
+  `chmod 660`) as part of the deployment.
+
 ## Companion serial connection: DTR
 
 The base talks to its companion over USB serial, and the two kinds of companion board want opposite things from the DTR line

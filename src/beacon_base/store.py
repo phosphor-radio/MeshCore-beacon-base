@@ -8,6 +8,7 @@ place. Never edit a released migration, append a new one.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -252,7 +253,10 @@ class Store:
     def open(cls, path: str | Path) -> "Store":
         path = str(path)
         if path != ":memory:":
-            Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            db_file = Path(path).expanduser()
+            db_file.parent.mkdir(parents=True, exist_ok=True)
+            if not db_file.exists():  # a new database is private to its owner (it can hold an admin password for a moment); an existing one is left alone
+                os.close(os.open(db_file, os.O_CREAT | os.O_RDWR, 0o600))
         # isolation_level=None: transactions are explicit (see transaction()). check_same_thread is off because a
         # Store may be created in one thread and used in another, never concurrently.
         conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=10)
@@ -260,6 +264,7 @@ class Store:
         conn.execute("PRAGMA busy_timeout = 10000")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA secure_delete = ON")  # freed bytes are zeroed, so an erased job password does not linger in the file
         conn.execute("PRAGMA foreign_keys = ON")
         store = cls(conn, path)
         store._migrate()
@@ -358,6 +363,22 @@ class Store:
             )
             return cur.lastrowid
 
+    def expire_jobs(self, now: float | None = None) -> int:
+        """Expire queued jobs that waited past their expiry, erasing any password. Run by ingest when it claims, and by beaconctl while
+        it waits, so a job nobody picked up (ingest down) does not stay queued."""
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            cur = db.execute(
+                """UPDATE remote_jobs SET state = 'expired', finished_at = ?, secret = NULL, error_code = 'expired', error = ?
+                   WHERE state = 'queued' AND expires_at < ?""",
+                (now, remote.ERROR_TEXT["expired"], now),
+            )
+            return cur.rowcount
+
+    def jobs_ahead(self, job_id: int) -> int:
+        """How many jobs are queued or running before this one."""
+        return self.conn.execute("SELECT count(*) FROM remote_jobs WHERE state IN ('queued', 'running') AND id < ?", (job_id,)).fetchone()[0]
+
     def claim_job(self, now: float | None = None) -> remote.RemoteJob | None:
         """Take the oldest queued job for ingest to run: mark it running and erase its password from the table (the returned job
         carries it in memory). Jobs that waited past their expiry are expired first, so a stale 'set' never runs."""
@@ -377,15 +398,33 @@ class Store:
             if row is None:
                 return None
             db.execute("UPDATE remote_jobs SET state = 'running', started_at = ?, secret = NULL WHERE id = ?", (now, row["id"]))
+        if row["secret"] is not None:
+            self._forget_password()
         return remote.RemoteJob(
             id=row["id"], repeater_prefix=bytes(row["repeater_prefix"]), pubkey=None if row["pubkey"] is None else bytes(row["pubkey"]),
             name=row["repeater_name"], lat=row["lat"], lon=row["lon"], kind=row["kind"], op=row["op"],
             params=json.loads(row["params"]), password=row["secret"], created_at=row["created_at"],
         )
 
+    def _forget_password(self) -> None:
+        """The password was in the database between submit and claim. Fold the write-ahead log back into the file and empty it, so
+        the row's old contents are not left behind in it (best effort: a reader holding the log open makes this a no-op)."""
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error:
+            pass
+
     def finish_job(self, job_id: int, outcome: remote.JobOutcome, now: float | None = None) -> None:
+        """Record how a job ended. A confirmed result is also written through to the repeater's record (see _write_through)."""
         now = time.time() if now is None else now
         with self.transaction() as db:
+            row = db.execute("SELECT * FROM remote_jobs WHERE id = ? AND state = 'running'", (job_id,)).fetchone()
+            if row is None:
+                return
+            if outcome.ok:
+                recorded = self._write_through(db, row, outcome.result, now)
+                if recorded:
+                    outcome.result["recorded"] = recorded
             db.execute(
                 """UPDATE remote_jobs SET state = ?, finished_at = ?, result = ?, error_code = ?, error = ?, secret = NULL
                    WHERE id = ? AND state = 'running'""",
@@ -394,6 +433,75 @@ class Store:
                     None if outcome.ok else outcome.message, job_id,
                 ),
             )
+
+    @staticmethod
+    def _write_through(db: sqlite3.Connection, job: sqlite3.Row, result: dict, now: float) -> list[str]:
+        """Bring the repeater's record up to date with what a finished job found or changed, so the base does not show the old
+        name, position or window until the next advert (which can be days away). Only what the repeater confirmed:
+
+        * a verified ``set name`` / ``set location`` / ``beacon.window``: the value that was sent. The position in particular is never
+          taken from a read-back, which is lossy (about 1 m), and is recorded with the source ``remote``.
+        * a ``get`` of the name or the window (also inside ``get all``): what the repeater reports. A position read with ``get`` is not recorded.
+
+        Last write wins, as with adverts: a later advert replaces any of it. Returns the list of what was recorded."""
+        kind, op = job["kind"], job["op"]
+        values = result.get("values", {})
+        verified = op == "set" and result.get("verified") is True
+        name = window = None
+        position = None
+        if op == "get":
+            name, window = values.get("name"), values.get("beacon.window")
+        elif verified and kind == "name":
+            name = result.get("sent")
+        elif verified and kind == "beacon.window":
+            window = result.get("sent")
+        elif verified and kind == "location":
+            position = result.get("sent")
+        row = db.execute("SELECT * FROM repeaters WHERE prefix = ?", (job["repeater_prefix"],)).fetchone()
+        if row is None:
+            return []
+        recorded: list[str] = []
+        clean = names_mod.clean_name(name, names_mod.MAX_NAME_BYTES) if isinstance(name, str) and name else None
+        if clean and clean != row["name"]:
+            db.execute("UPDATE repeaters SET name = ? WHERE prefix = ?", (clean, row["prefix"]))
+            recorded.append("name")
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0 and float(window) != row["window_s"]:
+            db.execute("UPDATE repeaters SET window_s = ? WHERE prefix = ?", (float(window), row["prefix"]))
+            recorded.append("window")
+        if position is not None:
+            lat, lon = float(position["lat"]), float(position["lon"])
+            db.execute(
+                "UPDATE repeaters SET lat = ?, lon = ?, location_source = ?, location_updated_at = ? WHERE prefix = ?",
+                (lat, lon, "remote" if (lat, lon) != (0.0, 0.0) else "none", now, row["prefix"]),
+            )
+            recorded.append("position")
+        return recorded
+
+    def latest_channel_reading(self, prefix: bytes) -> tuple[dict, float] | None:
+        """The most recent report-channel reading of a repeater from a finished job (``beacon.channel`` or ``get all``): the
+        ``{set, hash, matches_base}`` dict and when it was read. None if it was never read."""
+        rows = self.conn.execute(
+            """SELECT result, finished_at FROM remote_jobs WHERE repeater_prefix = ? AND state = 'done' AND op = 'get'
+               AND kind IN ('beacon.channel', 'all') ORDER BY id DESC LIMIT 20""",
+            (bytes(prefix),),
+        ).fetchall()
+        for r in rows:
+            channel = json.loads(r["result"] or "{}").get("values", {}).get("beacon.channel")
+            if channel is not None:
+                return channel, r["finished_at"]
+        return None
+
+    def previous_stats(self, prefix: bytes, before_job: int) -> tuple[dict, float] | None:
+        """The ``beacon.stats`` reading before a given job, for showing what changed since."""
+        r = self.conn.execute(
+            """SELECT result, finished_at FROM remote_jobs WHERE repeater_prefix = ? AND state = 'done' AND op = 'get'
+               AND kind = 'beacon.stats' AND id < ? ORDER BY id DESC LIMIT 1""",
+            (bytes(prefix), before_job),
+        ).fetchone()
+        if r is None:
+            return None
+        stats = json.loads(r["result"] or "{}").get("values", {}).get("beacon.stats")
+        return (stats, r["finished_at"]) if stats and stats.get("parsed") else None
 
     def recover_jobs(self, now: float | None = None) -> int:
         """Jobs left running by a crash will never finish: fail them, because the repeater may or may not have acted on them."""

@@ -40,7 +40,7 @@ class Env:
     path: object
 
     def submit(self, kind, op="get", params=None, password=None, **kw):
-        return self.store.submit_job("ridge", kind, op, params, password, **kw)
+        return self.store.submit_job(RKEY[:8].hex(), kind, op, params, password, **kw)  # by prefix: a rename is written through
 
     def wait(self, job_id):
         until(lambda: self.store.job(job_id)["state"] in FINISHED)

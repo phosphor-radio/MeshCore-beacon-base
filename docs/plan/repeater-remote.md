@@ -1,6 +1,6 @@
 # Remote Repeater Management Plan
 
-Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock) and RM2 (heartbeat, jobs, executor) are implemented and tested against a fake repeater; RM3 onwards is not.** Written after reading the firmware (`examples/simple_repeater`,
+Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock), RM2 (heartbeat, jobs, executor) and RM3 (commands) are implemented and tested against a fake repeater; RM4 (hardware) is not done.** Written after reading the firmware (`examples/simple_repeater`,
 `examples/companion_radio`, `src/helpers/CommonCLI.cpp`) and this repo, then amended with the firmware session's findings
 (documentation commit `e5761d02`, "Firmware follow-ups"). Done before the rest of B3; it includes the ingest heartbeat from B3
 and nothing else from it. See "Phases".
@@ -418,6 +418,31 @@ state, and jobs submitted from a test run to completion with reports flowing at 
 **RM3. Commands.** `beaconctl repeater remote ...`, password sources, write-through, `check` additions
 (channel hash mismatch is a failing finding when a result is on record), README section, `docs/operations.md`, CLAUDE.md.
 Done when every item reads and sets against the fake repeater from the command line.
+
+*Done.* `remote_cli.py` (`beaconctl repeater remote <repeater> get|set <item> [value ...]`, `jobs [ID]`) and the pieces around it.
+Where it differs from, or adds to, the text above:
+
+- **Not queued when it cannot run.** The command checks the heartbeat and the repeater's key first: `no_ingest` (never run, stopped, down,
+  or the companion not connected) and `no_key` are reported at once and nothing is queued. A queued job nobody picks up is expired by
+  `beaconctl` while it waits (`Store.expire_jobs`), erasing its password.
+- **Password.** `--password-file` (first line; a warning if group or others can read it), `$BEACON_REPEATER_PASSWORD`, `--ask-password`;
+  never an argument. An interactive run that gets `needs_password` asks for it and queues the job again. Checked to 15 bytes before
+  queuing. At claim the row's password is erased, `PRAGMA secure_delete` is on for every connection, and the write-ahead log is
+  truncated, so the password is gone from the database files (a test searches them). A new database file is created mode 600 (an existing
+  one is not changed; sharing it between users is a deployment decision, `docs/operations.md`).
+- **Write-through** is done by ingest in `Store.finish_job`, in the job's own transaction, so `--no-wait` is covered too. Recorded: a
+  verified name, position (`location_source = 'remote'`; 0, 0 becomes `none`) and `beacon.window` from the value *sent*; and the name and
+  window of any `get` (a read from the repeater is as good as an advert). A position read with `get` is never recorded (lossy). The job
+  result lists what was `recorded`; a `--no-verify` set records nothing.
+- **Output.** A `get` prints each item in words (the channel with "the same as" / "DIFFERENT from this base's channel", `beacon.stats` with
+  what changed since the previous reading or that the repeater restarted, an unavailable item with its reason); a `set` says it was
+  confirmed by reading it back, notes the lossy position read-back and the zero-hop warning, and what was recorded. Failures go to stderr.
+  Exit codes: 0 done, 1 failed, 2 a mistake in the command, 3 still running after `--timeout`. `--json` prints the job.
+- **`check`** fails for a repeater whose last channel reading was `not set`, or whose hash differs from the base's *current* key (the
+  hash is compared again at check time, not taken from the job).
+- **Added:** `jobs ID` shows one job in full with its commands and replies, `-n/--limit` and `--all` for the list, `--allow-zero`
+  for `set location 0 0`.
+- Tests: 57 for the command and 11 for the write-through and the password (636 in all). **Not seen on hardware.**
 
 **RM4. Hardware.** The check above on one repeater, then the rest. Findings go back into this plan.
 

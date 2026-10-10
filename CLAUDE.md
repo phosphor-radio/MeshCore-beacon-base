@@ -12,9 +12,9 @@ Scale is about 30 beacons and 10 repeaters.
 **Status: B1, B2 (store and pipeline) and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and
 verified on hardware, as is the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1-R3: positions and names
 from repeater adverts, plus discovery and auto-add). The remote repeater management work
-(`docs/plan/repeater-remote.md`) is under way: RM1 (companion protocol, clock) and RM2 (ingest heartbeat, job table, executor) are
-implemented and tested against a fake repeater but not on hardware; RM3 (`beaconctl repeater remote`) and RM4 (hardware) are not
-done. The rest of B3 (retention, systemd, udev, install) and B4 are not started.** The plans are the source of truth:
+(`docs/plan/repeater-remote.md`) is under way: RM1 (companion protocol, clock), RM2 (ingest heartbeat, job table, executor) and RM3
+(`beaconctl repeater remote`, write-through, `check`) are implemented and tested against a fake repeater but not on hardware; RM4
+(the hardware script in the plan) is not done. The rest of B3 (retention, systemd, udev, install) and B4 are not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -82,6 +82,7 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    fake_companion.py, simulate.py   fake companion on a pty and synthetic traffic
                    fake_repeater.py   model of a repeater's login/ACL/CLI (silent failures, replay rules, lossy get lat) for remote tests
                    remote.py     the closed set of remote repeater operations: validation, the commands, reading the replies (pure)
+                   remote_cli.py beaconctl repeater remote: parse, queue a job, wait, print; the job list
                    executor.py   RemoteExecutor: the job state machine the session loop drives (contact, login, tagged command, retry)
                    heartbeat.py  the service_status row ingest keeps current; HeartbeatWriter, liveness (monotonic clock)
                    (+ estimate.py api.py)
@@ -100,7 +101,9 @@ of a report that failed to decode). `on_synced` fires once the offline queue has
 blocking report draining) -> `Handler.finish_job`. A login is admin only if the push says role 1 *and* permission 3 (an empty password
 from a key the repeater does not know is a guest login); commands go out as `NN|command` and the reply is matched on the tag; one retry
 after `CMD_RESET_PATH`. Jobs expire after 60 s unqueued; `recover_jobs` fails any left `running` by a crash. `get lat/lon` read back
-lossy, so the base records the value it sent. `beacon-ingest` also keeps the `service_status` heartbeat row (`heartbeat.py`).
+lossy, so the base records the value it sent. `Store.finish_job` writes a confirmed name, position (`location_source = 'remote'`) and window
+through to `repeaters` (never a position read back). The admin password only ever travels in the job row and is erased at claim (with
+`secure_delete` and a WAL truncate); `beaconctl` takes it from a file, the environment or a prompt, never argv. `beacon-ingest` also keeps the `service_status` heartbeat row (`heartbeat.py`).
 
 Repeater positions and names come from the **repeaters' own adverts**, heard by the base companion (`CompanionSession`:
 contact list at connect, `PUSH_NEW_ADVERT`, bare `PUSH_ADVERT` then `CMD_GET_CONTACT_BY_KEY`; the companion is put in

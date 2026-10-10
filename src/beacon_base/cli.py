@@ -11,7 +11,7 @@ import secrets
 import sys
 import threading
 
-from . import __version__, admin
+from . import __version__, admin, remote_cli
 from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, ReceivedNames, ReceivedReport
 from .link import DTR_MODES, CompanionError
@@ -287,6 +287,27 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
     p.add_argument("seconds", type=float)
     p.set_defaults(func=admin.cmd_repeater_window)
+
+    p = repeater.add_parser(
+        "remote",
+        help="read or change a repeater over the mesh, through beacon-ingest and the base companion",
+        description="Read or change a repeater over the mesh. beaconctl queues the job and beacon-ingest, which owns the companion, runs it. "
+        "Only the operations below exist. Logging in needs the repeater's admin password the first time (the repeater then keeps this base "
+        "as an admin); give it in a file (--password-file), in $BEACON_REPEATER_PASSWORD or at a prompt (--ask-password), never as an argument.",
+        epilog=remote_cli.USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("words", nargs="+", metavar="WORD", help=REPEATER_REF_HELP + ", then get or set, the item and its value; or the word jobs and an optional job number")
+    p.add_argument("--password-file", metavar="FILE", help="read the admin password from the first line of this file (keep it mode 600)")
+    p.add_argument("--ask-password", action="store_true", help="prompt for the admin password before sending")
+    p.add_argument("--no-verify", action="store_true", help="for a set: do not read the value back (nothing is then recorded at the base)")
+    p.add_argument("--allow-zero", action="store_true", help="for set location: allow 0, 0, which the base treats as 'no position'")
+    p.add_argument("--timeout", type=float, default=30.0, metavar="SECS", help="how long to wait for the job (default 30); a longer one keeps running")
+    p.add_argument("--no-wait", action="store_true", help="queue the job and return its number")
+    p.add_argument("--json", action="store_true", help="print the job as JSON")
+    p.add_argument("--all", action="store_true", help="with jobs: show up to 200 jobs")
+    p.add_argument("-n", "--limit", type=int, default=10, help="with jobs: how many to show (default 10)")
+    p.set_defaults(func=remote_cli.cmd_repeater_remote)
 
     p = sub.add_parser("status", help="one line per beacon, rejected and silent first")
     p.add_argument("--hours", type=float, default=24.0, help="how far back to look for unlisted beacons and repeaters")

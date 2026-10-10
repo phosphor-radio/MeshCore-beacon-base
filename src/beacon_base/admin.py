@@ -8,7 +8,7 @@ import os
 import subprocess
 import time
 
-from . import clock, health, heartbeat, names
+from . import clock, health, heartbeat, names, remote
 from .config import Config
 from .store import Store, StoreError
 
@@ -522,6 +522,9 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
         beacons = store.beacons()
         auto = [k for k in ("repeaters", "beacons") if store.autoadd(k)]
         status = store.status_row()
+        channels = {bytes(r["prefix"]): store.latest_channel_reading(bytes(r["prefix"])) for r in repeaters}
+    now = time.time()
+    base_hash = remote.channel_hash(cfg.channel_key) if cfg.channel_key else None
     ingest = heartbeat.state(status)
     if ingest in (heartbeat.DOWN, heartbeat.STOPPED):
         problems.append(f"beacon-ingest is not running ({ingest}); reports are not being received")
@@ -540,6 +543,19 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
         problems.append("no repeaters in the repeater table")
     for r in repeaters:
         w = r["window_s"]
+        reading = channels.get(bytes(r["prefix"]))
+        if reading is not None:  # read over the mesh with 'beaconctl repeater remote'; compared with the key as it is now
+            channel, read_at = reading
+            if not channel["set"]:
+                problems.append(
+                    f"repeater {_repeater_label(r)}: no report channel set (read {fmt_age(read_at, now)}), so it sends no reports; set it "
+                    "on its serial console with 'beacon.channel <key>' ('beaconctl channel show' prints the key)"
+                )
+            elif base_hash is not None and channel["hash"] != base_hash:
+                problems.append(
+                    f"repeater {_repeater_label(r)}: its report channel (hash {channel['hash']:02X}, read {fmt_age(read_at, now)}) is not "
+                    f"this base's (hash {base_hash:02X}), so its reports cannot be read"
+                )
         if not Store.is_located(r["lat"], r["lon"]):
             problems.append(
                 f"repeater {_repeater_label(r)}: no location, so it is left out of positioning; set it on the repeater and send "
