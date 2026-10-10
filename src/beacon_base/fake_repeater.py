@@ -96,6 +96,8 @@ class FakeRepeater:
         self.drop_floods = False  # flooded packets are not forwarded (denied wildcard region); a stored route still works
         self.reflect_tag = True
         self.drop_replies = False  # the command runs but the reply is lost
+        self.drop_next_replies = 0  # lose the next N replies to commands, then answer again
+        self.drop_next_logins = 0  # lose the next N login replies
         self.commands: list[str] = []  # every command text run, in order, for assertions
         self.saves = 0
 
@@ -161,6 +163,21 @@ class FakeRepeater:
             return None  # an equal timestamp is a retry: not run again, no reply
         reply = self.handle_command(text)
         return reply if reply else None
+
+    def lose_reply(self) -> bool:
+        """True when the reply to a command is lost on its way back."""
+        if self.drop_replies:
+            return True
+        if self.drop_next_replies > 0:
+            self.drop_next_replies -= 1
+            return True
+        return False
+
+    def lose_login_reply(self) -> bool:
+        if self.drop_next_logins > 0:
+            self.drop_next_logins -= 1
+            return True
+        return False
 
     # --- the CLI ----------------------------------------------------------------------------------------------
 

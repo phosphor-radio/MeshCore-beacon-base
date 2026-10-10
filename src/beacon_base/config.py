@@ -69,6 +69,17 @@ class ClockConfig:
 
 
 @dataclass(frozen=True)
+class RemoteConfig:
+    """Remote repeater management (docs/plan/repeater-remote.md). A step waits for the companion's estimate of the round trip times
+    timeout_factor, kept between the two limits; one retry follows after the route is reset."""
+
+    min_timeout_s: float = 8.0
+    max_timeout_s: float = 30.0
+    timeout_factor: float = 1.5
+    max_job_s: float = 180.0  # a job that runs longer than this is failed, whatever step it is on
+
+
+@dataclass(frozen=True)
 class Config:
     companion: CompanionConfig = field(default_factory=CompanionConfig)
     radio: RadioConfig = field(default_factory=RadioConfig)
@@ -78,6 +89,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     beacon: BeaconConfig = field(default_factory=BeaconConfig)
     clock: ClockConfig = field(default_factory=ClockConfig)
+    remote: RemoteConfig = field(default_factory=RemoteConfig)
 
     @property
     def db_path(self) -> Path:
@@ -143,7 +155,7 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     elif required:
         raise ConfigError(f"config file not found: {path}")
 
-    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "secrets_file"}
+    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "remote", "secrets_file"}
     if unknown:
         raise ConfigError(f"{path}: unknown section(s): {', '.join(sorted(unknown))}")
 
@@ -152,6 +164,9 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     database = _section(data, "database", DatabaseConfig, path)
     beacon = _section(data, "beacon", BeaconConfig, path)
     clock = _section(data, "clock", ClockConfig, path)
+    remote = _section(data, "remote", RemoteConfig, path)
+    if not 0 < remote.min_timeout_s <= remote.max_timeout_s or remote.timeout_factor <= 0 or remote.max_job_s <= 0:
+        raise ConfigError("remote: min_timeout_s must be positive and at most max_timeout_s, timeout_factor and max_job_s positive")
     if isinstance(radio.path_hash_mode, bool) or not isinstance(radio.path_hash_mode, int) or not 0 <= radio.path_hash_mode <= 2:
         raise ConfigError("radio.path_hash_mode must be 0, 1 or 2")
     if companion.dtr not in ("auto", "on", "off"):
@@ -181,6 +196,7 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         database=database,
         beacon=beacon,
         clock=clock,
+        remote=remote,
     )
 
 

@@ -8,7 +8,7 @@ import os
 import subprocess
 import time
 
-from . import clock, health, names
+from . import clock, health, heartbeat, names
 from .config import Config
 from .store import Store, StoreError
 
@@ -73,6 +73,36 @@ def clock_state(store: Store, cfg: Config) -> tuple[bool, str]:
         return False, "NOT SET: observation times are provisional until 'beaconctl time set'"
     how = {"set": "set with beaconctl", "step": "stepped, seen by ingest"}.get(event["kind"], event["kind"])
     return True, f"{how} at {fmt_time(event['at_wall'])}"
+
+
+def ingest_lines(store: Store, now: float) -> list[str]:
+    """The first lines of 'status': is ingest running, is the companion connected. Problems start with '!'."""
+    row = store.status_row()
+    state = heartbeat.state(row)
+    if state == heartbeat.NEVER:
+        return ["! ingest: has never run against this database; start beacon-ingest"]
+    since = fmt_age(row["updated_at"], now)
+    if state == heartbeat.STOPPED:
+        return [f"! ingest: stopped cleanly {since}; start beacon-ingest"]
+    if state == heartbeat.DOWN:
+        return [f"! ingest: NOT RUNNING, last heard from {since} (crashed, killed, or the machine rebooted)"]
+    lines = [f"ingest: running (pid {row['pid']}, started {fmt_age(row['started_at'], now)})"]
+    if not row["connected"]:
+        lines.append("! companion: not connected (reports are not being received)")
+        return lines
+    model = " ".join(p for p in (row["companion_model"], row["companion_firmware"]) if p)
+    key = bytes(row["companion_key_prefix"]).hex() if row["companion_key_prefix"] else "?"
+    lines.append(
+        f"companion: {row['companion_name'] or '?'} ({model or '?'}) on {row['port'] or '?'}, key {key}, connected {fmt_age(row['connected_since'], now)};"
+        f" last frame {fmt_age(row['last_frame_at'], now)}, last report {fmt_age(row['last_report_at'], now)}"
+    )
+    offset = row["companion_clock_offset_s"]
+    if offset is not None and abs(offset) > 60:
+        lines.append(
+            f"! companion clock: {abs(offset)} s {'ahead of' if offset > 0 else 'behind'} the base's"
+            + ("; it cannot be set back, reboot the companion" if offset > 0 else "")
+        )
+    return lines
 
 
 # --- beacons -------------------------------------------------------------------------------------------------------------
@@ -301,6 +331,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     now = time.time()
     with _open(cfg) as store:
         trusted, clock_line = clock_state(store, cfg)
+        ingest = ingest_lines(store, now)
         assessed = health.assess(store, cfg.beacon, now)
         _, repeaters = store.names()
         unknown_b = store.unknown_beacons(now - args.hours * 3600)
@@ -335,6 +366,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
                     detail,
                 ]
             )
+    print("\n".join(ingest) + "\n")
     if not trusted:
         print(f"! clock {clock_line}\n")
     if auto_b or auto_r:
@@ -489,6 +521,12 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
         repeaters = store.repeaters()
         beacons = store.beacons()
         auto = [k for k in ("repeaters", "beacons") if store.autoadd(k)]
+        status = store.status_row()
+    ingest = heartbeat.state(status)
+    if ingest in (heartbeat.DOWN, heartbeat.STOPPED):
+        problems.append(f"beacon-ingest is not running ({ingest}); reports are not being received")
+    elif ingest == heartbeat.UP and not status["connected"]:
+        problems.append("beacon-ingest is running but the companion is not connected")
     if auto:
         problems.append(
             f"auto-add is on for {' and '.join(auto)}, so anything on the channel is trusted; lock the setup once everything "

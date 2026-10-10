@@ -14,13 +14,15 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Callable
 
-from . import companion, wire
+from . import companion, remote, wire
 from .companion import DeviceInfo, SelfInfo
 from .config import Config, ConfigError, RadioConfig
+from .executor import RemoteExecutor
 from .link import CompanionError, CompanionLink, CommandError, NoReply, SerialTransport, Transport, choose_dtr
 
 log = logging.getLogger(__name__)
 
+LOOP_SLICE = 0.25  # seconds the main loop waits for a frame before it looks at the job queue, the heartbeat and the deadlines
 CLOCK_TOLERANCE_S = 2  # the companion's clock is only set when it is behind by more than this
 CLOCK_AHEAD_WARN_S = 60  # warn when it is ahead by more than this: it cannot be moved back
 CLOCK_RECHECK_S = 30.0  # how often to look again while the base's own clock is not trusted yet
@@ -118,6 +120,17 @@ class Handler:
 
     def on_disconnected(self, error: str | None) -> None: ...
 
+    def claim_job(self) -> remote.RemoteJob | None:
+        """The next remote repeater job to run, or None. Called about four times a second while idle, from the session thread."""
+        return None
+
+    def finish_job(self, job: remote.RemoteJob, outcome: remote.JobOutcome) -> None:
+        """A job claimed with claim_job has finished, or failed."""
+
+    def on_tick(self) -> None:
+        """Called from the session thread about four times a second, connected or not (while waiting to reconnect, once a second). It is for
+        housekeeping that must keep running when nothing arrives, such as the heartbeat."""
+
 
 def radio_matches(info: SelfInfo, radio: RadioConfig) -> bool:
     return (
@@ -167,6 +180,21 @@ class CompanionSession:
         # the companion's clock (see _sync_clock); both are reset on every connection
         self.clock_synced = False
         self.companion_clock_offset: int | None = None  # companion minus base, in seconds, as last read
+        self._link: CompanionLink | None = None
+        self._executor = RemoteExecutor(
+            config.remote, lambda: self._handler.claim_job(), lambda job, outcome: self._handler.finish_job(job, outcome),
+            self._clock_ready, remote.channel_hash(config.channel_key),
+        )
+
+    @property
+    def remote_state(self) -> str:
+        """'idle', or the remote repeater job being run."""
+        return self._executor.describe()
+
+    @property
+    def last_frame_at(self) -> float | None:
+        """Wall time of the last frame from the companion on the current connection, None when not connected or nothing yet."""
+        return self._link.last_rx if self._link is not None else None
 
     # --- connection loop -------------------------------------------------------------------------------------------
 
@@ -183,6 +211,7 @@ class CompanionSession:
                 dtr = self._pick_dtr()
                 link = CompanionLink(self._transport_factory(self._cfg.companion.port, dtr), self._cfg.companion.command_timeout)
                 link.on_push = self._on_push
+                self._link = link
                 connected_at = time.monotonic()
                 self._serve(link, stop)
             except ConfigError:
@@ -194,6 +223,8 @@ class CompanionSession:
                 error = str(e)
                 log.warning("companion link lost: %s", e)
             finally:
+                self._link = None
+                self._executor.abort()  # a job in progress cannot finish without the link
                 if link is not None:
                     link.close()
             if connected_at is not None:
@@ -205,7 +236,10 @@ class CompanionSession:
             if connected_at is not None and time.monotonic() - connected_at > 10 * RECONNECT_MAX:
                 delay = RECONNECT_MIN  # it ran for a while, so this is a new failure
             log.info("reconnecting in %.0fs", delay)
-            stop.wait(delay)
+            until = time.monotonic() + delay
+            while not stop.is_set() and time.monotonic() < until:
+                self._handler.on_tick()
+                stop.wait(min(1.0, max(until - time.monotonic(), 0.0)))
             delay = min(delay * 2, RECONNECT_MAX)
 
     def _pick_dtr(self) -> bool:
@@ -262,6 +296,7 @@ class CompanionSession:
                 log.debug("ignoring a login push: %s", e)
                 return
             self.stats["logins"] += 1
+            self._executor.offer_login(result)
             self._handler.on_login(result)
         elif frame[0] in (companion.PUSH_NEW_ADVERT, companion.PUSH_ADVERT) and self._cfg.companion.learn_repeaters:
             # handled in the main loop: it needs commands of its own, which cannot nest inside another request
@@ -284,11 +319,13 @@ class CompanionSession:
             self._sync_contacts(link)  # after the drain, so it never delays a report
         self._handler.on_synced()
         self.clock_synced, self.companion_clock_offset = False, None
+        self._executor.new_connection()
         self._sync_clock(link)
         next_clock = time.monotonic() + CLOCK_RECHECK_S
         next_poll = time.monotonic() + self._cfg.companion.poll_interval
         while not stop.is_set():
-            frame = link.recv_frame(min(0.5, max(next_poll - time.monotonic(), 0.0)))
+            self._handler.on_tick()
+            frame = link.recv_frame(min(LOOP_SLICE, max(next_poll - time.monotonic(), 0.0)))
             if frame is not None:
                 if companion.is_push(frame[0]):
                     self._on_push(frame)
@@ -300,6 +337,7 @@ class CompanionSession:
                 next_poll = time.monotonic() + self._cfg.companion.poll_interval
             if self._advert_pushes:
                 self._process_adverts(link)
+            self._executor.poll(link)
             if not self.clock_synced and time.monotonic() >= next_clock:
                 self._sync_clock(link)  # the base's clock may have been set since the last look
                 next_clock = time.monotonic() + CLOCK_RECHECK_S
@@ -369,6 +407,17 @@ class CompanionSession:
             log.warning("could not set the companion's path hash mode to %d: %s", want, e)
             return
         log.info("set the companion's path hash mode to %d (was %d)", want, have)
+
+    def _clock_ready(self, link: CompanionLink) -> str | None:
+        """None when the companion's clock may stamp a login, else the job error. With companion.sync_clock off the operator keeps the
+        companion's clock right (an RTC chip), so nothing is required."""
+        if not self._cfg.companion.sync_clock:
+            return None
+        if not self._handler.clock_trusted():
+            return "clock_untrusted"
+        if not self.clock_synced:
+            self._sync_clock(link)
+        return None
 
     def _sync_clock(self, link: CompanionLink) -> None:
         """Move the companion's clock forward to the base's, once the base's own clock is trusted. A repeater compares the timestamps on
@@ -484,6 +533,9 @@ class CompanionSession:
                 message = companion.parse_contact_message(frame)
             except companion.ProtocolError as e:
                 self._drop("bad_frame", f"{e}: {frame.hex()}")
+                return
+            if self._executor.offer_message(message):
+                self.stats["remote_replies"] += 1
                 return
             self.stats["contact_messages"] += 1
             self._handler.on_contact_message(message)

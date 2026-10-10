@@ -7,6 +7,7 @@ place. Never edit a released migration, append a new one.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Iterator
 
 from . import names as names_mod
-from . import wire
+from . import remote, wire
 
 PUBKEY_LEN = 32
 
@@ -137,6 +138,45 @@ MIGRATIONS: list[tuple[str, ...]] = [
             offset_after REAL NOT NULL
         )""",
         "CREATE INDEX clock_events_boot ON clock_events (boot_id)",
+        """CREATE TABLE service_status (
+            id INTEGER PRIMARY KEY CHECK (id = 1),   -- the one row beacon-ingest keeps current
+            pid INTEGER NOT NULL,
+            boot_id TEXT NOT NULL,
+            started_at REAL NOT NULL,
+            updated_at REAL NOT NULL,         -- wall clock, for display
+            updated_mono REAL NOT NULL,       -- monotonic clock, shared by every process of a boot: liveness, so a clock step cannot fake it
+            state TEXT NOT NULL,              -- running, or stopped (a clean shutdown)
+            connected INTEGER NOT NULL DEFAULT 0,
+            port TEXT,
+            connected_since REAL,
+            companion_name TEXT,
+            companion_model TEXT,
+            companion_firmware TEXT,
+            companion_key_prefix BLOB,        -- the first 6 bytes of the companion's key, which is what a repeater's ACL lists
+            last_frame_at REAL,
+            last_report_at REAL,
+            stats TEXT NOT NULL DEFAULT '{}', -- session and pipeline counters, JSON
+            clock_trusted INTEGER NOT NULL DEFAULT 0,
+            companion_clock_offset_s INTEGER, -- companion minus base, as last read; NULL until read
+            remote_state TEXT NOT NULL DEFAULT 'idle'
+        )""",
+        """CREATE TABLE remote_jobs (
+            id INTEGER PRIMARY KEY,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,         -- a job not started by then is expired, so a queued 'set' never fires hours later
+            repeater_prefix BLOB NOT NULL REFERENCES repeaters (prefix) ON DELETE CASCADE,
+            kind TEXT NOT NULL,               -- one of remote.KINDS: a closed set, never command text
+            op TEXT NOT NULL CHECK (op IN ('get', 'set')),
+            params TEXT NOT NULL DEFAULT '{}',
+            secret TEXT,                      -- the admin password if one was given; erased when the job is picked up
+            state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired')),
+            started_at REAL,
+            finished_at REAL,
+            result TEXT,                      -- JSON: the values now on the repeater, the replies, round trips
+            error_code TEXT,
+            error TEXT
+        )""",
+        "CREATE INDEX remote_jobs_state ON remote_jobs (state, id)",
     ),
 ]
 
@@ -269,6 +309,109 @@ class Store:
             raise
         else:
             self.conn.execute("COMMIT")
+
+    # --- ingest heartbeat ----------------------------------------------------------------------------------------------
+
+    STATUS_COLUMNS = (
+        "pid", "boot_id", "started_at", "updated_at", "updated_mono", "state", "connected", "port", "connected_since",
+        "companion_name", "companion_model", "companion_firmware", "companion_key_prefix", "last_frame_at", "last_report_at",
+        "stats", "clock_trusted", "companion_clock_offset_s", "remote_state",
+    )
+
+    def write_status(self, values: dict) -> None:
+        """Replace the one service_status row (written by beacon-ingest; see heartbeat.py). Columns not given become NULL."""
+        unknown = set(values) - set(self.STATUS_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown service_status columns: {sorted(unknown)}")
+        row = {c: values.get(c) for c in self.STATUS_COLUMNS}
+        columns = ", ".join(self.STATUS_COLUMNS)
+        marks = ", ".join("?" for _ in self.STATUS_COLUMNS)
+        with self.transaction() as db:
+            db.execute(f"INSERT OR REPLACE INTO service_status (id, {columns}) VALUES (1, {marks})", [row[c] for c in self.STATUS_COLUMNS])
+
+    def status_row(self) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM service_status WHERE id = 1").fetchone()
+
+    # --- remote jobs ---------------------------------------------------------------------------------------------------
+    #
+    # beaconctl queues a job, beacon-ingest (which owns the serial port) runs it. See remote.py for what a job may be.
+
+    JOB_TTL = 60.0  # seconds a queued job may wait for ingest to pick it up
+
+    def submit_job(
+        self, ref: str, kind: str, op: str, params: dict | None = None, password: str | None = None,
+        ttl: float = JOB_TTL, now: float | None = None,
+    ) -> int:
+        """Queue an operation on a trusted repeater. The values are checked here and again by ingest before anything is sent."""
+        try:
+            params = remote.validate(kind, op, params)
+            password = remote.validate_password(password)
+        except remote.RemoteError as e:
+            raise StoreError(str(e)) from None
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            repeater = self.repeater(ref)
+            cur = db.execute(
+                """INSERT INTO remote_jobs (created_at, expires_at, repeater_prefix, kind, op, params, secret)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (now, now + ttl, repeater["prefix"], kind, op, json.dumps(params, sort_keys=True), password),
+            )
+            return cur.lastrowid
+
+    def claim_job(self, now: float | None = None) -> remote.RemoteJob | None:
+        """Take the oldest queued job for ingest to run: mark it running and erase its password from the table (the returned job
+        carries it in memory). Jobs that waited past their expiry are expired first, so a stale 'set' never runs."""
+        if self.conn.execute("SELECT 1 FROM remote_jobs WHERE state = 'queued' LIMIT 1").fetchone() is None:
+            return None  # the usual case, four times a second: look without taking the write lock
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE remote_jobs SET state = 'expired', finished_at = ?, secret = NULL, error_code = 'expired', error = ?
+                   WHERE state = 'queued' AND expires_at < ?""",
+                (now, remote.ERROR_TEXT["expired"], now),
+            )
+            row = db.execute(
+                """SELECT j.*, r.pubkey, r.name AS repeater_name, r.lat, r.lon FROM remote_jobs j
+                   JOIN repeaters r ON r.prefix = j.repeater_prefix WHERE j.state = 'queued' ORDER BY j.id LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute("UPDATE remote_jobs SET state = 'running', started_at = ?, secret = NULL WHERE id = ?", (now, row["id"]))
+        return remote.RemoteJob(
+            id=row["id"], repeater_prefix=bytes(row["repeater_prefix"]), pubkey=None if row["pubkey"] is None else bytes(row["pubkey"]),
+            name=row["repeater_name"], lat=row["lat"], lon=row["lon"], kind=row["kind"], op=row["op"],
+            params=json.loads(row["params"]), password=row["secret"], created_at=row["created_at"],
+        )
+
+    def finish_job(self, job_id: int, outcome: remote.JobOutcome, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE remote_jobs SET state = ?, finished_at = ?, result = ?, error_code = ?, error = ?, secret = NULL
+                   WHERE id = ? AND state = 'running'""",
+                (
+                    "done" if outcome.ok else "failed", now, json.dumps(outcome.result, sort_keys=True), outcome.code,
+                    None if outcome.ok else outcome.message, job_id,
+                ),
+            )
+
+    def recover_jobs(self, now: float | None = None) -> int:
+        """Jobs left running by a crash will never finish: fail them, because the repeater may or may not have acted on them."""
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            cur = db.execute(
+                """UPDATE remote_jobs SET state = 'failed', finished_at = ?, secret = NULL, error_code = 'interrupted', error = ?
+                   WHERE state = 'running'""",
+                (now, remote.ERROR_TEXT["interrupted"]),
+            )
+            return cur.rowcount
+
+    def job(self, job_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM remote_jobs WHERE id = ?", (job_id,)).fetchone()
+
+    def jobs(self, limit: int = 20, active_only: bool = False) -> list[sqlite3.Row]:
+        where = "WHERE state IN ('queued', 'running')" if active_only else ""
+        return self.conn.execute(f"SELECT * FROM remote_jobs {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
     # --- beacons -------------------------------------------------------------------------------------------------------
     #

@@ -287,7 +287,8 @@ when the replay scenarios above pass, a lockout is visible in `beaconctl status`
 state survives a restart.
 
 **B3. Service hardening and packaging.**
-Heartbeat table, retention job (reconnect and resync exist from B1; clock-step handling moved into B2), systemd units, a udev rule giving the companion a stable name,
+Retention job (reconnect and resync exist from B1; clock-step handling moved into B2; the **heartbeat table was built early**,
+with the remote repeater management work, see [repeater-remote.md](repeater-remote.md)), systemd units, a udev rule giving the companion a stable name,
 install script for a Pi and for the dev machine, logging to journald, a short operator README. Done when the service
 survives unplugging the companion and reboots of the Pi unattended.
 

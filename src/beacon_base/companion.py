@@ -57,6 +57,7 @@ PUSH_NEW_ADVERT = 0x8A  # an advert from a node it does not store: a full contac
 ADV_TYPE_CHAT = 1
 ADV_TYPE_REPEATER = 2
 ADV_TYPE_SENSOR = 4
+TXT_TYPE_PLAIN = 0  # a person's text message
 TXT_TYPE_CLI_DATA = 1  # a CLI command to a repeater, or its reply
 PERM_ADMIN = 3  # ACL permission of an admin client; 0 is guest, 1 read-only, 2 read-write
 MAX_PASSWORD_LEN = 15  # bytes; the firmware truncates longer passwords silently

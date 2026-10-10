@@ -208,6 +208,7 @@ class CompanionLink:
         self.command_timeout = command_timeout
         self.on_push: Callable[[bytes], None] = lambda frame: None
         self.stray_frames = 0
+        self.last_rx: float | None = None  # wall time of the last frame received
 
     @property
     def discarded_bytes(self) -> int:
@@ -230,7 +231,10 @@ class CompanionLink:
                 return None
             data = self._transport.read(min(remaining, READ_SLICE))
             if data:
-                self._ready.extend(self._decoder.feed(data))
+                frames = self._decoder.feed(data)
+                if frames:
+                    self.last_rx = time.time()
+                self._ready.extend(frames)
             if self._decoder.pending:
                 now = time.monotonic()
                 if self._partial_since is None or data:

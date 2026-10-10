@@ -8,7 +8,10 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > repeaters by key prefix and shows a lockout and its one-step fix. B1, B2, the beacon names (repeater
 > firmware `28bb4985` in the firmware repository) and the repeater onboarding (positions from adverts, discovery and
 > auto-add) are verified on hardware.
-> No web UI yet (B4) and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> **In progress:** remote repeater management over the mesh ([docs/plan/repeater-remote.md](docs/plan/repeater-remote.md)).
+> The companion protocol, the ingest heartbeat and the job executor inside `beacon-ingest` are implemented and tested against a
+> fake repeater (RM1, RM2); the `beaconctl repeater remote` commands (RM3) and the hardware check (RM4) are not done yet.
+> No web UI yet (B4) and no packaging (B3) beyond the heartbeat. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works
@@ -57,6 +60,7 @@ tested at a desk.
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): overall project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): base design, data model, pipeline, phases B0-B4.
+- [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh (a small fixed set of operations), the ingest heartbeat.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
 - [docs/operations.md](docs/operations.md): running on real hardware, starting with the companion's USB serial (DTR) settings.
 
@@ -212,6 +216,22 @@ rejected  Roof  a0a1a2a3a4a5a6a7  1000000  12s ago 3.98V  3 replays rejected sin
 accepted (a repeater with a long `beacon.window`) is rejected as `late` but is not a lockout; keep every repeater's
 window below the beacon interval (`beaconctl check` warns).
 
+### Is ingest running?
+
+`beacon-ingest` keeps a one-row heartbeat in the database, written when something changes (connect, disconnect, a job) and at least
+every 15 seconds. `beaconctl status` prints it first:
+
+```
+ingest: running (pid 1234, started 3h ago)
+companion: base (Xiao nRF52 v1.12) on /dev/serial/by-id/..., key 808182838485, connected 3h ago; last frame 2s ago, last report 40s ago
+```
+
+and flags (`!`) a companion that is not connected, an ingest that is **not running** (its row is older than 45 s, or from before the
+last boot, or it was stopped cleanly) or that **has never run**. Liveness uses the monotonic clock, so setting the Pi's clock by hand
+cannot make a dead ingest look alive. `beaconctl check` fails when ingest is down or the companion is not connected, but not for an
+ingest that has never run (a fresh setup is checked before its first start). The key prefix shown is the companion's, which is what a
+repeater lists in its access list once the base has logged in to it.
+
 ### Working without hardware
 
 ```bash
@@ -267,7 +287,7 @@ arrived.
 | B0 | Done. Firmware repo emits golden test vectors for the report format. |
 | B1 | Done and verified on hardware: wire decoder, serial framing, companion startup, `beaconctl listen`. |
 | B2 | Done and verified on hardware: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
-| B3 | Hardening and packaging: heartbeat table, retention, systemd units, udev rule, install script. |
+| B3 | Hardening and packaging: retention, systemd units, udev rule, install script. (The ingest heartbeat is done, built with the remote management work.) |
 | B4 | Web API and minimal offline map (MBTiles). |
 
 Later: location estimation, offline tile-cache builder, repeater timestamps, airtime measurement.

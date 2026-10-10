@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import sqlite3
 import sys
 import threading
+import time
 from collections import Counter
 
-from . import clock, names
+from . import clock, heartbeat, names
 from .config import Config, ConfigError, load_config
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, RawFrame, ReceivedNames, ReceivedReport
 from .link import DTR_MODES, CompanionError
@@ -23,14 +25,65 @@ log = logging.getLogger("beacon-ingest")
 class PipelineHandler(Handler):
     """Runs every decoded report through the replay/dedupe pipeline and watches for the system clock being set."""
 
-    def __init__(self, store: Store, pipeline: Pipeline):
+    def __init__(self, store: Store, pipeline: Pipeline, port: str | None = None, heartbeat_interval: float = heartbeat.INTERVAL):
         self._store = store
         self._pipeline = pipeline
+        self._port = port
         self._offset = clock.offset()  # wall minus monotonic clock; a jump means someone set the clock
         self.counts: Counter[str] = Counter()
+        self.heartbeat = heartbeat.HeartbeatWriter(store, heartbeat_interval)
+        self.session: CompanionSession | None = None  # set by bind(); the heartbeat reports its counters
+        self._last_report_at: float | None = None
+        self._next_sample = 0.0
+
+    def bind(self, session: CompanionSession) -> None:
+        self.session = session
+
+    def close(self) -> None:
+        """Say so in the heartbeat that this was a clean stop."""
+        self.heartbeat.stop()
 
     def on_connected(self, info: ConnectionInfo) -> None:
         log.info("connected to companion %r", info.self_info.name)
+        self.heartbeat.set(
+            connected=1, port=self._port, connected_since=time.time(), companion_name=info.self_info.name,
+            companion_model=info.device_info.model, companion_firmware=info.device_info.version,
+            companion_key_prefix=info.self_info.public_key[:6],
+        )
+        self.heartbeat.write()
+
+    def claim_job(self):
+        try:
+            return self._store.claim_job()
+        except sqlite3.Error as e:
+            log.warning("could not look at the remote job queue: %s", e)
+            return None
+
+    def finish_job(self, job, outcome) -> None:
+        try:
+            self._store.finish_job(job.id, outcome)
+        except sqlite3.Error as e:  # the job stays 'running' and is failed as interrupted at the next start
+            log.error("could not record the outcome of remote job %d: %s", job.id, e)
+
+    def on_tick(self) -> None:
+        """Refresh what the heartbeat reports (about once a second) and let it write when due."""
+        now = time.monotonic()
+        if now >= self._next_sample:
+            self._next_sample = now + 1.0
+            try:
+                trusted = int(self._pipeline.time_trusted())
+            except sqlite3.Error:
+                trusted = self.heartbeat.value("clock_trusted") or 0  # the database is busy: keep what was last known
+            fields = dict(last_report_at=self._last_report_at, clock_trusted=trusted)
+            if self.session is not None:
+                stats = dict(self.session.stats)
+                stats.update({f"pipeline_{k}": v for k, v in self.counts.items()})
+                fields.update(
+                    stats=stats, last_frame_at=self.session.last_frame_at, companion_clock_offset_s=self.session.companion_clock_offset,
+                    remote_state=self.session.remote_state,
+                )
+            self.heartbeat.set(**fields)
+        self.heartbeat.tick()
 
     def on_synced(self) -> None:
         log.info("companion queue drained, now live")
@@ -40,8 +93,11 @@ class PipelineHandler(Handler):
 
     def on_disconnected(self, error: str | None) -> None:
         log.warning("companion disconnected%s", f": {error}" if error else "")
+        self.heartbeat.set(connected=0, connected_since=None, remote_state="idle")
+        self.heartbeat.write()
 
     def on_report(self, rx: ReceivedReport) -> None:
+        self._last_report_at = time.time()
         self._check_clock_step(rx)
         verdicts = self._pipeline.process(rx)
         _, repeaters = self._store.names()
@@ -128,7 +184,17 @@ def run(cfg: Config, stop: threading.Event) -> None:
     with Store.open(cfg.db_path) as store:
         log.info("database %s (schema %d)", cfg.db_path, store.schema_version())
         pipeline = Pipeline(store, assume_synced=cfg.clock.assume_synced)
-        CompanionSession(cfg, PipelineHandler(store, pipeline)).run(stop)
+        interrupted = store.recover_jobs()
+        if interrupted:
+            log.warning("%d remote job(s) were running when ingest last stopped; they are marked failed", interrupted)
+        handler = PipelineHandler(store, pipeline, cfg.companion.port)
+        session = CompanionSession(cfg, handler)
+        handler.bind(session)
+        handler.heartbeat.write()  # so 'beaconctl status' sees ingest from the first moment, before the companion answers
+        try:
+            session.run(stop)
+        finally:
+            handler.close()
 
 
 def main(argv: list[str] | None = None) -> int:

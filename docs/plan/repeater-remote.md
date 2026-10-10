@@ -1,6 +1,6 @@
 # Remote Repeater Management Plan
 
-Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock) is implemented; RM2 onwards is not.** Written after reading the firmware (`examples/simple_repeater`,
+Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock) and RM2 (heartbeat, jobs, executor) are implemented and tested against a fake repeater; RM3 onwards is not.** Written after reading the firmware (`examples/simple_repeater`,
 `examples/companion_radio`, `src/helpers/CommonCLI.cpp`) and this repo, then amended with the firmware session's findings
 (documentation commit `e5761d02`, "Firmware follow-ups"). Done before the rest of B3; it includes the ingest heartbeat from B3
 and nothing else from it. See "Phases".
@@ -390,7 +390,32 @@ its own first), then the `remote_jobs` table (edit migration 1, delete the dev d
 session, the handler hook in `service.py`, expiry and recovery. Done when the heartbeat shows ingest up/down and the link
 state, and jobs submitted from a test run to completion with reports flowing at the same time.
 
-**RM3. Commands.** `beaconctl repeater remote ...`, validators, password sources, write-through, `check` additions
+*Done.* What was built, and where it differs from the text above:
+
+- **Heartbeat** (`heartbeat.py`, `service_status` in migration 1, `Store.write_status`): `HeartbeatWriter` writes on a change of any
+  event field (connection, companion identity, clock trust and offset, remote state) and otherwise every 15 s; counters and last-seen
+  times ride on the periodic write. Liveness compares `updated_mono` with the shared monotonic clock (and the boot id), not wall time,
+  so setting the Pi's clock cannot fake it. States: up, down (older than 45 s, or another boot), stopped (clean), never.
+  `beaconctl status` prints the ingest and companion lines first; `beaconctl check` fails on down, stopped, or a companion that is
+  not connected, and **not** on "never run". `Handler.on_tick` runs about four times a second, also while waiting to reconnect.
+- **Jobs** (`remote_jobs` in migration 1; `Store.submit_job`, `claim_job`, `finish_job`, `recover_jobs`, `job`, `jobs`): the queue is
+  looked at four times a second with a plain read, and the write transaction only happens when a job is queued. A claim erases the
+  password from the row; expired jobs also lose it. `recover_jobs` runs when ingest starts.
+- **Operations moved here from RM3.** The executor needs the closed set, so `remote.py` (validation, the commands, `interpret`) is
+  part of RM2, with `RemoteConfig` (`[remote]`: step timeout limits and `max_job_s`; the 60 s expiry is fixed). The write-through of
+  a confirmed name, position and window into `repeaters`, the CLI, `check` additions and docs remain RM3. A job kind `all` (get only)
+  was added for `get all`; a job error `companion_refused` for the companion rejecting a send.
+- **Executor** (`executor.py`): driven by `CompanionSession` (`new_connection`, `poll` each loop, `offer_login`, `offer_message`,
+  `abort`). Login events and replies are queued by the callbacks and acted on in `poll`, where it is safe to send commands. A reply
+  that carries another tag is dropped and counted; an untagged one is taken (a repeater that does not reflect the tag). A step times
+  out at the companion's estimate x 1.5 within 8-30 s, is retried once after a path reset and a fresh login, then fails `no_reply`.
+- **Clock gate.** A job fails `clock_untrusted` when `companion.sync_clock` is on and the base clock is not trusted, and syncs the
+  companion's clock first when it is trusted but not yet done.
+- Tests: 168 new (568 in all), among them the whole flow through a real session thread, the fake companion and the fake repeater with
+  reports arriving during a job, enrolment by password then by the ACL after a repeater reboot, a lost reply and a lost login,
+  an unreachable repeater, a disconnect mid-job and a stale job. **Not seen on hardware.**
+
+**RM3. Commands.** `beaconctl repeater remote ...`, password sources, write-through, `check` additions
 (channel hash mismatch is a failing finding when a result is on record), README section, `docs/operations.md`, CLAUDE.md.
 Done when every item reads and sets against the fake repeater from the command line.
 

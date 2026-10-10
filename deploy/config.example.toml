@@ -36,6 +36,15 @@ sync_clock = true
 poll_interval = 30
 command_timeout = 5
 
+# Remote repeater management over the mesh ('beaconctl repeater remote', docs/plan/repeater-remote.md). A step waits for the
+# companion's estimate of the round trip times timeout_factor, kept between the two limits, and is retried once after the route is
+# reset. A job running longer than max_job_s is failed.
+[remote]
+min_timeout_s = 8
+max_timeout_s = 30
+timeout_factor = 1.5
+max_job_s = 180
+
 # Radio settings shared by every device in the mesh (beacons, repeaters, base).
 [radio]
 freq_khz = 905775

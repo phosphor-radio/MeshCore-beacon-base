@@ -11,11 +11,16 @@ Scale is about 30 beacons and 10 repeaters.
 
 **Status: B1, B2 (store and pipeline) and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and
 verified on hardware, as is the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1-R3: positions and names
-from repeater adverts, plus discovery and auto-add). B3 onwards is not started.** The plans are the source of truth:
+from repeater adverts, plus discovery and auto-add). The remote repeater management work
+(`docs/plan/repeater-remote.md`) is under way: RM1 (companion protocol, clock) and RM2 (ingest heartbeat, job table, executor) are
+implemented and tested against a fake repeater but not on hardware; RM3 (`beaconctl repeater remote`) and RM4 (hardware) are not
+done. The rest of B3 (retention, systemd, udev, install) and B4 are not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
   replay pipeline, phases B0-B4, open questions.
+- [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh: a closed set of operations run as
+  jobs by ingest, the heartbeat, firmware facts (login, ACL, replay rules), the hardware script.
 
 Read the base plan before designing or implementing anything. If a change contradicts a recorded decision, say so and
 update the plan rather than silently diverging. The plan docs are dated and carry a "Decisions" table; keep them current.
@@ -76,6 +81,9 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    runtime.py    logging and signal setup shared by entry points
                    fake_companion.py, simulate.py   fake companion on a pty and synthetic traffic
                    fake_repeater.py   model of a repeater's login/ACL/CLI (silent failures, replay rules, lossy get lat) for remote tests
+                   remote.py     the closed set of remote repeater operations: validation, the commands, reading the replies (pure)
+                   executor.py   RemoteExecutor: the job state machine the session loop drives (contact, login, tagged command, retry)
+                   heartbeat.py  the service_status row ingest keeps current; HeartbeatWriter, liveness (monotonic clock)
                    (+ estimate.py api.py)
 web/               (+) static map UI (Leaflet)
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
@@ -85,6 +93,14 @@ deploy/            config.example.toml        (+ systemd units, udev rule, insta
 `CompanionSession` takes a `Handler`; `service.PipelineHandler` plugs the pipeline in (`on_report` receives a
 `ReceivedReport` with `rx_wall`, `rx_mono`, `late`, the companion SNR and the raw payload; `on_drop` carries the raw frame
 of a report that failed to decode). `on_synced` fires once the offline queue has been drained after connecting.
+
+**Remote repeater management** (plan `docs/plan/repeater-remote.md`): `beaconctl` never opens the port. It queues a row in `remote_jobs`
+(`Store.submit_job`: a kind from the closed set in `remote.py`, typed params, never command text; a password only until pickup) and
+`beacon-ingest` runs it: `Handler.claim_job` -> `RemoteExecutor` (driven from the session loop, one job and one command at a time, never
+blocking report draining) -> `Handler.finish_job`. A login is admin only if the push says role 1 *and* permission 3 (an empty password
+from a key the repeater does not know is a guest login); commands go out as `NN|command` and the reply is matched on the tag; one retry
+after `CMD_RESET_PATH`. Jobs expire after 60 s unqueued; `recover_jobs` fails any left `running` by a crash. `get lat/lon` read back
+lossy, so the base records the value it sent. `beacon-ingest` also keeps the `service_status` heartbeat row (`heartbeat.py`).
 
 Repeater positions and names come from the **repeaters' own adverts**, heard by the base companion (`CompanionSession`:
 contact list at connect, `PUSH_NEW_ADVERT`, bare `PUSH_ADVERT` then `CMD_GET_CONTACT_BY_KEY`; the companion is put in

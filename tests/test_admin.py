@@ -123,6 +123,7 @@ def test_lockout_is_visible_in_status_and_cleared_by_one_reset(cfg_file, tmp_pat
     code, out, _ = run(cfg_file, "status", capsys=capsys)
     assert code == 0
     lines = out.splitlines()
+    lines = lines[next(i for i, l in enumerate(lines) if l.startswith("STATE")):]  # after the ingest lines
     assert lines[1].startswith("rejected") and "Roof" in lines[1] and B1 in lines[1]  # most urgent first
     assert "3 replays rejected" in lines[1] and "counters 300-302" in lines[1] and "hwm 1000000" in lines[1]
     assert "north" in lines[1]

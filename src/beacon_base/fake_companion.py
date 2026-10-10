@@ -376,7 +376,7 @@ class FakeCompanion:
         if not self._delivered(repeater, flooded):
             return
         reply = repeater.login(self.public_key, password, self._unique_time())
-        if reply is None:
+        if reply is None or repeater.lose_login_reply():
             return  # a repeater never sends a failure: the host sees only a timeout
         if flooded:
             self.paths[key] = 1  # the reply teaches the companion the route
@@ -401,7 +401,7 @@ class FakeCompanion:
             if txt_type == 0 or not self._delivered(repeater, flooded):
                 return
             reply = repeater.command(self.public_key, self._unique_time(), text.decode("utf-8", "replace"))
-            if reply is None or repeater.drop_replies:
+            if reply is None or repeater.lose_reply():
                 return
             if flooded:
                 self.paths[key] = 1
