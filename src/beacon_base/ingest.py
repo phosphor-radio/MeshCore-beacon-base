@@ -21,6 +21,9 @@ from .link import CompanionError, CompanionLink, CommandError, NoReply, SerialTr
 
 log = logging.getLogger(__name__)
 
+CLOCK_TOLERANCE_S = 2  # the companion's clock is only set when it is behind by more than this
+CLOCK_AHEAD_WARN_S = 60  # warn when it is ahead by more than this: it cannot be moved back
+CLOCK_RECHECK_S = 30.0  # how often to look again while the base's own clock is not trusted yet
 RECONNECT_MIN = 1.0
 RECONNECT_MAX = 30.0
 DRAIN_LIMIT = 1000  # messages per drain call, a guard against a companion that never says "no more"
@@ -91,6 +94,18 @@ class Handler:
 
     def on_report(self, rx: ReceivedReport) -> None: ...
 
+    def clock_trusted(self) -> bool:
+        """True once the base's clock is known to be right. Only then is the companion's clock moved forward to it: the companion
+        cannot be set back, and repeaters reject a login whose timestamp is not newer than the last one they saw."""
+        return False
+
+    def on_login(self, result: companion.LoginResult) -> None:
+        """A repeater answered a login (or the companion reported a failure). Called from the session thread, mid-command, so it
+        must only note the result."""
+
+    def on_contact_message(self, message: companion.ContactMessage) -> None:
+        """A message from a contact came out of the offline queue: for a repeater, the reply to a CLI command."""
+
     def on_repeater_advert(self, advert: HeardRepeater) -> None:
         """The base companion heard a repeater advertise, or listed one among its contacts."""
 
@@ -149,6 +164,9 @@ class CompanionSession:
         self._stop = threading.Event()
         self._contacts: dict[bytes, companion.Contact] = {}  # every node the companion has told us about, this connection
         self._advert_pushes: deque[bytes] = deque(maxlen=1000)
+        # the companion's clock (see _sync_clock); both are reset on every connection
+        self.clock_synced = False
+        self.companion_clock_offset: int | None = None  # companion minus base, in seconds, as last read
 
     # --- connection loop -------------------------------------------------------------------------------------------
 
@@ -236,6 +254,15 @@ class CompanionSession:
     def _on_push(self, frame: bytes) -> None:
         if frame[0] == companion.PUSH_MSG_WAITING:
             self._msg_waiting = True
+        elif frame[0] in (companion.PUSH_LOGIN_SUCCESS, companion.PUSH_LOGIN_FAIL):
+            try:
+                result = companion.parse_login(frame)
+            except companion.ProtocolError as e:
+                self.stats["bad_login"] += 1
+                log.debug("ignoring a login push: %s", e)
+                return
+            self.stats["logins"] += 1
+            self._handler.on_login(result)
         elif frame[0] in (companion.PUSH_NEW_ADVERT, companion.PUSH_ADVERT) and self._cfg.companion.learn_repeaters:
             # handled in the main loop: it needs commands of its own, which cannot nest inside another request
             self._advert_pushes.append(frame)
@@ -256,6 +283,9 @@ class CompanionSession:
         if self._cfg.companion.learn_repeaters:
             self._sync_contacts(link)  # after the drain, so it never delays a report
         self._handler.on_synced()
+        self.clock_synced, self.companion_clock_offset = False, None
+        self._sync_clock(link)
+        next_clock = time.monotonic() + CLOCK_RECHECK_S
         next_poll = time.monotonic() + self._cfg.companion.poll_interval
         while not stop.is_set():
             frame = link.recv_frame(min(0.5, max(next_poll - time.monotonic(), 0.0)))
@@ -270,6 +300,9 @@ class CompanionSession:
                 next_poll = time.monotonic() + self._cfg.companion.poll_interval
             if self._advert_pushes:
                 self._process_adverts(link)
+            if not self.clock_synced and time.monotonic() >= next_clock:
+                self._sync_clock(link)  # the base's clock may have been set since the last look
+                next_clock = time.monotonic() + CLOCK_RECHECK_S
 
     def _start(self, link: CompanionLink) -> ConnectionInfo:
         cc = self._cfg.companion
@@ -336,6 +369,31 @@ class CompanionSession:
             log.warning("could not set the companion's path hash mode to %d: %s", want, e)
             return
         log.info("set the companion's path hash mode to %d (was %d)", want, have)
+
+    def _sync_clock(self, link: CompanionLink) -> None:
+        """Move the companion's clock forward to the base's, once the base's own clock is trusted. A repeater compares the timestamps on
+        a login and on each command with the last it saw from this key, and the companion's clock restarts at an old date after a
+        reboot (an nRF52 without an RTC chip). It is never set when the base clock is untrusted, nor backward (the companion refuses),
+        and it is not written to flash. A companion that is ahead is only reported."""
+        if self.clock_synced or not self._cfg.companion.sync_clock or not self._handler.clock_trusted():
+            return
+        try:
+            have = companion.parse_device_time(link.request(companion.get_device_time(), [companion.RESP_CURR_TIME]))
+            now = int(time.time())
+            self.companion_clock_offset = have - now
+            if have < now - CLOCK_TOLERANCE_S:
+                link.request(companion.set_device_time(now), [companion.RESP_OK])
+                log.info("set the companion's clock forward by %d s (it was %s)", now - have, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(have)))
+                self.companion_clock_offset = 0
+            elif have > now + CLOCK_AHEAD_WARN_S:
+                log.warning(
+                    "the companion's clock is %d s ahead of the base's; it cannot be set back, so reboot the companion if the base's "
+                    "clock is the right one (repeaters ignore logins and commands stamped earlier than ones they have seen)", have - now,
+                )
+            self.clock_synced = True
+        except CommandError as e:
+            log.warning("could not set the companion's clock: %s", e)
+            self.clock_synced = True  # do not retry every half minute; the next connection tries again
 
     def _ensure_channel(self, link: CompanionLink) -> None:
         cc = self._cfg.companion
@@ -421,6 +479,15 @@ class CompanionSession:
         self._msg_waiting = True  # more may be queued, come straight back
 
     def _handle_message(self, frame: bytes) -> None:
+        if frame[0] in (companion.RESP_CONTACT_MSG_RECV, companion.RESP_CONTACT_MSG_RECV_V3):
+            try:
+                message = companion.parse_contact_message(frame)
+            except companion.ProtocolError as e:
+                self._drop("bad_frame", f"{e}: {frame.hex()}")
+                return
+            self.stats["contact_messages"] += 1
+            self._handler.on_contact_message(message)
+            return
         if frame[0] != companion.RESP_CHANNEL_DATA_RECV:
             self._drop("other_message", f"code {frame[0]}")
             return

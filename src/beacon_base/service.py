@@ -35,6 +35,9 @@ class PipelineHandler(Handler):
     def on_synced(self) -> None:
         log.info("companion queue drained, now live")
 
+    def clock_trusted(self) -> bool:
+        return self._pipeline.time_trusted()
+
     def on_disconnected(self, error: str | None) -> None:
         log.warning("companion disconnected%s", f": {error}" if error else "")
 

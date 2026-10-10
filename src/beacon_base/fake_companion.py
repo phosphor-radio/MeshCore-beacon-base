@@ -2,7 +2,9 @@
 
 Speaks enough of the companion protocol for ``CompanionSession``: APP_START, DEVICE_QUERY, GET/SET_CHANNEL,
 SET_RADIO_PARAMS, SET_OTHER_PARAMS, GET_CONTACTS, GET_CONTACT_BY_KEY and SYNC_NEXT_MESSAGE, with an offline queue and MSG_WAITING pushes like the real firmware
-(``examples/companion_radio/MyMesh.cpp``). Test hooks inject reports, garbage and disconnects.
+(``examples/companion_radio/MyMesh.cpp``). It also does the remote-administration side: contacts with a route, a forward-only clock,
+CMD_SEND_LOGIN and CMD_SEND_TXT_MSG to ``FakeRepeater`` models added with ``add_repeater``, with the reply queued as a contact message.
+Test hooks inject reports, garbage and disconnects.
 """
 
 from __future__ import annotations
@@ -14,14 +16,18 @@ import select
 import struct
 import tempfile
 import threading
+import time
 import tty
 from collections import deque
 from pathlib import Path
 
 from . import companion, wire
+from .fake_repeater import FakeRepeater
 from .link import MAX_FRAME_SIZE
 
 OFFLINE_QUEUE_SIZE = 256
+NRF52_RTC_START = 1715770351  # 15 May 2024, where an nRF52 without an RTC chip starts at every boot
+NO_PATH = 0xFF
 
 
 class FakeCompanion:
@@ -31,6 +37,8 @@ class FakeCompanion:
         radio: tuple[int, int, int, int] = (905775, 62500, 8, 6),
         public_key: bytes = bytes(range(0x80, 0xA0)),
         fw_ver: int = 10,
+        rtc_start: int = NRF52_RTC_START,
+        rtc_persistent: bool = False,
     ):
         self.max_channels = max_channels
         self.radio = radio
@@ -51,6 +59,16 @@ class FakeCompanion:
         self.manual_add = False  # the companion's manual-add mode: it stores nothing and pushes every advert in full
         self.contacts_error: int | None = None  # answer CMD_GET_CONTACTS with this error code
         self.commands: list[bytes] = []  # every command frame received, for assertions
+        # remote administration: repeaters out on the mesh, the companion's own clock and the route it holds for each contact
+        self.repeaters: dict[bytes, FakeRepeater] = {}
+        self.paths: dict[bytes, int] = {}  # contact key -> stored out path length, NO_PATH when unknown (messages are flooded)
+        self.app_ver = 0  # the version the host declared in DEVICE_QUERY; 3 or more gets version 3 message frames
+        self.est_timeout_ms = 2000
+        self.contacts_full = False  # answer CMD_ADD_UPDATE_CONTACT for a new contact with 'table full'
+        self.rtc_start = rtc_start
+        self.rtc_persistent = rtc_persistent  # an ESP32 keeps its clock over a software reset, an nRF52 without an RTC chip does not
+        self._rtc_base, self._rtc_mark = rtc_start, time.monotonic()
+        self._last_unique = 0
         self.send_push_on_enqueue = True
         self._lock = threading.RLock()
         self._tmpdir = tempfile.TemporaryDirectory(prefix="fake-companion-")
@@ -100,6 +118,9 @@ class FakeCompanion:
         if reboot:
             with self._lock:
                 self.queue.clear()
+                if not self.rtc_persistent:
+                    self.set_rtc(self.rtc_start)
+                self.app_ver = 0
         self._open_pty()
 
     def close(self) -> None:
@@ -139,6 +160,30 @@ class FakeCompanion:
             self.write_frame(bytes([companion.PUSH_ADVERT]) + public_key)
         else:
             self.write_frame(companion.build_contact(companion.PUSH_NEW_ADVERT, public_key, adv_type, name, counter, lat, lon))
+
+    def add_repeater(self, repeater: FakeRepeater) -> FakeRepeater:
+        """Put a repeater model on the mesh. The companion only talks to it once it is a contact (CMD_ADD_UPDATE_CONTACT)."""
+        self.repeaters[repeater.public_key] = repeater
+        return repeater
+
+    def rtc(self) -> int:
+        with self._lock:
+            return self._rtc_base + int(time.monotonic() - self._rtc_mark)
+
+    def set_rtc(self, secs: int) -> None:
+        """Set the clock directly, even backward: a test hook, the command refuses to go backward."""
+        with self._lock:
+            if secs < self.rtc():
+                self._last_unique = 0  # going backward is a reboot, which also loses the 'unique' counter held in RAM
+            self._rtc_base, self._rtc_mark = secs, time.monotonic()
+
+    def _unique_time(self) -> int:
+        """``getCurrentTimeUnique``: the clock, bumped so that two calls never return the same second."""
+        t = self.rtc()
+        if t <= self._last_unique:
+            t = self._last_unique + 1
+        self._last_unique = t
+        return t
 
     def enqueue_frame(self, frame: bytes) -> None:
         with self._lock:
@@ -216,6 +261,7 @@ class FakeCompanion:
             frame += struct.pack("<IIBB", freq, bw, sf, cr) + b"fake-companion"
             self.write_frame(frame)
         elif op == companion.CMD_DEVICE_QUERY and len(cmd) >= 2:
+            self.app_ver = cmd[1]
             frame = bytes([companion.RESP_DEVICE_INFO, self.fw_ver, 50, self.max_channels]) + bytes(4)
             frame += b"08 Oct 2026".ljust(12, b"\0") + b"Fake Companion".ljust(40, b"\0") + b"v1.fake".ljust(20, b"\0")
             frame += bytes([0, self.path_hash_mode]) if self.fw_ver >= 10 else b""
@@ -261,6 +307,28 @@ class FakeCompanion:
                 self._err(2)
             else:
                 self.write_frame(companion.build_contact(companion.RESP_CONTACT, bytes(cmd[1:33]), *entry))
+        elif op == companion.CMD_GET_DEVICE_TIME:
+            self.write_frame(bytes([companion.RESP_CURR_TIME]) + struct.pack("<I", self.rtc()))
+        elif op == companion.CMD_SET_DEVICE_TIME and len(cmd) >= 5:
+            secs = struct.unpack_from("<I", cmd, 1)[0]
+            if secs >= self.rtc():
+                self.set_rtc(secs)
+                self._ok()
+            else:
+                self._err(6)  # the clock only moves forward
+        elif op == companion.CMD_ADD_UPDATE_CONTACT and len(cmd) >= 36:
+            self._add_contact(cmd)
+        elif op == companion.CMD_RESET_PATH and len(cmd) >= 33:
+            key = bytes(cmd[1:33])
+            if key in self.contacts:
+                self.paths[key] = NO_PATH
+                self._ok()
+            else:
+                self._err(2)
+        elif op == companion.CMD_SEND_LOGIN and len(cmd) >= 33:
+            self._send_login(cmd)
+        elif op == companion.CMD_SEND_TXT_MSG and len(cmd) >= 14:
+            self._send_text(cmd)
         elif op == companion.CMD_SYNC_NEXT_MESSAGE:
             if self.queue:
                 self.write_frame(self.queue.popleft())
@@ -268,3 +336,75 @@ class FakeCompanion:
                 self.write_frame(bytes([companion.RESP_NO_MORE_MESSAGES]))
         else:
             self._err(1)
+
+    # --- remote administration ----------------------------------------------------------------------------------
+
+    def _add_contact(self, cmd: bytes) -> None:
+        if len(cmd) < 136:
+            # The firmware accepts 36 bytes and reads stale bytes for the rest; the fake is stricter so a short frame is caught.
+            self._err(6)
+            return
+        key = bytes(cmd[1:33])
+        if self.contacts_full and key not in self.contacts:
+            self._err(3)
+            return
+        name = bytes(cmd[100:132]).split(b"\0", 1)[0].decode("utf-8", "replace")
+        advert_ts = struct.unpack_from("<I", cmd, 132)[0]
+        lat = lon = 0.0
+        if len(cmd) >= 144:
+            raw_lat, raw_lon = struct.unpack_from("<ii", cmd, 136)
+            lat, lon = raw_lat / 1e6, raw_lon / 1e6
+        self.contacts[key] = (cmd[33], name, advert_ts, lat, lon)
+        self.paths[key] = cmd[35]
+        self._ok()
+
+    def _sent(self, flooded: bool, tag: bytes) -> None:
+        self.write_frame(bytes([companion.RESP_SENT, 1 if flooded else 0]) + tag + struct.pack("<I", self.est_timeout_ms))
+
+    def _delivered(self, repeater: FakeRepeater | None, flooded: bool) -> bool:
+        return repeater is not None and repeater.reachable and not (flooded and repeater.drop_floods)
+
+    def _send_login(self, cmd: bytes) -> None:
+        key = bytes(cmd[1:33])
+        if key not in self.contacts:
+            self._err(2)
+            return
+        password = bytes(cmd[33:]).split(b"\0", 1)[0][: companion.MAX_PASSWORD_LEN].decode("utf-8", "replace")
+        flooded = self.paths.get(key, NO_PATH) == NO_PATH
+        self._sent(flooded, key[:4])
+        repeater = self.repeaters.get(key)
+        if not self._delivered(repeater, flooded):
+            return
+        reply = repeater.login(self.public_key, password, self._unique_time())
+        if reply is None:
+            return  # a repeater never sends a failure: the host sees only a timeout
+        if flooded:
+            self.paths[key] = 1  # the reply teaches the companion the route
+        self.write_frame(
+            bytes([companion.PUSH_LOGIN_SUCCESS, reply.admin_flag]) + key[:6]
+            + struct.pack("<I", reply.server_time) + bytes([reply.permissions, reply.firmware_level])
+        )
+
+    def _send_text(self, cmd: bytes) -> None:
+        txt_type, prefix, text = cmd[1], bytes(cmd[7:13]), bytes(cmd[13:])
+        key = next((k for k in self.contacts if k.startswith(prefix)), None)
+        if key is None:
+            self._err(2)
+        elif txt_type not in (0, 1, 3):
+            self._err(1)
+        elif len(text) > companion.MAX_CLI_TEXT_LEN:
+            self._err(3)  # the firmware's misleading answer to text that is too long
+        else:
+            flooded = self.paths.get(key, NO_PATH) == NO_PATH
+            self._sent(flooded, bytes(4))
+            repeater = self.repeaters.get(key)
+            if txt_type == 0 or not self._delivered(repeater, flooded):
+                return
+            reply = repeater.command(self.public_key, self._unique_time(), text.decode("utf-8", "replace"))
+            if reply is None or repeater.drop_replies:
+                return
+            if flooded:
+                self.paths[key] = 1
+            path_len = NO_PATH if self.paths.get(key, NO_PATH) != NO_PATH and not flooded else 1
+            snr = 20 if self.app_ver >= 3 else None
+            self.enqueue_frame(companion.build_contact_message(key[:6], reply, path_len, companion.TXT_TYPE_CLI_DATA, repeater.now(), snr))

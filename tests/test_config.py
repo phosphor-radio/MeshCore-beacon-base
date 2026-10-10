@@ -115,3 +115,8 @@ def test_example_config_loads():
 
     cfg = load_config(Path(__file__).parent.parent / "deploy" / "config.example.toml")
     assert cfg.companion.channel_index == 1 and cfg.radio.cr == 6
+
+
+def test_sync_clock_defaults_on_and_can_be_switched_off(tmp_path):
+    assert load_config(write(tmp_path / "a.toml", "")).companion.sync_clock is True
+    assert load_config(write(tmp_path / "b.toml", "[companion]\nsync_clock = false\n")).companion.sync_clock is False

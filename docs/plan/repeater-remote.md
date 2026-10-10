@@ -1,6 +1,6 @@
 # Remote Repeater Management Plan
 
-Status: **reviewed and agreed 2026-10-10, nothing implemented.** Written after reading the firmware (`examples/simple_repeater`,
+Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock) is implemented; RM2 onwards is not.** Written after reading the firmware (`examples/simple_repeater`,
 `examples/companion_radio`, `src/helpers/CommonCLI.cpp`) and this repo, then amended with the firmware session's findings
 (documentation commit `e5761d02`, "Firmware follow-ups"). Done before the rest of B3; it includes the ingest heartbeat from B3
 and nothing else from it. See "Phases".
@@ -377,6 +377,14 @@ Each ends with something runnable.
 companion clock when the base clock is trusted; message routing for contact messages. Done when a scripted login and a tagged
 command round trip through the fake repeater in tests.
 
+*Done.* `companion.py` has the builders and parsers (`add_update_contact`, `send_login`, `send_cli`, `reset_path`, device time,
+`parse_sent`, `parse_login` with the strict `admin` test, `parse_contact_message`, tag helpers). `fake_repeater.py` models the
+repeater (ACL, replay rules, guest-by-default empty password, silent failures, lossy `get lat`, tag reflection, the beacon
+commands) and `fake_companion.py` gained contacts with routes, login, CLI messages, a forward-only clock and reboot behaviour.
+The session moves the companion's clock forward once the base clock is trusted (`companion.sync_clock`, `Handler.clock_trusted`),
+and hands login pushes and contact messages to the handler (`on_login`, `on_contact_message`). 63 new tests; the full suite is
+400. The executor itself, and the contact-on-demand and login/command state machine, are RM2. Not yet seen on hardware.
+
 **RM2. Heartbeat, jobs and executor.** The `service_status` heartbeat and its use in `status` and `check` (usable and tested on
 its own first), then the `remote_jobs` table (edit migration 1, delete the dev database), the executor state machine in the
 session, the handler hook in `service.py`, expiry and recovery. Done when the heartbeat shows ingest up/down and the link
@@ -414,7 +422,7 @@ Nothing is changed in the firmware repository from here. The request was handed 
 | 1 | Document the host-visible login and CLI path | Done: "Remote Administration (Login and CLI)" in the firmware `docs/companion_protocol.md`, commit `e5761d02` on `beacon` (pushed). From the source, not run on a device. |
 | 2 | Answer the plan's questions from the source | Done, folded into "What the firmware does" and the gaps: ACL persistence and eviction, the tag prefix, `get lat` precision, companion clocks, flood scope, adverts after `set`, `beacon.*` timing. |
 | 3 | List what needs a real device | Done: the script below. |
-| 4 | Uptime in the `beacon.stats` reply | **Approved; the firmware session will implement it** (`, up Ns` appended, reply grows from 113 to 129 characters). The base treats it as optional so older builds still parse. Re-check the reply format against that commit in RM1. |
+| 4 | Uptime in the `beacon.stats` reply | **Approved; the firmware session will implement it** (`, up Ns` appended, reply grows from 113 to 129 characters). The base treats it as optional so older builds still parse. Re-check the reply format against that commit when it lands (before RM3). |
 
 Source findings that changed this plan: a login success is not proof of admin (decision 4); a full ACL evicts instead of
 failing (corrected); a read-back of `lat`/`lon` is lossy (decisions 6, 7); the first `set` on a fresh repeater turns zero-hop

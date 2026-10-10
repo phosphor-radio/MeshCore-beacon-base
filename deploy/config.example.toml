@@ -27,6 +27,10 @@ learn_repeaters = true
 # Run the base companion in manual-add mode, so it stores no contacts and every advert reaches the base in full with its
 # position. This is saved in the companion; set false to leave the companion's own setting alone.
 manual_add_contacts = true
+# Move the companion's clock forward to the base's once the base's clock is trusted (beaconctl time set|confirm, or
+# clock.assume_synced). Never backward and never from an untrusted clock; held in RAM, not flash. Needed for logging in to
+# repeaters (remote management), which reject timestamps older than ones they have seen.
+sync_clock = true
 
 # Safety-net queue drain, in seconds, in case a "messages waiting" notification is missed.
 poll_interval = 30

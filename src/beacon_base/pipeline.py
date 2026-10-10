@@ -81,6 +81,10 @@ class Pipeline:
     def boot(self) -> str:
         return self._boot
 
+    def time_trusted(self) -> bool:
+        """True once this machine's clock is known to be right (set or confirmed, or config says it is synced)."""
+        return clock.is_trusted(self._store.conn, self._boot, self._assume_synced)
+
     def process(self, rx: ReceivedReport) -> list[Verdict]:
         """Store the raw frame and judge every observation in it, atomically."""
         with self._store.transaction() as db:

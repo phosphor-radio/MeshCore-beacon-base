@@ -378,3 +378,19 @@ def test_repeater_adverts_in_the_contact_list_are_applied_at_connect(tmp_path):
         wait_for(lambda: store.repeater(REPEATER_A_KEY[:8].hex())["lat"] == 38.0)
         stop.set()
         t.join(timeout=5)
+
+
+def test_the_companion_clock_follows_a_trusted_base_clock(env):
+    fake, _, _, session = env  # assume_synced, and the fake companion's clock starts in May 2024
+    wait_for(lambda: session.clock_synced)
+    assert abs(fake.rtc() - time.time()) <= 2
+
+
+def test_clock_trusted_follows_the_database(tmp_path):
+    with Store.open(tmp_path / "c.db") as store:
+        handler = PipelineHandler(store, Pipeline(store, assume_synced=False))
+        assert not handler.clock_trusted()
+        with store.transaction() as db:
+            clock.apply_clock_event(db, handler._pipeline.boot, "set", 0.0, 0.0, time.time())
+        assert handler.clock_trusted()
+        assert PipelineHandler(store, Pipeline(store, assume_synced=True)).clock_trusted()

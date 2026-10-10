@@ -126,6 +126,7 @@ it differs (the companion keeps them in flash):
 | Path hash mode | `[radio]` `path_hash_mode` (default `2`, 0-2) | Hash size in the paths of the packets the companion floods; kept the same as the rest of the mesh. Needs companion firmware v10. A failure is logged and ignored. |
 | Report channel | `companion.channel_index` / `channel_name`, the key in `secrets.toml` | Slot 0 holds the built-in Public channel, so the default slot is 1. |
 | Manual-add mode | `companion.manual_add_contacts` (on) | Every advert reaches the base in full; see "Repeater positions and names". |
+| Clock | `companion.sync_clock` (on) | Moved **forward** to the base's clock, and only once that clock is trusted (`beaconctl time set` or `confirm`, or `clock.assume_synced`). Never backward (the companion refuses), never from an untrusted clock, and kept in RAM, not flash. An nRF52 companion restarts at May 2024 on every boot; repeaters ignore a login or command stamped earlier than one they have seen, which matters for remote repeater management (`docs/plan/repeater-remote.md`). A companion found ahead of the base is only warned about. |
 
 The serial port's DTR level is chosen separately, below.
 

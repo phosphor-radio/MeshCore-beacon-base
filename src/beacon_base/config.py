@@ -47,6 +47,7 @@ class CompanionConfig:
     poll_interval: float = 30.0  # safety-net queue drain, in case a MSG_WAITING push is missed
     learn_repeaters: bool = True  # take each repeater's position and name from the adverts the companion hears
     manual_add_contacts: bool = True  # run the companion in manual-add mode so every advert reaches us in full (stored in the companion)
+    sync_clock: bool = True  # move the companion's clock forward to the base's once that clock is trusted (repeaters check logins for replays)
     command_timeout: float = 5.0
 
 

@@ -11,10 +11,16 @@ from dataclasses import dataclass
 
 # commands (host to device)
 CMD_APP_START = 1
+CMD_SEND_TXT_MSG = 2
 CMD_GET_CONTACTS = 4
+CMD_GET_DEVICE_TIME = 5
+CMD_SET_DEVICE_TIME = 6
+CMD_ADD_UPDATE_CONTACT = 9
 CMD_SYNC_NEXT_MESSAGE = 10
 CMD_SET_RADIO_PARAMS = 11
+CMD_RESET_PATH = 13
 CMD_DEVICE_QUERY = 22
+CMD_SEND_LOGIN = 26
 CMD_GET_CONTACT_BY_KEY = 30
 CMD_GET_CHANNEL = 31
 CMD_SET_CHANNEL = 32
@@ -28,8 +34,10 @@ RESP_CONTACTS_START = 2
 RESP_CONTACT = 3
 RESP_END_OF_CONTACTS = 4
 RESP_SELF_INFO = 5
+RESP_SENT = 6
 RESP_CONTACT_MSG_RECV = 7
 RESP_CHANNEL_MSG_RECV = 8
+RESP_CURR_TIME = 9
 RESP_NO_MORE_MESSAGES = 10
 RESP_DEVICE_INFO = 13
 RESP_CONTACT_MSG_RECV_V3 = 16
@@ -41,12 +49,18 @@ RESP_CHANNEL_DATA_RECV = 27
 PUSH_ADVERT = 0x80  # an advert from a contact the companion stores: code + 32-byte public key, no position
 PUSH_SEND_CONFIRMED = 0x82
 PUSH_MSG_WAITING = 0x83
+PUSH_LOGIN_SUCCESS = 0x85  # a repeater accepted a login; carries the role it granted
+PUSH_LOGIN_FAIL = 0x86  # the companion's own failure push; a repeater never sends a failure reply, so this is not expected
 PUSH_LOG_RX_DATA = 0x88
 PUSH_NEW_ADVERT = 0x8A  # an advert from a node it does not store: a full contact frame, with position
 
 ADV_TYPE_CHAT = 1
 ADV_TYPE_REPEATER = 2
 ADV_TYPE_SENSOR = 4
+TXT_TYPE_CLI_DATA = 1  # a CLI command to a repeater, or its reply
+PERM_ADMIN = 3  # ACL permission of an admin client; 0 is guest, 1 read-only, 2 read-write
+MAX_PASSWORD_LEN = 15  # bytes; the firmware truncates longer passwords silently
+MAX_CLI_TEXT_LEN = 160  # bytes; longer text is answered with the misleading ERR_CODE_TABLE_FULL
 CONTACT_FRAME_LEN = 148
 APP_NAME = b"beacon-base"
 PROTOCOL_VERSION = 3  # DEVICE_QUERY app target version
@@ -138,6 +152,72 @@ def set_path_hash_mode(mode: int) -> bytes:
     return bytes([CMD_SET_PATH_HASH_MODE, 0, mode])
 
 
+def get_device_time() -> bytes:
+    return bytes([CMD_GET_DEVICE_TIME])
+
+
+def set_device_time(epoch_s: int) -> bytes:
+    """The companion refuses a time earlier than its current one (ERR_CODE_ILLEGAL_ARG); equal is accepted."""
+    return bytes([CMD_SET_DEVICE_TIME]) + struct.pack("<I", epoch_s)
+
+
+def add_update_contact(public_key: bytes, adv_type: int, name: str, lat: float = 0.0, lon: float = 0.0) -> bytes:
+    """Make a node a contact of the companion, with its route unknown so messages to it are flooded. The firmware checks for 36 bytes
+    but reads 136, so the whole contact frame is always sent (148 bytes, which this is)."""
+    if len(public_key) != PUBKEY_LEN:
+        raise ValueError(f"public key must be {PUBKEY_LEN} bytes")
+    return build_contact(CMD_ADD_UPDATE_CONTACT, public_key, adv_type, name, 0, lat, lon, 0)
+
+
+def reset_path(public_key: bytes) -> bytes:
+    """Forget a contact's stored route, so the next message to it is flooded (and the reply teaches the new route)."""
+    if len(public_key) != PUBKEY_LEN:
+        raise ValueError(f"public key must be {PUBKEY_LEN} bytes")
+    return bytes([CMD_RESET_PATH]) + public_key
+
+
+def send_login(public_key: bytes, password: str = "") -> bytes:
+    """Log in to a repeater, which must be a contact. An empty password logs in a key the repeater already has in its ACL with the
+    role it has there; for any other key it is a guest login (the guest password is empty by default)."""
+    if len(public_key) != PUBKEY_LEN:
+        raise ValueError(f"public key must be {PUBKEY_LEN} bytes")
+    raw = password.encode("utf-8")
+    if len(raw) > MAX_PASSWORD_LEN:
+        raise ValueError(f"a repeater password is at most {MAX_PASSWORD_LEN} bytes (longer ones are truncated by the firmware)")
+    if b"\0" in raw:
+        raise ValueError("password must not contain NUL")
+    return bytes([CMD_SEND_LOGIN]) + public_key + raw
+
+
+def send_cli(public_key: bytes, text: str, attempt: int = 0) -> bytes:
+    """Send a CLI command to a repeater (a CLI_DATA message). The companion replaces the timestamp with its own clock. Only the first 6
+    bytes of the key are sent, as the contact is looked up by prefix."""
+    if len(public_key) != PUBKEY_LEN:
+        raise ValueError(f"public key must be {PUBKEY_LEN} bytes")
+    raw = text.encode("utf-8")
+    if not 1 <= len(raw) <= MAX_CLI_TEXT_LEN:
+        raise ValueError(f"a CLI command is 1-{MAX_CLI_TEXT_LEN} bytes")
+    return bytes([CMD_SEND_TXT_MSG, TXT_TYPE_CLI_DATA, attempt & 3]) + bytes(4) + public_key[:6] + raw
+
+
+def make_tag(n: int) -> str:
+    """Two characters that a repeater reflects at the start of its reply when the command is sent as ``NN|command``."""
+    return f"{n & 0xFF:02x}"
+
+
+def tag_command(tag: str, command: str) -> str:
+    if len(tag) != 2 or "|" in tag or tag.startswith(" "):
+        raise ValueError("a command tag is two characters, not '|' and not starting with a space")
+    return f"{tag}|{command}"
+
+
+def split_tag(text: str) -> tuple[str | None, str]:
+    """The ``NN`` of a reply that starts with ``NN|`` and the rest; (None, text) otherwise."""
+    if len(text) >= 3 and text[2] == "|":
+        return text[:2], text[3:]
+    return None, text
+
+
 def set_radio_params(freq_khz: int, bw_hz: int, sf: int, cr: int) -> bytes:
     return struct.pack("<BIIBB", CMD_SET_RADIO_PARAMS, freq_khz, bw_hz, sf, cr)
 
@@ -211,6 +291,102 @@ def parse_device_info(frame: bytes) -> DeviceInfo:
         version=_cstr(bytes(frame[60:80])),
         path_hash_mode=frame[81] if fw_ver >= 10 and len(frame) >= 82 else None,  # byte 80 is the client-repeat flag (v9+)
     )
+
+
+@dataclass(frozen=True)
+class Sent:
+    """RESP_CODE_SENT: the companion transmitted a login or message. It does not mean the repeater received it."""
+
+    flooded: bool  # False when a stored route was used
+    tag: bytes  # for a login the first 4 bytes of the repeater's key; zeros for a CLI message (no ack is expected)
+    timeout_ms: int  # the companion's estimate of the round trip; it has no timeout of its own
+
+
+def parse_sent(frame: bytes) -> Sent:
+    if len(frame) < 10 or frame[0] != RESP_SENT:
+        raise ProtocolError(f"bad sent frame ({len(frame)} bytes)")
+    return Sent(bool(frame[1]), bytes(frame[2:6]), struct.unpack_from("<I", frame, 6)[0])
+
+
+def parse_device_time(frame: bytes) -> int:
+    if len(frame) < 5 or frame[0] != RESP_CURR_TIME:
+        raise ProtocolError(f"bad device time frame ({len(frame)} bytes)")
+    return struct.unpack_from("<I", frame, 1)[0]
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """PUSH_CODE_LOGIN_SUCCESS (or the companion's own PUSH_CODE_LOGIN_FAIL).
+
+    A success is not proof of admin rights: an empty password from a key the repeater does not know logs in as a guest. ``admin`` is
+    true only when the repeater says admin (flag 1) and the ACL permission is admin (3)."""
+
+    success: bool
+    prefix: bytes  # first 6 bytes of the repeater's key
+    admin_flag: int  # byte 1 of a success; 0 for a legacy reply, which cannot be told from a guest
+    permissions: int | None  # ACL permission granted: 0 guest, 1 read-only, 2 read-write, 3 admin; None in a legacy reply
+    server_time: int | None  # the repeater's clock when it replied
+    firmware_level: int | None
+
+    @property
+    def admin(self) -> bool:
+        return self.success and self.admin_flag == 1 and self.permissions == PERM_ADMIN
+
+
+def parse_login(frame: bytes) -> LoginResult:
+    if len(frame) < 8 or frame[0] not in (PUSH_LOGIN_SUCCESS, PUSH_LOGIN_FAIL):
+        raise ProtocolError(f"bad login push ({len(frame)} bytes)")
+    prefix = bytes(frame[2:8])
+    if frame[0] == PUSH_LOGIN_FAIL:
+        return LoginResult(False, prefix, 0, None, None, None)
+    if len(frame) < 14:  # legacy repeater reply: 0x85, 0x00, prefix
+        return LoginResult(True, prefix, frame[1], None, None, None)
+    return LoginResult(True, prefix, frame[1], frame[12], struct.unpack_from("<I", frame, 8)[0], frame[13])
+
+
+@dataclass(frozen=True)
+class ContactMessage:
+    """RESP_CODE_CONTACT_MSG_RECV / _V3: a message from a contact, for a repeater the reply to a CLI command."""
+
+    prefix: bytes  # first 6 bytes of the sender's key
+    path_len: int  # 0xFF when it arrived by a direct route, else the encoded length of the flooded path
+    txt_type: int
+    timestamp: int  # the sender's clock
+    text: str
+    snr_x4: int | None  # SNR at the companion; None in the version 1 frame
+
+    @property
+    def is_cli_data(self) -> bool:
+        return self.txt_type == TXT_TYPE_CLI_DATA
+
+
+def parse_contact_message(frame: bytes) -> ContactMessage:
+    if frame and frame[0] == RESP_CONTACT_MSG_RECV_V3 and len(frame) >= 16:
+        snr, = struct.unpack_from("<b", frame, 1)
+        start = 4
+    elif frame and frame[0] == RESP_CONTACT_MSG_RECV and len(frame) >= 13:
+        snr, start = None, 1
+    else:
+        raise ProtocolError(f"bad contact message frame ({len(frame)} bytes)")
+    ts, = struct.unpack_from("<I", frame, start + 8)
+    return ContactMessage(
+        prefix=bytes(frame[start : start + 6]),
+        path_len=frame[start + 6],
+        txt_type=frame[start + 7],
+        timestamp=ts,
+        text=bytes(frame[start + 12 :]).decode("utf-8", "replace"),
+        snr_x4=snr,
+    )
+
+
+def build_contact_message(
+    prefix: bytes, text: str, path_len: int = 0xFF, txt_type: int = TXT_TYPE_CLI_DATA, timestamp: int = 0, snr_x4: int | None = 20,
+) -> bytes:
+    """The inverse of parse_contact_message, for the fake companion: version 3 when an SNR is given, else version 1."""
+    body = prefix[:6] + bytes([path_len, txt_type]) + struct.pack("<I", timestamp) + text.encode("utf-8")
+    if snr_x4 is None:
+        return bytes([RESP_CONTACT_MSG_RECV]) + body
+    return struct.pack("<BbBB", RESP_CONTACT_MSG_RECV_V3, snr_x4, 0, 0) + body
 
 
 @dataclass(frozen=True)

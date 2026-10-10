@@ -75,6 +75,7 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    cli.py        beaconctl parser, listen, simulate, channel commands
                    runtime.py    logging and signal setup shared by entry points
                    fake_companion.py, simulate.py   fake companion on a pty and synthetic traffic
+                   fake_repeater.py   model of a repeater's login/ACL/CLI (silent failures, replay rules, lossy get lat) for remote tests
                    (+ estimate.py api.py)
 web/               (+) static map UI (Leaflet)
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
@@ -126,7 +127,9 @@ deployment migration 1 may still be edited, and the development database deleted
   as ordinary reconnects. See `docs/operations.md`.
 - Radio settings across all devices: 905.775 MHz, BW 62.5 kHz, SF 8, CR 4/6, path hash mode 2. The report channel key is 16 bytes.
   The session writes the radio parameters, path hash mode, channel and manual-add mode to the companion at every connect, each
-  only when it differs (flash wear); `companion.manage_radio` (on by default) covers the radio and path hash mode.
+  only when it differs (flash wear); `companion.manage_radio` (on by default) covers the radio and path hash mode. It also moves
+  the companion's clock forward to the base's (never backward, never from an untrusted base clock; `companion.sync_clock`),
+  because repeaters reject logins stamped earlier than ones they have seen.
 - Reject and log unknown report versions; never guess at a format.
 - Use numbered schema migrations from the start. Batch commits and keep `synchronous=NORMAL` (SD card wear).
 - Secrets (channel key, web token) live in a mode 0600 config file and never in git.
