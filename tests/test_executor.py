@@ -12,7 +12,7 @@ from beacon_base.remote import JobOutcome, RemoteJob
 
 RKEY = bytes(range(1, 33))
 OTHER = bytes(range(101, 133))
-CFG = RemoteConfig(min_timeout_s=8.0, max_timeout_s=30.0, timeout_factor=1.5, max_job_s=100.0)
+CFG = RemoteConfig(min_timeout_s=8.0, max_timeout_s=30.0, timeout_factor=1.5, max_job_s=100.0, step_gap_s=0.0)
 
 
 def sent_frame(flooded=True, timeout_ms=2000):
@@ -70,13 +70,13 @@ class StubLink:
 
 
 class Harness:
-    def __init__(self, clock_ready=None, contact_known=True):
+    def __init__(self, clock_ready=None, contact_known=True, cfg=CFG):
         self.clock = Clock()
         self.queue: list[RemoteJob] = []
         self.finished: list[tuple[RemoteJob, JobOutcome]] = []
         self.link = StubLink(contact_known)
         self.claims = 0
-        self.ex = RemoteExecutor(CFG, self._claim, lambda j, o: self.finished.append((j, o)), clock_ready or (lambda link: None), 0x42, self.clock)
+        self.ex = RemoteExecutor(cfg, self._claim, lambda j, o: self.finished.append((j, o)), clock_ready or (lambda link: None), 0x42, self.clock)
 
     def _claim(self):
         self.claims += 1
@@ -84,6 +84,12 @@ class Harness:
 
     def poll(self):
         self.ex.poll(self.link)
+
+    def advance(self, seconds):
+        """Let time pass. Two polls: the first notices a timeout and schedules the resend, the second can transmit it."""
+        self.clock.t += seconds
+        self.poll()
+        self.poll()
 
     def run_to_login(self, j):
         self.queue.append(j)
@@ -214,79 +220,126 @@ def test_a_login_from_another_repeater_is_ignored():
     assert h.ex.busy and not h.link.commands()
 
 
-def test_no_answer_to_the_login_resets_the_route_and_tries_again_once():
+def test_no_answer_to_the_login_sends_it_again_on_the_same_route():
     h = Harness()
     h.run_to_login(job("name", "get"))
-    h.clock.t += 8.0 * 1.0  # inside the deadline: nothing happens
-    h.poll()
+    h.advance(7.0)  # inside the 8 s minimum wait: nothing happens
     assert h.link.ops().count(companion.CMD_SEND_LOGIN) == 1
-    h.clock.t += 4.5  # past it (timeout 2 s x 1.5 = 3 s, raised to the 8 s minimum)
-    h.poll()
-    assert h.link.ops()[-2:] == [companion.CMD_RESET_PATH, companion.CMD_SEND_LOGIN]
+    h.advance(2.0)  # past it (timeout 2 s x 1.5 = 3 s, raised to the 8 s minimum)
+    assert h.link.ops().count(companion.CMD_SEND_LOGIN) == 2 and companion.CMD_RESET_PATH not in h.link.ops()
     h.login()
     h.reply("> ridge")
-    assert h.outcome.ok
+    out = h.outcome
+    assert out.ok and out.result["retries"] == 1 and out.result["route_resets"] == 0
 
 
-def test_two_unanswered_logins_fail_with_no_reply():
+def test_a_second_unanswered_login_resets_the_route_and_a_third_gives_up():
     h = Harness()
     h.run_to_login(job("name", "get"))
-    for _ in range(2):
-        h.clock.t += 9.0
-        h.poll()
+    h.advance(9.0)  # try 2, same route
+    assert companion.CMD_RESET_PATH not in h.link.ops()
+    h.advance(9.0)  # try 3: reset the route, then log in again
+    assert h.link.ops()[-2:] == [companion.CMD_RESET_PATH, companion.CMD_SEND_LOGIN]
+    assert not h.finished
+    h.advance(9.0)
     out = h.outcome
-    assert out.code == "no_reply" and h.link.ops().count(companion.CMD_RESET_PATH) == 1 and h.link.ops().count(companion.CMD_SEND_LOGIN) == 2
-    assert not h.ex.busy
+    assert out.code == "no_reply" and h.link.ops().count(companion.CMD_RESET_PATH) == 1 and h.link.ops().count(companion.CMD_SEND_LOGIN) == 3
+    assert out.result["retries"] == 2 and out.result["route_resets"] == 1 and not h.ex.busy
 
 
 def test_the_wait_follows_the_companion_s_estimate_between_the_limits():
     h = Harness()
     h.link.timeout_ms = 10_000  # x1.5 = 15 s
     h.run_to_login(job("name", "get"))
-    h.clock.t += 14.0
-    h.poll()
+    h.advance(14.0)
     assert h.ex.busy and h.link.ops().count(companion.CMD_SEND_LOGIN) == 1
-    h.clock.t += 2.0
-    h.poll()
+    h.advance(2.0)
     assert h.link.ops().count(companion.CMD_SEND_LOGIN) == 2
     h2 = Harness()
     h2.link.timeout_ms = 120_000  # capped at 30 s
     h2.run_to_login(job("name", "get"))
-    h2.clock.t += 29.0
-    h2.poll()
+    h2.advance(29.0)
     assert h2.link.ops().count(companion.CMD_SEND_LOGIN) == 1
-    h2.clock.t += 2.0
-    h2.poll()
+    h2.advance(2.0)
     assert h2.link.ops().count(companion.CMD_SEND_LOGIN) == 2
 
 
-def test_a_lost_reply_logs_in_again_and_resends_the_same_command_with_a_new_tag():
+def test_a_lost_reply_is_sent_again_on_the_same_route_without_a_new_login():
     h = Harness()
     h.run_to_login(job("name", "get"))
     h.login()
     first = h.link.commands()[0]
-    h.clock.t += 9.0
-    h.poll()  # no reply: reset the route, log in again
-    assert h.link.ops()[-2:] == [companion.CMD_RESET_PATH, companion.CMD_SEND_LOGIN] and RKEY not in h.ex.logged_in
-    h.login()
+    h.advance(9.0)  # no reply
+    ops = h.link.ops()
+    assert companion.CMD_RESET_PATH not in ops and ops.count(companion.CMD_SEND_LOGIN) == 1 and len(h.link.commands()) == 2
     second = h.link.commands()[1]
-    assert second.split("|", 1)[1] == first.split("|", 1)[1] and second.split("|")[0] != first.split("|")[0]
+    assert second.split("|", 1)[1] == first.split("|", 1)[1] and second.split("|")[0] != first.split("|")[0]  # same command, new tag
     h.reply("> ridge")
-    assert h.outcome.ok and h.outcome.result["round_trips"] == 1
+    assert h.outcome.ok and h.outcome.result["round_trips"] == 1 and h.outcome.result["retries"] == 1
 
 
-def test_a_late_reply_to_the_abandoned_command_is_ignored():
+def test_two_lost_replies_reset_the_route_log_in_again_and_send_a_last_time():
     h = Harness()
     h.run_to_login(job("name", "get"))
     h.login()
-    stale_tag = companion.split_tag(h.link.commands()[0])[0]
-    h.clock.t += 9.0
-    h.poll()
+    h.advance(9.0)  # try 2
+    h.advance(9.0)  # try 3: reset, log in
+    assert h.link.ops()[-2:] == [companion.CMD_RESET_PATH, companion.CMD_SEND_LOGIN] and RKEY not in h.ex.logged_in
+    assert len(h.link.commands()) == 2
     h.login()
-    assert h.reply("> late", tag=stale_tag)  # consumed, but not taken as the answer
-    assert h.ex.busy and h.ex.stats["stale_replies"] == 1
+    assert len(h.link.commands()) == 3  # the last try
     h.reply("> ridge")
+    out = h.outcome
+    assert out.ok and out.result["route_resets"] == 1 and out.result["retries"] == 2
+
+
+def test_the_last_try_failing_ends_the_job_without_another_login():
+    h = Harness()
+    h.run_to_login(job("name", "get"))
+    h.login()
+    h.advance(9.0)
+    h.advance(9.0)
+    h.login()
+    h.advance(9.0)
+    assert h.outcome.code == "no_reply" and h.link.ops().count(companion.CMD_SEND_LOGIN) == 2 and len(h.link.commands()) == 3
+
+
+def test_a_late_reply_to_an_earlier_try_still_answers_the_step():
+    h = Harness()
+    h.run_to_login(job("name", "get"))
+    h.login()
+    first_tag = companion.split_tag(h.link.commands()[0])[0]
+    h.advance(9.0)  # the command went out again
+    assert len(h.link.commands()) == 2
+    assert h.reply("> ridge", tag=first_tag)  # the first try's answer, after all
     assert h.outcome.result["values"] == {"name": "ridge"}
+    second_tag = companion.split_tag(h.link.commands()[1])[0]
+    assert not h.reply("> ridge", tag=second_tag)  # the second try's answer, with no job any more: left for the session
+
+
+def test_a_reply_to_an_earlier_step_is_ignored_for_the_next_one():
+    h = Harness()
+    h.run_to_login(job("beacon.window", "set", {"seconds": 5}))
+    h.login()
+    old_tag = companion.split_tag(h.link.commands()[0])[0]
+    h.reply("OK")  # the first step is answered; the read-back is now in flight
+    assert len(h.link.commands()) == 2
+    assert h.reply("OK", tag=old_tag)  # a duplicate of the first answer arrives
+    assert h.ex.stats["stale_replies"] == 1 and len(h.link.commands()) == 2 and h.ex.busy
+    h.reply("> 5 secs")
+    h.reply("> 0")
+    assert h.outcome.ok
+
+
+def test_a_late_login_answer_during_the_wait_to_resend_is_taken():
+    h = Harness()
+    h.run_to_login(job("name", "get"))
+    h.clock.t += 9.0
+    h.poll()  # timed out; the resend waits for the next poll
+    h.login()  # the first login's answer turns up now
+    assert h.link.ops().count(companion.CMD_SEND_LOGIN) == 1 and h.link.commands()  # logged in, no second login, the command is out
+    h.reply("> ridge")
+    assert h.outcome.ok
 
 
 def test_a_reply_with_no_tag_is_taken_for_a_repeater_that_does_not_reflect_it():
@@ -297,10 +350,11 @@ def test_a_reply_with_no_tag_is_taken_for_a_repeater_that_does_not_reflect_it():
     assert h.outcome.ok and h.ex.stats["untagged_replies"] == 1
 
 
-def test_messages_that_are_not_the_reply_are_left_for_the_session():
+def test_only_cli_replies_from_the_job_s_repeater_are_taken_from_the_session():
     h = Harness()
     h.run_to_login(job("name", "get"))
-    assert not h.reply("> early", tag="00")  # not waiting for a reply yet (still logging in)
+    assert h.reply("> early", tag="00")  # a CLI reply from the repeater, though none is expected yet: taken and counted as late
+    assert h.ex.stats["stale_replies"] == 1 and h.ex.busy
     h.login()
     assert not h.reply("hello", txt_type=companion.TXT_TYPE_PLAIN, tag="")  # a person's message, not a CLI reply
     assert not h.reply("> other", key=OTHER, tag="00")  # another repeater
@@ -410,3 +464,99 @@ def test_the_channel_reply_is_compared_with_the_base_s_hash():
     h.login()
     h.reply("> set, hash 42")
     assert h.outcome.result["values"]["beacon.channel"] == {"set": True, "hash": 0x42, "matches_base": True}
+
+
+# --- pacing ---------------------------------------------------------------------------------------------------------------
+
+PACED = RemoteConfig(min_timeout_s=8.0, max_timeout_s=30.0, timeout_factor=1.5, max_job_s=100.0, step_gap_s=3.0)
+
+
+def test_the_first_command_waits_out_the_gap_after_the_login_answer():
+    h = Harness(cfg=PACED)
+    h.run_to_login(job("name", "get"))
+    assert h.link.ops()[-1] == companion.CMD_SEND_LOGIN  # nothing was heard yet, so the login goes out at once
+    h.login()
+    assert not h.link.commands() and h.ex.describe().endswith("(pacing)")
+    h.advance(2.9)
+    assert not h.link.commands()
+    h.advance(0.2)
+    assert len(h.link.commands()) == 1 and h.ex.describe().endswith("(reply)")
+
+
+def test_every_command_waits_the_gap_after_the_reply_before_it():
+    h = Harness(cfg=PACED)
+    h.run_to_login(job("beacon.window", "set", {"seconds": 5}))
+    h.login()
+    h.advance(3.1)
+    sent_at = []
+    for answer in ("OK", "> 5 secs"):
+        sent_at.append(h.clock.t)
+        h.reply(answer)
+        count = len(h.link.commands())
+        h.advance(2.9)
+        assert len(h.link.commands()) == count, "transmitted inside the gap"
+        h.advance(0.2)
+        assert len(h.link.commands()) == count + 1
+    h.reply("> 0")
+    assert h.outcome.ok and len(h.link.commands()) == 3
+
+
+def test_a_job_that_follows_another_waits_for_the_gap_since_the_last_reply():
+    h = Harness(cfg=PACED)
+    h.queue += [job("name", "get", job_id=1)]
+    h.poll()
+    h.login()
+    h.advance(3.1)
+    h.reply("> ridge")
+    assert len(h.finished) == 1
+    h.queue.append(job("beacon.window", "get", job_id=2))
+    h.link.sent.clear()
+    h.poll()  # claimed at once, but the repeater's reply to the last job was just heard
+    assert h.ex.busy and not h.link.commands() and not h.link.ops().count(companion.CMD_SEND_TXT_MSG)
+    h.advance(3.1)
+    assert len(h.link.commands()) == 1
+
+
+def test_a_timeout_also_starts_the_gap_before_the_resend():
+    h = Harness(cfg=PACED)
+    h.run_to_login(job("name", "get"))
+    h.login()
+    h.advance(3.1)
+    assert len(h.link.commands()) == 1
+    h.advance(8.5)  # past the 8 s wait: the resend is scheduled, not sent
+    assert len(h.link.commands()) == 1
+    h.advance(3.1)
+    assert len(h.link.commands()) == 2
+
+
+def test_a_late_reply_during_the_gap_extends_it():
+    h = Harness(cfg=PACED)
+    h.run_to_login(job("beacon.window", "set", {"seconds": 5}))
+    h.login()
+    h.advance(3.1)
+    first_tag = companion.split_tag(h.link.commands()[0])[0]
+    h.reply("OK")  # the first step is answered; the next waits 3 s
+    h.advance(2.0)
+    assert len(h.link.commands()) == 1
+    h.reply("OK", tag=first_tag)  # an echo of the same reply comes in: the quiet time restarts
+    h.advance(2.0)
+    assert len(h.link.commands()) == 1
+    h.advance(1.2)
+    assert len(h.link.commands()) == 2
+
+
+def test_the_reply_deadline_runs_from_the_transmission_not_from_the_gap():
+    h = Harness(cfg=PACED)
+    h.run_to_login(job("name", "get"))
+    h.login()
+    h.advance(3.1)  # the command goes out here
+    h.advance(7.0)  # 7 s after it: inside the 8 s wait
+    assert len(h.link.commands()) == 1 and h.ex.describe().endswith("(reply)")
+
+
+def test_with_no_gap_the_next_command_follows_the_reply_at_once():
+    h = Harness()
+    h.run_to_login(job("beacon.window", "set", {"seconds": 5}))
+    h.login()
+    h.reply("OK")
+    assert len(h.link.commands()) == 2

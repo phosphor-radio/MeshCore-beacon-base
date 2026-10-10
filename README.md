@@ -320,6 +320,13 @@ sent: `get lat` / `get lon` print a 32-bit float truncated to 7 decimals, so a r
 later advert still replaces any of it (last write wins). `beaconctl check` also fails for a repeater whose report channel was read as
 unset or different from this base's.
 
+**Pacing.** The radio is shared and half duplex, and a reply is rebroadcast by the repeaters that hear it. After anything it receives (a
+login answer, a reply, a late reply) or a timeout, the base waits `remote.step_gap_s` (default 3 s) before it transmits again, so a `get all`
+(9 round trips) or a `set` (3) takes a few seconds longer but does not talk over its own echoes. A lost reply is first sent again on the same
+route (a late answer to the first try still counts); only a second timeout resets the route and logs in again. Each job records its `retries`
+and `route_resets` (`--json`, `jobs N`), which tell you how rough the path is. Lower `step_gap_s` for a quiet room, raise it for a long
+multi-hop path.
+
 **Waiting.** The command waits 30 s (`--timeout`); a flooded, multi-hop exchange can be slower. If the repeater has not answered yet it
 says so, exits with 3, and the job carries on (`repeater remote jobs N` shows the result). `--no-wait` queues and returns the number,
 `--json` prints the job. A job not started within 60 s expires, so nothing queued while ingest was down runs later. Exit codes: 0 done,
@@ -334,7 +341,7 @@ says so, exits with 3, and the job carries on (`repeater remote jobs N` shows th
 | `no_key` | The base has never heard this repeater advertise, so it does not have its full key. |
 | `needs_password` | The repeater does not have this base as an admin yet: give the admin password. |
 | `not_admin` | A password was given but it was the guest password (or this key is not an admin there). |
-| `no_reply` | Wrong password, out of range, a flood not forwarded, or the companion's clock behind what the repeater has seen from it. Tried twice, the second time after resetting the route. |
+| `no_reply` | Wrong password, out of range, a flood not forwarded, or the companion's clock behind what the repeater has seen from it. Tried three times: again on the same route, then after resetting the route and logging in again. |
 | `unsupported` | The repeater does not know the command: not a beacon build, or firmware older than the names work. |
 | `rejected` / `mismatch` | The repeater refused the value, or accepted it and reads back something else. |
 | `interrupted` | Ingest stopped, or lost the companion, while the job was running. The repeater may or may not have acted on it; read it back. |

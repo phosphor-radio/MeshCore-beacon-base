@@ -408,7 +408,7 @@ state, and jobs submitted from a test run to completion with reports flowing at 
 - **Executor** (`executor.py`): driven by `CompanionSession` (`new_connection`, `poll` each loop, `offer_login`, `offer_message`,
   `abort`). Login events and replies are queued by the callbacks and acted on in `poll`, where it is safe to send commands. A reply
   that carries another tag is dropped and counted; an untagged one is taken (a repeater that does not reflect the tag). A step times
-  out at the companion's estimate x 1.5 within 8-30 s, is retried once after a path reset and a fresh login, then fails `no_reply`.
+  out at the companion's estimate x 1.5 within 8-30 s. (Amended during RM4, see "Pacing and retries" below.)
 - **Clock gate.** A job fails `clock_untrusted` when `companion.sync_clock` is on and the base clock is not trusted, and syncs the
   companion's clock first when it is trusted but not yet done.
 - Tests: 168 new (568 in all), among them the whole flow through a real session thread, the fake companion and the fake repeater with
@@ -447,6 +447,22 @@ Where it differs from, or adds to, the text above:
 **RM4. Hardware.** The check above on one repeater, then the rest. Findings go back into this plan.
 
 The heartbeat is built here and counts as done for B3; update the B3 text in the base plan and the README when RM2 lands.
+
+## Pacing and retries (amended during RM4)
+
+The first hardware runs, with the repeaters a few metres apart, failed on later round trips: `get all` returned most values, and a `set`
+usually worked while its read-back did not. The executor sent the next command the moment a reply arrived, while the repeaters that had
+heard the reply were still rebroadcasting it (a flood is rebroadcast after a random delay of up to 2.5 airtimes: `getRetransmitDelay` is random between 0 and 5 x airtime x `tx_delay_factor`, 0.5 by default; a direct packet up to 1.5; on a slow SF8 / 62.5 kHz link where one packet is roughly half a second to a second on air), and
+a lost reply set off a route reset and a flood login, which added more traffic. Changed:
+
+- **Pacing.** `remote.step_gap_s` (default 3 s, 0 turns it off): nothing is transmitted until that long after the last thing received (a login
+  answer, a reply, a late or duplicate reply) or after a timeout. It is a time, not a sleep, so reports keep draining. The wait for a reply is
+  measured from the transmission, not from the start of the gap. The repeater's own 600 ms reply delay is separate.
+- **Gentler retries.** A step is tried up to three times: the same login or command again on the same route (one packet); then, after a second
+  timeout, `CMD_RESET_PATH`, a fresh login and the command a last time; then `no_reply`. A reply to any tag sent for the current step answers it,
+  so a slow answer to the first try is not wasted; a reply to an earlier step, or one that arrives when nothing is expected, is counted as late.
+- **Visible.** A job's result carries `retries` and `route_resets`; the heartbeat shows `(pacing)` while the base is holding off.
+- Kept as they were: the extra `advert.interval` read after a `set` and the nine reads of `get all`, which are useful.
 
 ## Review questions: answers
 

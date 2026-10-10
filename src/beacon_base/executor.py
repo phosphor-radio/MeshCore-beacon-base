@@ -5,7 +5,15 @@ machine that the session loop drives, not a blocking call. It never touches the 
 (``claim``) and takes the outcome (``finish``), the same split as reports (``docs/plan/repeater-remote.md``).
 
     claim -> contact -> login -> command -> wait for the tagged reply -> next command ... -> interpret -> finish
-                           \\-> timeout: reset the route, log in again, send again, once; then fail ``no_reply``
+
+Pacing. The radio is half duplex and shared with every repeater in earshot, and a reply is rebroadcast by the repeaters that hear it,
+each after a random delay. Sending the next command the moment a reply arrives puts it on the air while the echoes of that reply are
+still going round, so the base waits ``remote.step_gap_s`` after anything it receives (a login answer, a reply, a late reply) before it
+transmits again, and the same after a timeout. The wait is a time, not a sleep: reports keep draining meanwhile.
+
+Retries. A step is tried up to three times. A timeout first sends the same login or command again on the same route (one packet,
+and a late answer to the first try still counts); a second timeout resets the stored route, logs in again over a flood, and sends the
+command a last time; a third gives up with ``no_reply``.
 
 Everything is serialised: one job, one command in flight. The callbacks the session makes from deep inside a request (a login push)
 or from the queue drain (a reply) only record what arrived; the work is done in ``poll`` from the main loop, where it is safe to
@@ -26,7 +34,7 @@ from .remote import JobOutcome, RemoteJob
 log = logging.getLogger(__name__)
 
 CLAIM_INTERVAL = 0.25  # seconds between looks at the job queue when it is empty (a read, no write lock)
-ATTEMPTS = 2  # one try and one retry after the route is reset
+ATTEMPTS = 3  # send; send again on the same route; reset the route, log in again and send
 NOT_FOUND = 2  # the companion's ERR_CODE_NOT_FOUND
 
 
@@ -49,11 +57,12 @@ class RemoteExecutor:
         self._base_hash = base_channel_hash
         self._now = clock
         self._next_claim = 0.0
+        self._quiet_until = 0.0  # nothing is transmitted before this: the previous exchange is still echoing round the mesh
         self._tag_n = 0
         self.contacts: set[bytes] = set()  # keys known to the companion on this connection
         self.logged_in: set[bytes] = set()  # keys that answered a login as admin on this connection
         self._events: list[tuple[str, object]] = []
-        self.stats = {"jobs": 0, "failed": 0, "stale_replies": 0, "untagged_replies": 0}
+        self.stats = {"jobs": 0, "failed": 0, "stale_replies": 0, "untagged_replies": 0, "retries": 0}
         self._reset_job()
 
     # --- state ----------------------------------------------------------------------------------------------------------
@@ -62,13 +71,17 @@ class RemoteExecutor:
         self.job: RemoteJob | None = None
         self._steps: list[remote.Step] = []
         self._replies: list[str] = []
-        self._phase = "idle"  # idle, login, reply
+        self._phase = "idle"  # idle, login (waiting for the answer), reply (waiting for the answer), gap (waiting to transmit)
+        self._pending: str | None = None  # what to transmit when the gap ends: 'login' or 'step'
         self._attempt = 1
+        self._relogin = False  # the login in progress follows a route reset, so it does not clear the attempt count
         self._deadline = 0.0
         self._started = 0.0
-        self._tag = ""
+        self._step_tags: list[str] = []  # tags of the tries at the current step; a reply to any of them answers it
         self._flooded = False
         self._round_trips = 0
+        self._retries = 0
+        self._route_resets = 0
         self._login: companion.LoginResult | None = None
         self._events.clear()
 
@@ -80,7 +93,8 @@ class RemoteExecutor:
         """What the heartbeat reports."""
         if self.job is None:
             return "idle"
-        return f"job {self.job.id}: {self.job.op} {self.job.kind} on {self.job.repeater_prefix.hex()[:12]} ({self._phase})"
+        phase = "pacing" if self._phase == "gap" else self._phase
+        return f"job {self.job.id}: {self.job.op} {self.job.kind} on {self.job.repeater_prefix.hex()[:12]} ({phase})"
 
     def new_connection(self) -> None:
         """A fresh link: the companion may have rebooted, so what was known about logins and contacts is gone."""
@@ -89,13 +103,17 @@ class RemoteExecutor:
 
     # --- events from the session ----------------------------------------------------------------------------------------
 
+    def _waiting_for_login(self) -> bool:
+        return self._phase == "login" or (self._phase == "gap" and self._pending == "login")
+
     def offer_login(self, result: companion.LoginResult) -> None:
-        if self._phase == "login":
+        if self._waiting_for_login():
             self._events.append(("login", result))
 
     def offer_message(self, message: companion.ContactMessage) -> bool:
-        """True when the message is the reply to the job's command (so the session does not pass it on)."""
-        if self._phase == "reply" and self.job is not None and self.job.pubkey and message.prefix == self.job.pubkey[:6] and message.is_cli_data:
+        """True when the message is a CLI reply from the repeater the job is working on (so the session does not pass it on). Whether it
+        answers the step in hand or is a late one is decided in poll."""
+        if self.job is not None and self.job.pubkey and message.prefix == self.job.pubkey[:6] and message.is_cli_data:
             self._events.append(("message", message))
             return True
         return False
@@ -103,7 +121,7 @@ class RemoteExecutor:
     # --- the loop -------------------------------------------------------------------------------------------------------
 
     def poll(self, link: CompanionLink) -> None:
-        """Advance the job: take what arrived, check the deadlines, start the next job when idle."""
+        """Advance the job: take what arrived, transmit when the quiet time is over, check the deadlines, start the next job when idle."""
         now = self._now()
         if self.job is None:
             if now >= self._next_claim:
@@ -118,14 +136,17 @@ class RemoteExecutor:
             if self.job is None:
                 break
             if kind == "login":
-                self._on_login(link, payload, now)  # type: ignore[arg-type]
+                self._on_login(payload, now)  # type: ignore[arg-type]
             else:
-                self._on_message(link, payload, now)  # type: ignore[arg-type]
-        if self.job is not None:
-            if now - self._started > self._cfg.max_job_s:
-                self._fail("no_reply", f"the job ran for more than {self._cfg.max_job_s:g} s")
-            elif self._phase in ("login", "reply") and now > self._deadline:
-                self._on_timeout(link, now)
+                self._on_message(payload, now)  # type: ignore[arg-type]
+        if self.job is None:
+            return
+        if now - self._started > self._cfg.max_job_s:
+            self._fail("no_reply", f"the job ran for more than {self._cfg.max_job_s:g} s")
+        elif self._phase == "gap" and now >= self._quiet_until:
+            self._transmit(link, self._pending or "step", now)
+        elif self._phase in ("login", "reply") and now > self._deadline:
+            self._on_timeout(link, now)
 
     def abort(self, code: str = "interrupted") -> None:
         """The link was lost or ingest is stopping: the job cannot finish, and a command may or may not have been acted on."""
@@ -155,7 +176,8 @@ class RemoteExecutor:
             return
         if not self._ensure_contact(link, job):
             return
-        self._begin_login(link, now)
+        # a password always logs in; without one, a repeater that already took the base as an admin on this connection needs no login
+        self._schedule(link, "login" if job.password is not None or job.pubkey not in self.logged_in else "step", now)
 
     def _ensure_contact(self, link: CompanionLink, job: RemoteJob) -> bool:
         key = job.pubkey
@@ -181,43 +203,51 @@ class RemoteExecutor:
     def _timeout(self, sent: companion.Sent) -> float:
         return min(max(sent.timeout_ms / 1000.0 * self._cfg.timeout_factor, self._cfg.min_timeout_s), self._cfg.max_timeout_s)
 
-    def _begin_login(self, link: CompanionLink, now: float) -> None:
+    def _heard(self, now: float) -> None:
+        """Something came in (or a wait ran out): leave the air alone for the pacing gap."""
+        self._quiet_until = max(self._quiet_until, now + self._cfg.step_gap_s)
+
+    def _schedule(self, link: CompanionLink, action: str, now: float) -> None:
+        """Transmit 'login' or 'step' now, or when the pacing gap since the last traffic is over."""
+        if now < self._quiet_until:
+            self._pending, self._phase = action, "gap"
+            return
+        self._transmit(link, action, now)
+
+    def _transmit(self, link: CompanionLink, action: str, now: float) -> None:
+        self._pending = None
         job = self.job
         assert job is not None and job.pubkey is not None
-        if job.password is None and job.pubkey in self.logged_in:
-            self._send_step(link, now)  # the repeater has the base as an admin from earlier on this connection
-            return
         try:
-            sent = companion.parse_sent(link.request(companion.send_login(job.pubkey, job.password or ""), [companion.RESP_SENT]))
+            if action == "login":
+                sent = companion.parse_sent(link.request(companion.send_login(job.pubkey, job.password or ""), [companion.RESP_SENT]))
+                self._phase = "login"
+            else:
+                self._tag_n += 1
+                tag = companion.make_tag(self._tag_n)
+                text = companion.tag_command(tag, self._steps[len(self._replies)].command)
+                sent = companion.parse_sent(link.request(companion.send_cli(job.pubkey, text), [companion.RESP_SENT]))
+                self._step_tags.append(tag)
+                self._phase = "reply"
         except CommandError as e:
-            self._fail("companion_refused", f"the companion would not send the login: {companion.describe_error(e.code)}")
+            self._fail("companion_refused", f"the companion would not send the {'login' if action == 'login' else 'command'}: {companion.describe_error(e.code)}")
             return
         self._flooded = self._flooded or sent.flooded
-        self._phase, self._deadline = "login", now + self._timeout(sent)
+        self._deadline = now + self._timeout(sent)
 
-    def _send_step(self, link: CompanionLink, now: float) -> None:
+    def _on_login(self, result: companion.LoginResult, now: float) -> None:
         job = self.job
         assert job is not None and job.pubkey is not None
-        self._tag_n += 1
-        self._tag = companion.make_tag(self._tag_n)
-        text = companion.tag_command(self._tag, self._steps[len(self._replies)].command)
-        try:
-            sent = companion.parse_sent(link.request(companion.send_cli(job.pubkey, text), [companion.RESP_SENT]))
-        except CommandError as e:
-            self._fail("companion_refused", f"the companion would not send the command: {companion.describe_error(e.code)}")
-            return
-        self._flooded = self._flooded or sent.flooded
-        self._phase, self._deadline = "reply", now + self._timeout(sent)
-
-    def _on_login(self, link: CompanionLink, result: companion.LoginResult, now: float) -> None:
-        job = self.job
-        assert job is not None and job.pubkey is not None
-        if result.prefix != job.pubkey[:6] or self._phase != "login":
+        if result.prefix != job.pubkey[:6] or not self._waiting_for_login():
             return
         self._login = result
+        self._heard(now)
         if result.admin:
             self.logged_in.add(job.pubkey)
-            self._send_step(link, now)
+            if not self._relogin:
+                self._attempt = 1  # a first login that took a few tries does not count against the command
+            self._relogin = False
+            self._pending, self._phase = "step", "gap"  # the first command waits out the gap like any other
             return
         self.logged_in.discard(job.pubkey)
         if job.password is None:
@@ -225,22 +255,24 @@ class RemoteExecutor:
         else:
             self._fail("not_admin", f"{remote.ERROR_TEXT['not_admin']} (permission {result.permissions})")
 
-    def _on_message(self, link: CompanionLink, message: companion.ContactMessage, now: float) -> None:
+    def _on_message(self, message: companion.ContactMessage, now: float) -> None:
+        self._heard(now)
         tag, text = companion.split_tag(message.text)
-        if tag is not None and tag != self._tag:
-            self.stats["stale_replies"] += 1  # the late answer to a command that was already given up on
-            log.debug("ignoring a reply tagged %s, waiting for %s", tag, self._tag)
+        if not self._step_tags or (tag is not None and tag not in self._step_tags):
+            self.stats["stale_replies"] += 1  # the late answer to an earlier step, or to a command given up on
+            log.debug("ignoring a reply tagged %s (waiting for %s)", tag, self._step_tags)
             return
         if tag is None:
             self.stats["untagged_replies"] += 1  # a repeater that does not reflect the tag: take the one reply that came
         self._replies.append(text)
         self._round_trips += 1
         self._attempt = 1
+        self._step_tags = []
         step = self._steps[len(self._replies) - 1]
         if len(self._replies) >= len(self._steps) or remote.step_failed(step, text):
             self._complete()
         else:
-            self._send_step(link, now)
+            self._pending, self._phase = "step", "gap"
 
     def _on_timeout(self, link: CompanionLink, now: float) -> None:
         job = self.job
@@ -248,20 +280,34 @@ class RemoteExecutor:
         if self._attempt >= ATTEMPTS:
             self._fail("no_reply")
             return
+        action = "login" if self._phase == "login" else "step"
         self._attempt += 1
-        log.info("remote job %d: no answer from %s, resetting its route and trying again", job.id, job.repeater_prefix.hex())
-        self.logged_in.discard(job.pubkey)
-        try:
-            link.request(companion.reset_path(job.pubkey), [companion.RESP_OK])
-        except CommandError:
-            pass  # not a contact any more; the login below says so
-        self._begin_login(link, now)
+        self._retries += 1
+        self.stats["retries"] += 1
+        self._heard(now)
+        if self._attempt < ATTEMPTS:
+            log.info("remote job %d: no answer from %s (try %d of %d), sending again", job.id, job.repeater_prefix.hex(), self._attempt - 1, ATTEMPTS)
+        else:
+            log.info(
+                "remote job %d: still no answer from %s, resetting its route, logging in again and trying a last time",
+                job.id, job.repeater_prefix.hex(),
+            )
+            self._route_resets += 1
+            self.logged_in.discard(job.pubkey)
+            self._relogin, action = True, "login"
+            try:
+                link.request(companion.reset_path(job.pubkey), [companion.RESP_OK])
+            except CommandError:
+                pass  # not a contact any more; the login says so
+        self._pending, self._phase = action, "gap"
 
     # --- the end --------------------------------------------------------------------------------------------------------
 
     def _extras(self, result: dict) -> dict:
         result["round_trips"] = self._round_trips
         result["flooded"] = self._flooded
+        result["retries"] = self._retries
+        result["route_resets"] = self._route_resets
         result["seconds"] = round(self._now() - self._started, 1)
         if self._login is not None:
             result["login"] = {"permissions": self._login.permissions, "admin": self._login.admin, "repeater_time": self._login.server_time}

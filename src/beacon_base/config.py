@@ -71,12 +71,13 @@ class ClockConfig:
 @dataclass(frozen=True)
 class RemoteConfig:
     """Remote repeater management (docs/plan/repeater-remote.md). A step waits for the companion's estimate of the round trip times
-    timeout_factor, kept between the two limits; one retry follows after the route is reset."""
+    timeout_factor, kept between the two limits; a step is tried up to three times (see executor.py)."""
 
     min_timeout_s: float = 8.0
     max_timeout_s: float = 30.0
     timeout_factor: float = 1.5
     max_job_s: float = 180.0  # a job that runs longer than this is failed, whatever step it is on
+    step_gap_s: float = 3.0  # nothing is transmitted until this long after the last thing received, so the echoes of a reply die down
 
 
 @dataclass(frozen=True)
@@ -165,8 +166,10 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     beacon = _section(data, "beacon", BeaconConfig, path)
     clock = _section(data, "clock", ClockConfig, path)
     remote = _section(data, "remote", RemoteConfig, path)
-    if not 0 < remote.min_timeout_s <= remote.max_timeout_s or remote.timeout_factor <= 0 or remote.max_job_s <= 0:
-        raise ConfigError("remote: min_timeout_s must be positive and at most max_timeout_s, timeout_factor and max_job_s positive")
+    if not 0 < remote.min_timeout_s <= remote.max_timeout_s or remote.timeout_factor <= 0 or remote.max_job_s <= 0 or remote.step_gap_s < 0:
+        raise ConfigError(
+            "remote: min_timeout_s must be positive and at most max_timeout_s, timeout_factor and max_job_s positive, step_gap_s not negative"
+        )
     if isinstance(radio.path_hash_mode, bool) or not isinstance(radio.path_hash_mode, int) or not 0 <= radio.path_hash_mode <= 2:
         raise ConfigError("radio.path_hash_mode must be 0, 1 or 2")
     if companion.dtr not in ("auto", "on", "off"):

@@ -120,3 +120,11 @@ def test_example_config_loads():
 def test_sync_clock_defaults_on_and_can_be_switched_off(tmp_path):
     assert load_config(write(tmp_path / "a.toml", "")).companion.sync_clock is True
     assert load_config(write(tmp_path / "b.toml", "[companion]\nsync_clock = false\n")).companion.sync_clock is False
+
+
+def test_the_remote_pacing_gap_defaults_to_three_seconds_and_can_be_changed_or_turned_off(tmp_path):
+    assert load_config(write(tmp_path / "a.toml", "")).remote.step_gap_s == 3.0
+    assert load_config(write(tmp_path / "b.toml", "[remote]\nstep_gap_s = 0\n")).remote.step_gap_s == 0
+    assert load_config(write(tmp_path / "c.toml", "[remote]\nstep_gap_s = 5.5\n")).remote.step_gap_s == 5.5
+    with pytest.raises(ConfigError, match="step_gap_s"):
+        load_config(write(tmp_path / "d.toml", "[remote]\nstep_gap_s = -1\n"))

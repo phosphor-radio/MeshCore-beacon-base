@@ -64,7 +64,7 @@ def build(tmp_path, assume_synced=True, rtc_start=1_715_770_351):
     cfg = Config(
         companion=CompanionConfig(port=fake.path, command_timeout=2.0, poll_interval=5.0), radio=RadioConfig(), channel_key=KEY,
         clock=ClockConfig(assume_synced=assume_synced),
-        remote=RemoteConfig(min_timeout_s=0.4, max_timeout_s=0.8, timeout_factor=1.5, max_job_s=20.0),
+        remote=RemoteConfig(min_timeout_s=0.4, max_timeout_s=0.8, timeout_factor=1.5, max_job_s=20.0, step_gap_s=0.05),
     )
     handler = PipelineHandler(server, Pipeline(server, assume_synced=assume_synced), fake.path)
     session = CompanionSession(cfg, handler)
@@ -178,19 +178,28 @@ def test_the_stats_reply_with_and_without_uptime(env):
     assert stats["heard"] == 7 and stats["up_s"] is not None
 
 
-def test_a_lost_reply_is_retried_and_a_set_is_idempotent(env):
+def test_a_lost_reply_is_sent_again_on_the_same_route_and_a_set_is_idempotent(env):
     assert env.run("name", password="password")["state"] == "done"
     env.repeater.drop_next_replies = 1
     row = env.run("name", "set", {"name": "again"})
     assert row["state"] == "done" and env.repeater.name == "again" and env.result(row)["verified"]
     assert env.repeater.commands.count("set name again") == 2  # the lost one ran, so it ran twice
+    assert env.result(row)["retries"] == 1 and env.result(row)["route_resets"] == 0
+    assert not any(c[0] == companion.CMD_RESET_PATH for c in env.fake.commands)  # one packet to try again, not a new flood login
 
 
-def test_a_lost_login_reply_is_retried_after_the_route_is_reset(env):
+def test_a_lost_login_reply_is_sent_again_without_touching_the_route(env):
     env.repeater.drop_next_logins = 1
     row = env.run("name", password="password")
-    assert row["state"] == "done"
-    assert any(c[0] == companion.CMD_RESET_PATH for c in env.fake.commands)
+    assert row["state"] == "done" and env.result(row)["retries"] == 1
+    assert not any(c[0] == companion.CMD_RESET_PATH for c in env.fake.commands)
+
+
+def test_two_lost_logins_reset_the_route_before_the_last_try(env):
+    env.repeater.drop_next_logins = 2
+    row = env.run("name", password="password")
+    assert row["state"] == "done" and env.result(row)["route_resets"] == 1
+    assert sum(1 for c in env.fake.commands if c[0] == companion.CMD_RESET_PATH) == 1
 
 
 def test_an_unreachable_repeater_fails_as_no_reply_without_hanging(env):

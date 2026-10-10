@@ -99,8 +99,10 @@ of a report that failed to decode). `on_synced` fires once the offline queue has
 (`Store.submit_job`: a kind from the closed set in `remote.py`, typed params, never command text; a password only until pickup) and
 `beacon-ingest` runs it: `Handler.claim_job` -> `RemoteExecutor` (driven from the session loop, one job and one command at a time, never
 blocking report draining) -> `Handler.finish_job`. A login is admin only if the push says role 1 *and* permission 3 (an empty password
-from a key the repeater does not know is a guest login); commands go out as `NN|command` and the reply is matched on the tag; one retry
-after `CMD_RESET_PATH`. Jobs expire after 60 s unqueued; `recover_jobs` fails any left `running` by a crash. `get lat/lon` read back
+from a key the repeater does not know is a guest login); commands go out as `NN|command` and the reply is matched on the tag (any tag
+sent for the current step answers it). Pacing: nothing is transmitted until `remote.step_gap_s` (3 s) after the last thing received or
+after a timeout, so the echoes of a reply die down. A step is tried three times: again on the same route, then after `CMD_RESET_PATH` and a
+fresh login. Jobs expire after 60 s unqueued; `recover_jobs` fails any left `running` by a crash. `get lat/lon` read back
 lossy, so the base records the value it sent. `Store.finish_job` writes a confirmed name, position (`location_source = 'remote'`) and window
 through to `repeaters` (never a position read back). The admin password only ever travels in the job row and is erased at claim (with
 `secure_delete` and a WAL truncate); `beaconctl` takes it from a file, the environment or a prompt, never argv. `beacon-ingest` also keeps the `service_status` heartbeat row (`heartbeat.py`).
