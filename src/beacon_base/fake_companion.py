@@ -1,7 +1,7 @@
 """A fake companion radio on a pseudo-terminal, for tests and desk development.
 
 Speaks enough of the companion protocol for ``CompanionSession``: APP_START, DEVICE_QUERY, GET/SET_CHANNEL,
-SET_RADIO_PARAMS and SYNC_NEXT_MESSAGE, with an offline queue and MSG_WAITING pushes like the real firmware
+SET_RADIO_PARAMS, SET_OTHER_PARAMS, GET_CONTACTS, GET_CONTACT_BY_KEY and SYNC_NEXT_MESSAGE, with an offline queue and MSG_WAITING pushes like the real firmware
 (``examples/companion_radio/MyMesh.cpp``). Test hooks inject reports, garbage and disconnects.
 """
 
@@ -38,6 +38,10 @@ class FakeCompanion:
         self.fw_ver = fw_ver
         self.channels: dict[int, tuple[str, bytes]] = {0: ("Public", bytes.fromhex("8b3387e9c5cdea6ac9e5edbaa115cd72"))}
         self.queue: deque[bytes] = deque()
+        # nodes the companion stores: public key -> (type, name, advert timestamp, lat, lon)
+        self.contacts: dict[bytes, tuple[int, str, int, float, float]] = {}
+        self.manual_add = False  # the companion's manual-add mode: it stores nothing and pushes every advert in full
+        self.contacts_error: int | None = None  # answer CMD_GET_CONTACTS with this error code
         self.commands: list[bytes] = []  # every command frame received, for assertions
         self.send_push_on_enqueue = True
         self._lock = threading.RLock()
@@ -113,6 +117,21 @@ class FakeCompanion:
         """Queue a received GRP_DATA packet, as if a repeater's report had arrived over the air."""
         self.enqueue_frame(companion.build_channel_data(snr_x4, channel_index, path_len, data_type, report_payload))
 
+    def advert(
+        self, public_key: bytes, name: str, adv_type: int = companion.ADV_TYPE_REPEATER,
+        lat: float = 0.0, lon: float = 0.0, counter: int = 0,
+    ) -> None:
+        """The companion hears a node's advert, as the firmware does: in manual-add mode, or for a node it does not store,
+        the host gets a full contact with the position; a node it already stores is pushed as a bare key."""
+        with self._lock:
+            known = public_key in self.contacts
+            if known or not self.manual_add:
+                self.contacts[public_key] = (adv_type, name, counter, lat, lon)
+        if known:
+            self.write_frame(bytes([companion.PUSH_ADVERT]) + public_key)
+        else:
+            self.write_frame(companion.build_contact(companion.PUSH_NEW_ADVERT, public_key, adv_type, name, counter, lat, lon))
+
     def enqueue_frame(self, frame: bytes) -> None:
         with self._lock:
             if len(self.queue) >= OFFLINE_QUEUE_SIZE:
@@ -180,7 +199,7 @@ class FakeCompanion:
         if op == companion.CMD_APP_START and len(cmd) >= 8:
             freq, bw, sf, cr = self.radio
             frame = bytes([companion.RESP_SELF_INFO, 1, 22, 22]) + self.public_key
-            frame += struct.pack("<iiBBBB", 0, 0, 0, 0, 0, 0)
+            frame += struct.pack("<iiBBBB", 0, 0, 0, 0, 0, 1 if self.manual_add else 0)
             frame += struct.pack("<IIBB", freq, bw, sf, cr) + b"fake-companion"
             self.write_frame(frame)
         elif op == companion.CMD_DEVICE_QUERY and len(cmd) >= 2:
@@ -205,6 +224,22 @@ class FakeCompanion:
         elif op == companion.CMD_SET_RADIO_PARAMS and len(cmd) >= 11:
             self.radio = struct.unpack_from("<IIBB", cmd, 1)
             self._ok()
+        elif op == companion.CMD_SET_OTHER_PARAMS and len(cmd) >= 2:
+            self.manual_add = bool(cmd[1] & 1)
+            self._ok()
+        elif op == companion.CMD_GET_CONTACTS and self.contacts_error is not None:
+            self._err(self.contacts_error)
+        elif op == companion.CMD_GET_CONTACTS:
+            self.write_frame(bytes([companion.RESP_CONTACTS_START]) + struct.pack("<I", len(self.contacts)))
+            for key, (adv_type, name, counter, lat, lon) in list(self.contacts.items()):
+                self.write_frame(companion.build_contact(companion.RESP_CONTACT, key, adv_type, name, counter, lat, lon, 1))
+            self.write_frame(bytes([companion.RESP_END_OF_CONTACTS]) + struct.pack("<I", 1))
+        elif op == companion.CMD_GET_CONTACT_BY_KEY and len(cmd) >= 33:
+            entry = self.contacts.get(bytes(cmd[1:33]))
+            if entry is None:
+                self._err(2)
+            else:
+                self.write_frame(companion.build_contact(companion.RESP_CONTACT, bytes(cmd[1:33]), *entry))
         elif op == companion.CMD_SYNC_NEXT_MESSAGE:
             if self.queue:
                 self.write_frame(self.queue.popleft())

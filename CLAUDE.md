@@ -10,7 +10,8 @@ reports through a MeshCore **companion node over USB**, enforces replay protecti
 Scale is about 30 beacons and 10 repeaters.
 
 **Status: B1 and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and verified on hardware. B2
-(store and pipeline) is code complete and tested without hardware (fake companion). B3 onwards is not started.** The plans are the source of truth:
+(store and pipeline) and the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1 and R2: positions and names
+from repeater adverts) are code complete and tested without hardware (fake companion). B3 onwards is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -84,8 +85,16 @@ deploy/            config.example.toml        (+ systemd units, udev rule, insta
 `ReceivedReport` with `rx_wall`, `rx_mono`, `late`, the companion SNR and the raw payload; `on_drop` carries the raw frame
 of a report that failed to decode). `on_synced` fires once the offline queue has been drained after connecting.
 
-Pipeline rules worth remembering (full text in the base plan): unknown beacon/repeater and disabled entries are stored but
-change nothing; an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason
+Repeater positions and names come from the **repeaters' own adverts**, heard by the base companion (`CompanionSession`:
+contact list at connect, `PUSH_NEW_ADVERT`, bare `PUSH_ADVERT` then `CMD_GET_CONTACT_BY_KEY`; the companion is put in
+manual-add mode so every advert is a full one) and applied by `Store.record_repeater_advert`: adverts with a valid non-0,0
+position are kept in `repeater_adverts` whether or not the repeater is trusted; for a trusted repeater position and name are
+overwritten, last write wins (`repeater locate` is the same, until the next advert); an advert without a position never
+erases one. 0, 0 means **unlocated**: `Store.is_located` / `located_repeaters()` is the one place that decides, and the
+estimator must use it. `repeater add --all` considers only repeaters that have *reported*.
+
+Pipeline rules worth remembering (full text in the base plan): unknown repeater/beacon and disabled entries are stored but
+change nothing (the repeater is checked first, so repeaters are onboarded before beacons); an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason
 `late` if that transmission was already seen (not a lockout, not counted in `rejects_since_accept`) or `below_hwm`
 (counts, and makes the beacon `rejected`); reset clears the mark and bumps `epoch`, and dedupe/grouping are per epoch.
 Beacons are identified by the 8-byte prefix only (no full beacon key is stored; the reports are the source of truth).

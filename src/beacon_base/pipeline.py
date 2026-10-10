@@ -3,9 +3,10 @@
 ``Pipeline.process`` handles one received report in one database transaction, so a crash leaves either the whole report
 applied or none of it, and re-running it on an unchanged database gives the same result. For each entry:
 
-1. **Allowlist.** An unknown beacon prefix is stored as ``unknown_beacon`` and nothing else changes.
-2. **Repeater known.** An unknown repeater prefix is stored as ``unknown_repeater`` and the beacon's high-water mark is
-   not touched, so a rogue repeater cannot move it.
+1. **Repeater known.** An unknown repeater prefix is stored as ``unknown_repeater`` and nothing else changes, so a rogue or
+   misconfigured repeater can neither move a high-water mark nor get beacons listed. Repeaters are the infrastructure and
+   are onboarded first.
+2. **Allowlist.** An unknown beacon prefix, from a known repeater, is stored as ``unknown_beacon`` and nothing else changes.
 3. **High-water mark.** No mark yet: accept and take the counter as the baseline. A lower counter is rejected as
    ``replay``. An equal counter is the current transmission and joins its group. A higher counter is a new transmission:
    accept and advance the mark.
@@ -143,14 +144,16 @@ class Pipeline:
                 transmission_id,
             )
 
-        if beacon is None:
-            return record(UNKNOWN_BEACON)
-        if not beacon["enabled"]:
-            return record(DISABLED, "beacon")
+        # Repeaters are checked first: they are the infrastructure, set up before the beacons, and a stranger must not be able
+        # to get its beacons listed or move a high-water mark.
         if repeater is None:
             return record(UNKNOWN_REPEATER)  # the high-water mark is deliberately not touched
         if not repeater["enabled"]:
             return record(DISABLED, "repeater")
+        if beacon is None:
+            return record(UNKNOWN_BEACON)
+        if not beacon["enabled"]:
+            return record(DISABLED, "beacon")
 
         hwm = beacon["hwm"]
         if hwm is not None and o.counter < hwm:

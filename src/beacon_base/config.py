@@ -41,6 +41,8 @@ class CompanionConfig:
     channel_name: str = "beacon-reports"
     manage_radio: bool = False  # apply [radio] to the companion instead of only warning when it differs
     poll_interval: float = 30.0  # safety-net queue drain, in case a MSG_WAITING push is missed
+    learn_repeaters: bool = True  # take each repeater's position and name from the adverts the companion hears
+    manual_add_contacts: bool = True  # run the companion in manual-add mode so every advert reaches us in full (stored in the companion)
     command_timeout: float = 5.0
 
 

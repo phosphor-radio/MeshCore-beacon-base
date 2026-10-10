@@ -223,3 +223,26 @@ class CompanionLink:
             else:
                 self.stray_frames += 1
                 log.warning("skipping unexpected reply %#04x to command %d", code, payload[0])
+
+    def request_until(self, payload: bytes, end_code: int, timeout: float | None = None) -> list[bytes]:
+        """Send a command whose reply is a stream of frames (a contact list) and collect them up to end_code.
+
+        timeout applies to each frame, not the whole stream. Pushes go to on_push, a RESP_ERR reply raises CommandError.
+        The end frame is not included in the result.
+        """
+        wait = self.command_timeout if timeout is None else timeout
+        self.send(payload)
+        frames: list[bytes] = []
+        while True:
+            frame = self.recv_frame(wait)
+            if frame is None:
+                raise LinkError(f"reply to command {payload[0]} stalled for {wait:.0f}s after {len(frames)} frames")
+            code = frame[0]
+            if companion.is_push(code):
+                self.on_push(frame)
+            elif code == companion.RESP_ERR:
+                raise CommandError(companion.error_code(frame))
+            elif code == end_code:
+                return frames
+            else:
+                frames.append(frame)

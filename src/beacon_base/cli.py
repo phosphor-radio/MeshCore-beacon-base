@@ -13,7 +13,7 @@ import threading
 
 from . import __version__, admin
 from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
-from .ingest import CompanionSession, ConnectionInfo, Handler, ReceivedNames, ReceivedReport
+from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, ReceivedNames, ReceivedReport
 from .link import CompanionError
 from .names import sanitize_name
 from .runtime import setup_logging, stop_on_signals
@@ -72,6 +72,19 @@ class PrintHandler(Handler):
             if self._limit is not None and self.printed >= self._limit:
                 self._stop.set()
                 return
+
+    def on_repeater_advert(self, advert: HeardRepeater) -> None:
+        if self._stop.is_set():
+            return
+        located = Store.is_located(advert.lat, advert.lon)
+        name = sanitize_name(advert.name.encode()) or ""
+        if self._json:
+            print(json.dumps({"type": "repeater_advert", "repeater": advert.public_key[:8].hex(), "key": advert.public_key.hex(), "name": name,
+                              "lat": advert.lat if located else None, "lon": advert.lon if located else None,
+                              "live": advert.heard_at is not None}), flush=True)
+        else:
+            where = f"{advert.lat:.6f},{advert.lon:.6f}" if located else "no-location"
+            print(f"{'advert' if advert.heard_at else 'contact'} repeater={advert.public_key[:8].hex()} name={name!r} position={where}", flush=True)
 
     def on_names(self, rx: ReceivedNames) -> None:
         if self._stop.is_set():
@@ -143,8 +156,8 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
             with Store.open(cfg.db_path) as store:
                 for beacon_id in sim.beacon_ids:
                     store.add_beacon(beacon_id.hex(), "simulated")
-                for i, key in enumerate(sim.repeater_keys, 1):
-                    store.add_repeater(key.hex(), 40.0 + 0.01 * i, -75.0 + 0.01 * i, name=f"sim-repeater-{i}", window_s=20)
+                for key in sim.repeater_keys:
+                    store.add_repeater(key.hex(), window_s=20)  # position and name come from the repeaters' adverts
             print(f"added the simulated beacons and repeaters to {cfg.db_path}")
         print(f"fake companion on {fake.path}")
         print(f"  ingest with:  beacon-ingest --port {fake.path}   (or: beaconctl listen --port ...)")
@@ -153,12 +166,14 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
         for i, key in enumerate(sim.repeater_keys, 1):
             print(f"  repeater {i}:  {key.hex()}", flush=True)
         sim.announce_names()
+        sim.advertise_repeaters()
         ticks = 0
         while not stop.wait(args.interval):
             sim.tick()
             ticks += 1
             if ticks % args.names_every == 0:
                 sim.announce_names()
+                sim.advertise_repeaters()
     return 0
 
 
@@ -243,13 +258,20 @@ def _add_admin_commands(sub) -> None:
         p.set_defaults(func=admin.cmd_beacon_enable, enable=enable)
 
     repeater = sub.add_parser("repeater", help="repeater table").add_subparsers(dest="repeater_command", required=True)
-    p = repeater.add_parser("add", help="add a repeater and its location")
-    p.add_argument("key", help="public key (64 hex characters) or its 8-byte prefix (16 hex characters)")
-    p.add_argument("lat", type=float)
-    p.add_argument("lon", type=float)
-    p.add_argument("--name", help="optional display name; not unique, and never required")
+    p = repeater.add_parser("add", help="trust a repeater; its position and name come from its advert unless given")
+    p.add_argument("key", nargs="?", help="public key (64 hex characters) or its 8-byte prefix (16 hex characters)")
+    p.add_argument("lat", nargs="?", type=float, help="optional; without it the advertised position is used, else 0, 0 (unlocated)")
+    p.add_argument("lon", nargs="?", type=float)
+    p.add_argument("--name", help="optional display name; the repeater's advertised name replaces it")
+    p.add_argument("-a", "--all", action="store_true", help="add every repeater that has reported but is not in the table")
+    p.add_argument("--hours", type=float, default=24.0, help="with --all: how far back to look for reporting repeaters")
     p.add_argument("--window", type=float, help="the repeater's beacon.window in seconds, checked by 'beaconctl check'")
     p.set_defaults(func=admin.cmd_repeater_add)
+    p = repeater.add_parser("locate", help="set a repeater's position by hand (the next advert with a position replaces it)")
+    p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
+    p.add_argument("lat", type=float)
+    p.add_argument("lon", type=float)
+    p.set_defaults(func=admin.cmd_repeater_locate)
     repeater.add_parser("list", help="list repeaters").set_defaults(func=admin.cmd_repeater_list)
     p = repeater.add_parser("remove", help="remove a repeater")
     p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)

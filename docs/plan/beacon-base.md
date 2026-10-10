@@ -21,7 +21,7 @@ made while implementing B2 are marked "(B2)".
 | 5 | **Late-report cutoff is in:** strict high-water mark plus the rule that the repeater report window stays below the beacon interval. |
 | 6 | **Time is stamped on the base**, from the Pi's clock, set manually after boot. Repeater-side timestamps are parked (see "Time"). |
 | 7 | Test base companion: **XIAO ESP32-S3 + Wio-SX1262** running `Xiao_S3_WIO_companion_radio_usb` (USB, no Bluetooth). |
-| 8 | **Beacons are identified by their 8-byte key prefix only.** Reports carry nothing else, every pipeline decision uses only the prefix, and a full key would have no use at the base (a signature check would need the *repeater's* key, which the repeater table keeps). `beacon add` takes the prefix. The reports are the source of truth, so the base does not collect adverts from the companion. |
+| 8 | **Beacons are identified by their 8-byte key prefix only.** Reports carry nothing else, every pipeline decision uses only the prefix, and a full key would have no use at the base (a signature check would need the *repeater's* key, which the repeater table keeps). `beacon add` takes the prefix. The reports are the source of truth, so the base does not collect beacon adverts from the companion. (Repeater adverts are collected, for their position and name: [repeater-onboarding.md](repeater-onboarding.md).) |
 
 ## Goals and constraints
 
@@ -118,9 +118,12 @@ repeater's `beacon.window`, for `beaconctl check`). The database file defaults t
 - `beacon_names`: `prefix` (primary key), `name`, `first_seen`, `updated_at`, `repeater_prefix`. The name repeaters last
   announced for a prefix ([beacon-names.md](beacon-names.md)), display only, for any prefix whether or not it is allowlisted.
   Beacon rows read through a join, so `beacon["name"]` is the announced name or NULL.
-- `repeaters`: `prefix` (8 bytes, primary key), `pubkey` (optional), `name` (optional, not unique), `lat`, `lon`,
-  `enabled`. Authoritative repeater locations. Optionally importable from the companion's contact list (`CMD_GET_CONTACTS` returns lat/lon for
-  repeaters that advertise), but the table wins.
+- `repeaters`: `prefix` (8 bytes, primary key), `pubkey` (optional, filled from the repeater's advert), `name` (optional, not
+  unique), `lat`, `lon` (0, 0 = unlocated, excluded from positioning), `location_source` (`none`, `advert`, `manual`),
+  `location_updated_at`, `enabled`. The position and name follow the repeater's adverts, last write wins
+  ([repeater-onboarding.md](repeater-onboarding.md)).
+- `repeater_adverts`: `prefix` (primary key), `pubkey`, `name`, `lat`, `lon`, `advert_timestamp`, `first_seen`, `last_heard`.
+  Adverts with a valid position heard by the base companion, whether or not the repeater is trusted yet.
 - `raw_frames`: every beacon-report frame as received (`rx_time`, companion SNR, path length, payload, `late`). Audit
   trail and replay source for debugging; pruned by age.
 - `observations`: one row per entry in a report: `rx_time` (wall clock), `rx_mono` (seconds since boot, from the
@@ -146,9 +149,10 @@ Implements "Replay checks at the base" from the main plan as a pure function ove
 report so it is idempotent and crash-safe. For each entry in a decoded report:
 
 1. **Format.** Unknown report version or malformed length: log and drop the whole report.
-2. **Allowlist.** Look up `beacon_prefix`. Not found: store as `unknown_beacon`, nothing else changes.
-3. **Repeater known.** Unknown repeater prefix: store as `unknown_repeater` and do **not** touch the high-water mark
-   (a rogue or misconfigured repeater must not be able to move it). It is shown in the UI as an action item.
+2. **Repeater known.** (Checked before the allowlist since the repeater onboarding work, so repeaters are onboarded first.)
+   Unknown repeater prefix: store as `unknown_repeater` and change nothing else: a rogue or misconfigured repeater must not be
+   able to move a high-water mark or get beacons listed. It is shown in the UI as an action item.
+3. **Allowlist.** Look up `beacon_prefix`. Not found: store as `unknown_beacon`, nothing else changes.
 4. **High-water mark.**
    - `hwm` is NULL: accept, set `hwm = counter` (baseline).
    - `counter < hwm`: reject as `replay`. (B2) The reason is `late` if that `(beacon, counter)` transmission was already seen
@@ -229,8 +233,10 @@ Beacons have no clock and reports carry no time (decision 7 of the main plan), s
 - `beaconctl beacon add <prefix>`; the 16-character prefix is listed by `beaconctl status` once a repeater has reported
   the beacon, or comes from the beacon's serial `pubkey` command (a full key is accepted and reduced to its prefix).
   Onboarding is: configure the beacons, let them transmit, then add them from the unlisted list in `status`.
-- `beaconctl repeater add <pubkey-or-prefix> <lat> <lon> [--name N] [--window S]`; the key comes from the repeater's CLI. The
-  name is optional display text.
+- `beaconctl repeater add <pubkey-or-prefix> [<lat> <lon>] [--name N] [--window S]`; the key comes from the repeater's CLI.
+  Position and name default to what the repeater advertised, else the repeater is added unlocated at 0, 0.
+  `repeater add --all` adds every repeater that has reported but is not in the table, and `repeater locate` sets a position
+  by hand. Onboarding order: repeaters first (`status` lists the unknown ones), then beacons.
 - `beaconctl beacon reset <prefix>`, `... list`, `... status <prefix>` (last heard, counter, battery, which repeaters hear
   it). A beacon is addressed by its prefix or the first six or more hex digits of it; names are never used to find one.
 - `beaconctl time` shows and sets the clock state (see "Time"), `beaconctl status` and `beaconctl rejects` as above.

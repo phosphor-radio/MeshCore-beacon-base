@@ -24,6 +24,23 @@ class Simulator:
             return f"beacon-{self.beacon_ids[index].hex()[:6]}"
         return f"sim-beacon-{index + 1}"
 
+    def repeater_name(self, index: int) -> str:
+        return f"sim-repeater-{index + 1}"
+
+    def repeater_position(self, index: int) -> tuple[float, float] | None:
+        """Where repeater `index` has been told it is. The last one (when there are two or more) was never located."""
+        if index == len(self.repeater_keys) - 1 and index > 0:
+            return None
+        return (40.0 + 0.01 * (index + 1), -75.0 + 0.01 * (index + 1))
+
+    def advertise_repeaters(self) -> int:
+        """Every repeater's flood advert is heard by the companion: name, and position when it has one (an unlocated
+        repeater advertises 0, 0). Returns the number of adverts sent."""
+        for i, key in enumerate(self.repeater_keys):
+            lat, lon = self.repeater_position(i) or (0.0, 0.0)
+            self._fake.advert(key, self.repeater_name(i), lat=lat, lon=lon, counter=1000 + i)
+        return len(self.repeater_keys)
+
     def announce_names(self) -> int:
         """Every repeater announces the names of all the beacons, as repeaters do on first sight and on their refresh.
         Returns the number of messages queued."""

@@ -11,15 +11,21 @@ from dataclasses import dataclass
 
 # commands (host to device)
 CMD_APP_START = 1
+CMD_GET_CONTACTS = 4
 CMD_SYNC_NEXT_MESSAGE = 10
 CMD_SET_RADIO_PARAMS = 11
 CMD_DEVICE_QUERY = 22
+CMD_GET_CONTACT_BY_KEY = 30
 CMD_GET_CHANNEL = 31
 CMD_SET_CHANNEL = 32
+CMD_SET_OTHER_PARAMS = 38
 
 # responses (device to host, replies to a command)
 RESP_OK = 0
 RESP_ERR = 1
+RESP_CONTACTS_START = 2
+RESP_CONTACT = 3
+RESP_END_OF_CONTACTS = 4
 RESP_SELF_INFO = 5
 RESP_CONTACT_MSG_RECV = 7
 RESP_CHANNEL_MSG_RECV = 8
@@ -31,12 +37,16 @@ RESP_CHANNEL_INFO = 18
 RESP_CHANNEL_DATA_RECV = 27
 
 # pushes (device to host, unsolicited); every push code has the top bit set
-PUSH_ADVERT = 0x80
+PUSH_ADVERT = 0x80  # an advert from a contact the companion stores: code + 32-byte public key, no position
 PUSH_SEND_CONFIRMED = 0x82
 PUSH_MSG_WAITING = 0x83
 PUSH_LOG_RX_DATA = 0x88
-PUSH_NEW_ADVERT = 0x8A
+PUSH_NEW_ADVERT = 0x8A  # an advert from a node it does not store: a full contact frame, with position
 
+ADV_TYPE_CHAT = 1
+ADV_TYPE_REPEATER = 2
+ADV_TYPE_SENSOR = 4
+CONTACT_FRAME_LEN = 148
 APP_NAME = b"beacon-base"
 PROTOCOL_VERSION = 3  # DEVICE_QUERY app target version
 CHANNEL_NAME_LEN = 32
@@ -101,6 +111,21 @@ def set_channel(index: int, name: str, secret: bytes) -> bytes:
     return bytes([CMD_SET_CHANNEL, index]) + raw_name.ljust(CHANNEL_NAME_LEN, b"\0") + secret
 
 
+def get_contacts() -> bytes:
+    return bytes([CMD_GET_CONTACTS])
+
+
+def get_contact_by_key(pubkey: bytes) -> bytes:
+    if len(pubkey) != PUBKEY_LEN:
+        raise ValueError(f"public key must be {PUBKEY_LEN} bytes")
+    return bytes([CMD_GET_CONTACT_BY_KEY]) + pubkey
+
+
+def set_manual_add_contacts(manual: bool) -> bytes:
+    """CMD_SET_OTHER_PARAMS with only the first parameter, so the companion's telemetry and location settings are left alone."""
+    return bytes([CMD_SET_OTHER_PARAMS, 1 if manual else 0])
+
+
 def sync_next_message() -> bytes:
     return bytes([CMD_SYNC_NEXT_MESSAGE])
 
@@ -135,6 +160,7 @@ class SelfInfo:
     sf: int
     cr: int
     name: str
+    manual_add_contacts: int = 0  # bit 0: the companion does not add adverts to its contacts by itself
 
 
 def parse_self_info(frame: bytes) -> SelfInfo:
@@ -149,6 +175,7 @@ def parse_self_info(frame: bytes) -> SelfInfo:
         sf=frame[56],
         cr=frame[57],
         name=_cstr(bytes(frame[58:])),
+        manual_add_contacts=frame[47],
     )
 
 
@@ -228,4 +255,58 @@ def build_channel_data(snr_x4: int, channel_index: int, path_len: int, data_type
     return (
         struct.pack("<BbBBBBHB", RESP_CHANNEL_DATA_RECV, snr_x4, 0, 0, channel_index, path_len, data_type, len(payload))
         + payload
+    )
+
+
+@dataclass(frozen=True)
+class Contact:
+    """A node the companion has heard an advert from. A repeater appears here with its key, advertised name and position."""
+
+    public_key: bytes
+    adv_type: int
+    name: str
+    advert_timestamp: int
+    lat: float | None  # degrees; None if the frame has no position field. 0.0, 0.0 means the node did not set one
+    lon: float | None
+
+
+def parse_contact(frame: bytes) -> Contact:
+    """RESP_CODE_CONTACT and PUSH_CODE_NEW_ADVERT share this layout:
+    code, key(32), type, flags, out_path_len, out_path(64), name(32), advert timestamp(4), lat(4), lon(4), lastmod(4);
+    lat and lon are int32 degrees x 1e6."""
+    if len(frame) < 136 or frame[0] not in (RESP_CONTACT, PUSH_NEW_ADVERT):
+        raise ProtocolError(f"bad contact frame ({len(frame)} bytes)")
+    lat = lon = None
+    if len(frame) >= 144:
+        raw_lat, raw_lon = struct.unpack_from("<ii", frame, 136)
+        lat, lon = raw_lat / 1e6, raw_lon / 1e6
+    return Contact(
+        public_key=bytes(frame[1 : 1 + PUBKEY_LEN]),
+        adv_type=frame[33],
+        name=_cstr(bytes(frame[100:132])),
+        advert_timestamp=struct.unpack_from("<I", frame, 132)[0],
+        lat=lat,
+        lon=lon,
+    )
+
+
+def parse_bare_advert(frame: bytes) -> bytes:
+    """PUSH_CODE_ADVERT: the public key of a node the companion already has as a contact."""
+    if len(frame) < 1 + PUBKEY_LEN or frame[0] != PUSH_ADVERT:
+        raise ProtocolError(f"bad advert push ({len(frame)} bytes)")
+    return bytes(frame[1 : 1 + PUBKEY_LEN])
+
+
+def build_contact(
+    code: int, public_key: bytes, adv_type: int, name: str, advert_timestamp: int = 0,
+    lat: float = 0.0, lon: float = 0.0, lastmod: int = 0,
+) -> bytes:
+    """The inverse of parse_contact, for the fake companion."""
+    return (
+        bytes([code])
+        + public_key
+        + bytes([adv_type, 0, 0xFF])
+        + bytes(64)
+        + name.encode("utf-8")[:31].ljust(32, b"\0")
+        + struct.pack("<IiiI", advert_timestamp, round(lat * 1e6), round(lon * 1e6), lastmod)
     )

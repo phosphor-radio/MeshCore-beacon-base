@@ -165,7 +165,7 @@ def test_status_lists_unlisted_beacons_with_their_name_and_unknown_repeaters(cfg
     assert f"{stranger.hex()}  'Shed'" in out and f"add: beaconctl beacon add {stranger.hex()}" in out
     assert f"{nameless.hex()}  (no name announced)" in out
     assert "not in the repeater table" in out and rogue[:8].hex() in out
-    assert f"beaconctl repeater add {rogue[:8].hex()} <lat> <lon>" in out
+    assert f"no location advertised  1 observations" in out and f"add: beaconctl repeater add {rogue[:8].hex()}" in out
 
 
 def test_status_on_an_empty_database(cfg_file, capsys):
@@ -460,3 +460,119 @@ def test_add_all_options_and_conflicts(cfg_file, tmp_path, capsys):
     assert code == 2 and "usage" in err
     code, out, _ = run(cfg_file, "beacon", "add", "--all", capsys=capsys)
     assert code == 0 and "added 1 beacon(s)" in out
+
+
+# --- repeater onboarding: positions come from adverts --------------------------------------------------------------------
+
+
+RK = bytes(range(0x60, 0x80))
+RP = RK[:8].hex()
+
+
+def heard_advert(tmp_path, key=RK, name="North Ridge", lat=40.5, lon=-75.25):
+    with Store.open(tmp_path / "beacon.db") as store:
+        store.record_repeater_advert(key, name, lat, lon, 1, time.time())
+
+
+def test_repeater_add_takes_the_heard_position_and_name(cfg_file, tmp_path, capsys):
+    heard_advert(tmp_path)
+    code, out, _ = run(cfg_file, "repeater", "add", RP, capsys=capsys)
+    assert code == 0 and "North Ridge" in out and "40.500000, -75.250000" in out and "left out of positioning" not in out
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    row = out.splitlines()[1].split()
+    assert row[:5] == ["North", "Ridge", RP, "40.500000", "-75.250000"] and "advert" in row
+
+
+def test_repeater_add_without_a_position_is_unlocated_and_says_so(cfg_file, capsys):
+    code, out, _ = run(cfg_file, "repeater", "add", RP, capsys=capsys)
+    assert code == 0 and "no location" in out and "left out of positioning" in out
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    row = out.splitlines()[1].split()
+    assert row[:4] == ["-", RP, "-", "-"] and "0.000000" not in out
+
+
+def test_repeater_add_with_a_position_is_manual(cfg_file, capsys):
+    code, out, _ = run(cfg_file, "repeater", "add", RP, "41.5", "-76.5", "--name", "Mine", capsys=capsys)
+    assert code == 0 and "Mine" in out and "41.500000, -76.500000" in out
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    assert "manual" in out
+
+
+def test_repeater_add_needs_both_coordinates(cfg_file, capsys):
+    code, _, err = run(cfg_file, "repeater", "add", RP, "41.5", capsys=capsys)
+    assert code == 2 and "both latitude and longitude" in err
+
+
+def test_a_later_advert_replaces_a_hand_set_position(cfg_file, tmp_path, capsys):
+    run(cfg_file, "repeater", "add", RP, "41.5", "-76.5")
+    code, out, _ = run(cfg_file, "repeater", "locate", RP[:6], "10", "20", capsys=capsys)
+    assert code == 0 and "10.000000, 20.000000" in out and "next advert" in out
+    heard_advert(tmp_path)  # the repeater was told where it is
+    with Store.open(tmp_path / "beacon.db") as store:
+        r = store.repeater(RP)
+        assert (r["lat"], r["lon"], r["location_source"]) == (40.5, -75.25, "advert")
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    assert "advert" in out and "manual" not in out
+
+
+def test_locate_validates(cfg_file, capsys):
+    run(cfg_file, "repeater", "add", RP)
+    code, _, err = run(cfg_file, "repeater", "locate", RP, "95", "0", capsys=capsys)
+    assert code == 2 and "latitude" in err
+    code, _, err = run(cfg_file, "repeater", "locate", "nobody", "1", "1", capsys=capsys)
+    assert code == 2 and "no repeater matches" in err
+
+
+def test_repeater_add_all_adds_reporters_with_what_was_heard(cfg_file, tmp_path, capsys):
+    run(cfg_file, "beacon", "add", B1)
+    other = bytes(range(150, 182))
+    heard_advert(tmp_path)
+    feed(tmp_path, rx(RK, obs(1), t=time.time() - 5), rx(other, obs(2), t=time.time() - 4))
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "repeater", "add", "--all", capsys=capsys)
+    assert code == 0
+    assert "North Ridge" in out and "40.500000, -75.250000" in out and f"{other[:6].hex()}" in out and "no location" in out
+    assert "added 2 repeater(s)" in out and "1 of them have no location" in out
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "not in the repeater table" not in out
+    code, out, _ = run(cfg_file, "repeater", "add", "-a", capsys=capsys)
+    assert code == 0 and "nothing to add" in out
+
+
+def test_repeater_add_all_ignores_repeaters_that_only_advertised(cfg_file, tmp_path, capsys):
+    heard_advert(tmp_path)  # in range of the base companion, but never reported on our channel
+    code, out, _ = run(cfg_file, "repeater", "add", "--all", capsys=capsys)
+    assert code == 0 and "nothing to add" in out
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    assert "no repeaters" in out
+
+
+def test_repeater_add_all_conflicts(cfg_file, capsys):
+    for argv in ([RP, "--all"], ["--all", "--name", "x"], ["--all", "1", "2"]):
+        code, _, err = run(cfg_file, "repeater", "add", *argv, capsys=capsys)
+        assert code == 2 and "--all" in err
+    code, _, err = run(cfg_file, "repeater", "add", capsys=capsys)
+    assert code == 2 and "usage" in err
+
+
+def test_status_describes_unknown_repeaters_by_their_advert(cfg_file, tmp_path, capsys):
+    run(cfg_file, "beacon", "add", B1)
+    heard_advert(tmp_path)
+    feed(tmp_path, rx(RK, obs(1), t=time.time() - 5))
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert f"{RP}  'North Ridge'  at 40.500000, -75.250000" in out and f"add: beaconctl repeater add {RP}" in out
+
+
+def test_check_fails_for_unlocated_repeaters(cfg_file, tmp_path, capsys):
+    _secrets(tmp_path)
+    run(cfg_file, "beacon", "add", B1)
+    run(cfg_file, "repeater", "add", "11" * 8, "1", "1", "--name", "placed", "--window", "60")
+    run(cfg_file, "repeater", "add", "22" * 8, "--name", "lost", "--window", "60")
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "check", capsys=capsys)
+    assert code == 1
+    assert "lost (222222): no location, so it is left out of positioning" in out and "placed" not in out
+    run(cfg_file, "repeater", "locate", "lost", "5", "6")
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "check", capsys=capsys)
+    assert code == 0 and out.startswith("ok:")

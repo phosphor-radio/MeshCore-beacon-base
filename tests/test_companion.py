@@ -101,3 +101,57 @@ def test_push_and_plausible_codes():
     assert companion.is_push(0x83) and not companion.is_push(0x1B)
     assert companion.plausible_code(0x1B) and companion.plausible_code(0x83)
     assert not companion.plausible_code(0x20) and not companion.plausible_code(0xFF) and not companion.plausible_code(0x7F)
+
+
+def test_contact_parsing_and_round_trip():
+    key = bytes(range(32))
+    frame = companion.build_contact(companion.RESP_CONTACT, key, companion.ADV_TYPE_REPEATER, "North Ridge", 4242, 40.123456, -75.654321, 9)
+    assert len(frame) == companion.CONTACT_FRAME_LEN
+    c = companion.parse_contact(frame)
+    assert (c.public_key, c.adv_type, c.name, c.advert_timestamp) == (key, 2, "North Ridge", 4242)
+    assert (c.lat, c.lon) == (40.123456, -75.654321)
+    pushed = companion.build_contact(companion.PUSH_NEW_ADVERT, key, 2, "x", 1, -33.8, 151.2)
+    assert (companion.parse_contact(pushed).lat, companion.parse_contact(pushed).lon) == (-33.8, 151.2)
+
+
+def test_contact_layout_matches_the_firmware():
+    # hand-assembled from writeContactRespFrame: code, key, type, flags, path_len, path[64], name[32], ts, lat, lon, lastmod
+    key = bytes(range(1, 33))
+    frame = (bytes([3]) + key + bytes([2, 0, 255]) + bytes(64) + b"tag".ljust(32, b"\0") + (7).to_bytes(4, "little")
+             + (40_000_000).to_bytes(4, "little", signed=True) + (-75_500_000).to_bytes(4, "little", signed=True) + bytes(4))
+    c = companion.parse_contact(frame)
+    assert (c.name, c.advert_timestamp, c.adv_type, c.lat, c.lon) == ("tag", 7, 2, 40.0, -75.5)
+
+
+def test_a_contact_frame_without_the_position_fields_has_none():
+    frame = companion.build_contact(companion.RESP_CONTACT, bytes(32), 2, "x")[:140]
+    c = companion.parse_contact(frame)
+    assert c.lat is None and c.lon is None
+
+
+def test_parse_contact_rejects_bad_frames():
+    for frame in (b"", bytes([3]) + bytes(40), bytes([companion.RESP_OK]) + bytes(147)):
+        with pytest.raises(ProtocolError):
+            companion.parse_contact(frame)
+
+
+def test_bare_advert_and_contact_commands():
+    key = bytes(range(32))
+    assert companion.parse_bare_advert(bytes([0x80]) + key) == key
+    with pytest.raises(ProtocolError):
+        companion.parse_bare_advert(bytes([0x80]) + key[:5])
+    assert companion.get_contacts() == bytes([4])
+    assert companion.get_contact_by_key(key) == bytes([30]) + key
+    with pytest.raises(ValueError):
+        companion.get_contact_by_key(key[:8])
+
+
+def test_set_manual_add_contacts_leaves_the_other_settings_alone():
+    # CMD_SET_OTHER_PARAMS has optional telemetry/location bytes after the first; sending only the first keeps them
+    assert companion.set_manual_add_contacts(True) == bytes([38, 1])
+    assert companion.set_manual_add_contacts(False) == bytes([38, 0])
+
+
+def test_self_info_reports_manual_add_mode():
+    frame = bytes([5, 1, 22, 22]) + bytes(32) + bytes(4 + 4 + 3) + bytes([1]) + struct.pack("<IIBB", 905775, 62500, 8, 6) + b"x"
+    assert companion.parse_self_info(frame).manual_add_contacts == 1

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -57,6 +57,18 @@ class ReceivedReport:
 
 
 @dataclass(frozen=True)
+class HeardRepeater:
+    """A repeater advert as the base companion reports it: the key, name and position the repeater advertises."""
+
+    public_key: bytes
+    name: str
+    lat: float | None  # 0.0, 0.0 means the repeater has not been told where it is
+    lon: float | None
+    advert_timestamp: int
+    heard_at: float | None  # Pi clock; None when it comes from the companion's contact list rather than a live advert
+
+
+@dataclass(frozen=True)
 class ReceivedNames:
     """A name announcement: what a repeater says its heard beacons call themselves."""
 
@@ -78,6 +90,9 @@ class Handler:
         """The companion's offline queue has been drained after connecting; reports from here on are live."""
 
     def on_report(self, rx: ReceivedReport) -> None: ...
+
+    def on_repeater_advert(self, advert: HeardRepeater) -> None:
+        """The base companion heard a repeater advertise, or listed one among its contacts."""
 
     def on_names(self, rx: ReceivedNames) -> None:
         """A repeater announced the names of beacons it hears."""
@@ -122,6 +137,8 @@ class CompanionSession:
         self._msg_waiting = False
         self._first_drain = True
         self._stop = threading.Event()
+        self._contacts: dict[bytes, companion.Contact] = {}  # every node the companion has told us about, this connection
+        self._advert_pushes: deque[bytes] = deque(maxlen=1000)
 
     # --- connection loop -------------------------------------------------------------------------------------------
 
@@ -159,6 +176,9 @@ class CompanionSession:
     def _on_push(self, frame: bytes) -> None:
         if frame[0] == companion.PUSH_MSG_WAITING:
             self._msg_waiting = True
+        elif frame[0] in (companion.PUSH_NEW_ADVERT, companion.PUSH_ADVERT) and self._cfg.companion.learn_repeaters:
+            # handled in the main loop: it needs commands of its own, which cannot nest inside another request
+            self._advert_pushes.append(frame)
         else:
             self.stats["push_ignored"] += 1
             log.debug("ignoring push %#04x", frame[0])
@@ -171,6 +191,10 @@ class CompanionSession:
         self._first_drain = True
         self._drain(link)
         self._first_drain = False
+        self._contacts.clear()
+        self._advert_pushes.clear()
+        if self._cfg.companion.learn_repeaters:
+            self._sync_contacts(link)  # after the drain, so it never delays a report
         self._handler.on_synced()
         next_poll = time.monotonic() + self._cfg.companion.poll_interval
         while not stop.is_set():
@@ -184,6 +208,8 @@ class CompanionSession:
             if self._msg_waiting or time.monotonic() >= next_poll:
                 self._drain(link)
                 next_poll = time.monotonic() + self._cfg.companion.poll_interval
+            if self._advert_pushes:
+                self._process_adverts(link)
 
     def _start(self, link: CompanionLink) -> ConnectionInfo:
         cc = self._cfg.companion
@@ -204,7 +230,17 @@ class CompanionSession:
             )
         self._ensure_radio(link, self_info)
         self._ensure_channel(link)
+        self._ensure_manual_add(link, self_info)
         return ConnectionInfo(self_info, device)
+
+    def _ensure_manual_add(self, link: CompanionLink, info: SelfInfo) -> None:
+        """Run the base companion in manual-add mode so every advert reaches us as a full contact with its position, and its
+        contact table does not fill with the mesh. Only written when it differs, since the companion stores it in flash."""
+        cc = self._cfg.companion
+        if not (cc.learn_repeaters and cc.manual_add_contacts) or info.manual_add_contacts & 1:
+            return
+        link.request(companion.set_manual_add_contacts(True), [companion.RESP_OK])
+        log.info("set the companion to manual-add mode (companion.manual_add_contacts)")
 
     def _ensure_radio(self, link: CompanionLink, info: SelfInfo) -> None:
         radio = self._cfg.radio
@@ -235,6 +271,58 @@ class CompanionSession:
             log.warning("overwriting channel slot %d (was %r)", cc.channel_index, current.name)
         link.request(companion.set_channel(cc.channel_index, cc.channel_name, key), [companion.RESP_OK])
         log.info("provisioned channel %d %r", cc.channel_index, cc.channel_name)
+
+    # --- repeater adverts ------------------------------------------------------------------------------------------
+
+    def _sync_contacts(self, link: CompanionLink) -> None:
+        """Read the companion's contact list once per connection. Best effort: it never stops reports."""
+        try:
+            frames = link.request_until(companion.get_contacts(), companion.RESP_END_OF_CONTACTS)
+        except CommandError as e:
+            log.warning("could not read the companion's contacts: %s", e)
+            return
+        for frame in frames:
+            if frame[0] == companion.RESP_CONTACT:
+                self._note_contact(frame, live=False)
+        repeaters = sum(1 for c in self._contacts.values() if c.adv_type == companion.ADV_TYPE_REPEATER)
+        log.info("companion knows %d nodes, %d of them repeaters", len(self._contacts), repeaters)
+
+    def _note_contact(self, frame: bytes, live: bool) -> None:
+        try:
+            contact = companion.parse_contact(frame)
+        except companion.ProtocolError as e:
+            self.stats["bad_contact"] += 1
+            log.debug("ignoring a contact frame: %s", e)
+            return
+        self._contacts[contact.public_key] = contact
+        if contact.adv_type == companion.ADV_TYPE_REPEATER:
+            self._handler.on_repeater_advert(
+                HeardRepeater(
+                    contact.public_key, contact.name, contact.lat, contact.lon, contact.advert_timestamp,
+                    time.time() if live else None,
+                )
+            )
+
+    def _process_adverts(self, link: CompanionLink) -> None:
+        while self._advert_pushes:
+            frame = self._advert_pushes.popleft()
+            if frame[0] == companion.PUSH_NEW_ADVERT:
+                self._note_contact(frame, live=True)
+                continue
+            try:
+                key = companion.parse_bare_advert(frame)
+            except companion.ProtocolError:
+                self.stats["bad_contact"] += 1
+                continue
+            known = self._contacts.get(key)
+            if known is not None and known.adv_type != companion.ADV_TYPE_REPEATER:
+                continue  # a node we are not interested in
+            try:  # a stored contact advertised again: the push has no position, so read the contact for the new one
+                reply = link.request(companion.get_contact_by_key(key), [companion.RESP_CONTACT])
+            except CommandError:
+                self._contacts[key] = companion.Contact(key, 0, "", 0, None, None)  # remember not to ask again
+                continue
+            self._note_contact(reply, live=True)
 
     # --- draining -------------------------------------------------------------------------------------------------
 

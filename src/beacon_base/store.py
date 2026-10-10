@@ -58,10 +58,22 @@ MIGRATIONS: list[tuple[str, ...]] = [
             prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),
             pubkey BLOB UNIQUE CHECK (pubkey IS NULL OR length(pubkey) = 32),
             name TEXT,                        -- operator-assigned, optional, not unique
-            lat REAL NOT NULL,
-            lon REAL NOT NULL,
+            lat REAL NOT NULL DEFAULT 0,      -- 0, 0 means unlocated: the repeater is excluded from positioning
+            lon REAL NOT NULL DEFAULT 0,
+            location_source TEXT NOT NULL DEFAULT 'none',   -- none, advert or manual: whoever wrote it last
+            location_updated_at REAL,
             enabled INTEGER NOT NULL DEFAULT 1,
             window_s REAL                     -- the repeater's beacon.window, if known, for 'beaconctl check'
+        )""",
+        """CREATE TABLE repeater_adverts (
+            prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),  -- heard before or after the repeater is trusted
+            pubkey BLOB NOT NULL CHECK (length(pubkey) = 32),
+            name TEXT,
+            lat REAL NOT NULL,                -- only adverts with a valid position are kept
+            lon REAL NOT NULL,
+            advert_timestamp INTEGER,
+            first_seen REAL NOT NULL,
+            last_heard REAL NOT NULL
         )""",
         """CREATE TABLE raw_frames (
             id INTEGER PRIMARY KEY,
@@ -127,6 +139,18 @@ MIGRATIONS: list[tuple[str, ...]] = [
 
 class StoreError(Exception):
     """An operator error: unknown name, duplicate, collision, bad value."""
+
+
+@dataclass
+class AdvertEffect:
+    """What taking a repeater advert changed. position and name are set when they are new or different."""
+
+    prefix: bytes
+    trusted: bool  # the repeater is in the table
+    position: tuple[float, float] | None = None
+    name: str | None = None
+    old_name: str | None = None
+    old_position: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -354,26 +378,147 @@ class Store:
     # --- repeaters -------------------------------------------------------------------------------------------------
 
     def add_repeater(
-        self, key_hex: str, lat: float, lon: float, name: str | None = None, window_s: float | None = None
+        self,
+        key_hex: str,
+        lat: float | None = None,
+        lon: float | None = None,
+        name: str | None = None,
+        window_s: float | None = None,
+        now: float | None = None,
     ) -> sqlite3.Row:
+        """Trust a repeater. Without a position it takes the one from the repeater's advert if one was heard, else it is
+        added unlocated at 0, 0. Without a name it takes the advertised one."""
         raw = parse_hex_key(key_hex, "repeater public key or prefix", (wire.ID_LEN, PUBKEY_LEN))
-        if name is not None:
-            name = names_mod.clean_name(name, 64)
-        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        if (lat is None) != (lon is None):
+            raise StoreError("give both latitude and longitude, or neither")
+        if lat is not None and (not -90 <= lat <= 90 or not -180 <= lon <= 180):
             raise StoreError("latitude must be within +/-90 and longitude within +/-180")
         if window_s is not None and window_s <= 0:
             raise StoreError("window must be positive")
         prefix = raw[: wire.ID_LEN]
-        pubkey = raw if len(raw) == PUBKEY_LEN else None
         with self.transaction() as db:
-            clash = db.execute("SELECT name FROM repeaters WHERE prefix = ?", (prefix,)).fetchone()
-            if clash is not None:
-                raise StoreError(f"repeater {names_mod.label(clash['name'], prefix)} is already in the repeater table")
-            db.execute(
-                "INSERT INTO repeaters (prefix, pubkey, name, lat, lon, window_s) VALUES (?, ?, ?, ?, ?, ?)",
-                (prefix, pubkey, name, lat, lon, window_s),
-            )
+            self._insert_repeater(db, prefix, raw if len(raw) == PUBKEY_LEN else None, lat, lon, name, window_s, now)
         return self.repeater(prefix.hex())
+
+    def _insert_repeater(self, db, prefix, pubkey, lat, lon, name, window_s, now) -> None:
+        stamp = time.time() if now is None else now
+        if db.execute("SELECT 1 FROM repeaters WHERE prefix = ?", (prefix,)).fetchone() is not None:
+            existing = db.execute("SELECT name FROM repeaters WHERE prefix = ?", (prefix,)).fetchone()
+            raise StoreError(f"repeater {names_mod.label(existing['name'], prefix)} is already in the repeater table")
+        heard = db.execute("SELECT * FROM repeater_adverts WHERE prefix = ?", (prefix,)).fetchone()
+        source = "none"
+        if lat is not None:
+            source = "manual" if (lat, lon) != (0.0, 0.0) else "none"
+        elif heard is not None:
+            lat, lon, source = heard["lat"], heard["lon"], "advert"
+        else:
+            lat = lon = 0.0
+        if name is not None:
+            name = names_mod.clean_name(name, 64)
+        elif heard is not None:
+            name = names_mod.clean_name(heard["name"] or "", names_mod.MAX_NAME_BYTES)
+        if pubkey is None and heard is not None:
+            pubkey = bytes(heard["pubkey"])
+        db.execute(
+            """INSERT INTO repeaters (prefix, pubkey, name, lat, lon, location_source, location_updated_at, window_s)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (prefix, pubkey, name, lat, lon, source, stamp if source != "none" else None, window_s),
+        )
+
+    def add_heard_repeaters(self, since: float, now: float | None = None) -> list[sqlite3.Row]:
+        """Trust every repeater that has sent reports since `since` but is not in the table, each with the position and name
+        from its advert when one was heard (else unlocated at 0, 0), in one transaction."""
+        with self.transaction() as db:
+            heard = db.execute(
+                """SELECT DISTINCT repeater_prefix FROM observations
+                   WHERE status = ? AND rx_time >= ? AND repeater_prefix NOT IN (SELECT prefix FROM repeaters)
+                   ORDER BY repeater_prefix""",
+                (UNKNOWN_REPEATER, since),
+            ).fetchall()
+            for row in heard:
+                self._insert_repeater(db, bytes(row["repeater_prefix"]), None, None, None, None, None, now)
+            return [self.repeater(bytes(r["repeater_prefix"]).hex()) for r in heard]
+
+    def locate_repeater(self, ref: str, lat: float, lon: float, now: float | None = None) -> sqlite3.Row:
+        """Set a repeater's position by hand (testing, before it has advertised, or when it cannot be set on the repeater).
+        The latest write wins, so the next advert with a position replaces it."""
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise StoreError("latitude must be within +/-90 and longitude within +/-180")
+        with self.transaction() as db:
+            r = self.repeater(ref)
+            db.execute(
+                "UPDATE repeaters SET lat = ?, lon = ?, location_source = ?, location_updated_at = ? WHERE prefix = ?",
+                (lat, lon, "manual" if (lat, lon) != (0.0, 0.0) else "none", time.time() if now is None else now, r["prefix"]),
+            )
+        return self.repeater(bytes(r["prefix"]).hex())
+
+    @staticmethod
+    def is_located(lat: float | None, lon: float | None) -> bool:
+        """A valid position that is not the 0, 0 an unset one advertises."""
+        return (
+            lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180 and (lat, lon) != (0.0, 0.0)
+        )
+
+    def located_repeaters(self) -> list[sqlite3.Row]:
+        """Enabled repeaters with a position: the ones location estimation may use. Unlocated ones (0, 0) are left out."""
+        return [r for r in self.repeaters() if r["enabled"] and self.is_located(r["lat"], r["lon"])]
+
+    def record_repeater_advert(
+        self,
+        pubkey: bytes,
+        name: str | None,
+        lat: float | None,
+        lon: float | None,
+        advert_timestamp: int | None,
+        heard_at: float | None,
+        now: float | None = None,
+    ) -> "AdvertEffect | None":
+        """Take a repeater's advert. Adverts with a valid position are kept whether or not the repeater is trusted yet;
+        for a trusted repeater the position and name also replace what the table has (the latest write wins) and an
+        advert without a position still updates its name. Returns what changed, or None if nothing was kept."""
+        if len(pubkey) != PUBKEY_LEN:
+            raise StoreError("advert public key must be 32 bytes")
+        prefix = pubkey[: wire.ID_LEN]
+        stamp = time.time() if now is None else now
+        located = self.is_located(lat, lon)
+        clean = names_mod.clean_name(name, names_mod.MAX_NAME_BYTES) if name else None
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM repeaters WHERE prefix = ?", (prefix,)).fetchone()
+            if not located and row is None:
+                return None
+            if located:
+                db.execute(
+                    """INSERT INTO repeater_adverts (prefix, pubkey, name, lat, lon, advert_timestamp, first_seen, last_heard)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (prefix) DO UPDATE SET pubkey = excluded.pubkey, name = COALESCE(excluded.name, name),
+                         lat = excluded.lat, lon = excluded.lon,
+                         advert_timestamp = COALESCE(excluded.advert_timestamp, advert_timestamp),
+                         last_heard = excluded.last_heard""",
+                    (prefix, pubkey, clean, lat, lon, advert_timestamp, stamp, heard_at if heard_at is not None else stamp),
+                )
+            effect = AdvertEffect(prefix, trusted=row is not None)
+            if row is not None:
+                effect.old_name, effect.old_position = row["name"], (row["lat"], row["lon"])
+                updates, args = ["pubkey = ?"], [pubkey]
+                if clean is not None and clean != row["name"]:
+                    updates.append("name = ?")
+                    args.append(clean)
+                    effect.name = clean
+                if located and (lat, lon) != (row["lat"], row["lon"]):
+                    updates += ["lat = ?", "lon = ?", "location_source = 'advert'", "location_updated_at = ?"]
+                    args += [lat, lon, stamp]
+                    effect.position = (lat, lon)
+                elif located and row["location_source"] != "advert":
+                    updates += ["location_source = 'advert'", "location_updated_at = ?"]  # same place, now owned by the advert
+                    args.append(stamp)
+                db.execute(f"UPDATE repeaters SET {', '.join(updates)} WHERE prefix = ?", (*args, prefix))
+            else:
+                effect.position = (lat, lon)
+                effect.name = clean
+        return effect
+
+    def repeater_advert(self, prefix: bytes) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM repeater_adverts WHERE prefix = ?", (bytes(prefix),)).fetchone()
 
     def repeater(self, ref: str) -> sqlite3.Row:
         """The repeater a command-line reference names: the start of its key prefix (at least six hex digits) or its name,
@@ -463,9 +608,10 @@ class Store:
     def unknown_repeaters(self, since: float) -> list[sqlite3.Row]:
         """Repeater prefixes reporting known beacons but not in the repeater table."""
         return self.conn.execute(
-            """SELECT repeater_prefix, count(*) AS n, max(rx_time) AS last_seen
-               FROM observations WHERE status = ? AND rx_time >= ? AND repeater_prefix NOT IN (SELECT prefix FROM repeaters)
-               GROUP BY repeater_prefix ORDER BY last_seen DESC""",
+            """SELECT o.repeater_prefix, count(*) AS n, max(o.rx_time) AS last_seen, a.name AS name, a.lat AS lat, a.lon AS lon
+               FROM observations o LEFT JOIN repeater_adverts a ON a.prefix = o.repeater_prefix
+               WHERE o.status = ? AND o.rx_time >= ? AND o.repeater_prefix NOT IN (SELECT prefix FROM repeaters)
+               GROUP BY o.repeater_prefix ORDER BY last_seen DESC""",
             (UNKNOWN_REPEATER, since),
         ).fetchall()
 

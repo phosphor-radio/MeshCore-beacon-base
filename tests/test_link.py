@@ -139,3 +139,19 @@ def test_serial_transport_turns_termios_errors_into_link_errors(monkeypatch):
     with pytest.raises(LinkError):
         t.write(b"x")
     t.close()  # closing a dead port must not raise
+
+
+def test_request_until_collects_a_stream_and_routes_pushes():
+    pushes = []
+    t = ScriptedTransport([frame(b"\x02\x01\x00\x00\x00") + frame(b"\x83") + frame(b"\x03a") + frame(b"\x03b") + frame(b"\x04\x00\x00\x00\x00")])
+    link = CompanionLink(t)
+    link.on_push = pushes.append
+    assert link.request_until(b"\x04", 4) == [b"\x02\x01\x00\x00\x00", b"\x03a", b"\x03b"]
+    assert pushes == [b"\x83"]
+
+
+def test_request_until_error_and_stall():
+    with pytest.raises(CommandError):
+        CompanionLink(ScriptedTransport([frame(b"\x01\x04")])).request_until(b"\x04", 4)
+    with pytest.raises(LinkError):
+        CompanionLink(ScriptedTransport([frame(b"\x02\x01\x00\x00\x00")]), command_timeout=0.3).request_until(b"\x04", 4)

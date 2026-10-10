@@ -191,3 +191,31 @@ def test_the_simulator_announces_names_in_packets_that_fit(cfg_file):
                 seen[e.beacon_id] = e.name.decode()
         assert seen == {bid: sim.beacon_name(i) for i, bid in enumerate(sim.beacon_ids)}
         assert any(v.startswith("beacon-") for v in seen.values()) and any(v.startswith("sim-beacon-") for v in seen.values())
+
+
+def test_the_simulator_advertises_repeaters_with_and_without_a_position():
+    with FakeCompanion() as fake:
+        fake.manual_add = True
+        fake.send_push_on_enqueue = False
+        sim = Simulator(fake, beacons=1, repeaters=3, seed=2)
+        assert sim.advertise_repeaters() == 3
+        assert sim.repeater_position(2) is None and sim.repeater_position(0) == (40.01, -74.99)
+        assert sim.repeater_name(1) == "sim-repeater-2"
+
+
+def test_listen_prints_repeater_adverts(capsys):
+    import threading
+
+    from beacon_base.cli import PrintHandler
+    from beacon_base.ingest import HeardRepeater
+
+    for as_json in (False, True):
+        h = PrintHandler(threading.Event(), as_json=as_json)
+        h.on_repeater_advert(HeardRepeater(bytes(range(32)), "North Ridge", 40.5, -75.25, 1, 100.0))
+        h.on_repeater_advert(HeardRepeater(bytes(range(40, 72)), "Unplaced", 0.0, 0.0, 1, None))
+    lines = capsys.readouterr().out.splitlines()
+    assert "advert repeater=0001020304050607 name='North Ridge' position=40.500000,-75.250000" in lines[0]
+    assert "contact repeater=2829" in lines[1] and "name='Unplaced' position=no-location" in lines[1]
+    recs = [json.loads(l) for l in lines[2:]]
+    assert (recs[0]["type"], recs[0]["lat"], recs[0]["live"]) == ("repeater_advert", 40.5, True)
+    assert recs[1]["lat"] is None and recs[1]["lon"] is None and recs[1]["live"] is False  # 0, 0 is reported as no position

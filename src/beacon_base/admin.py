@@ -208,27 +208,68 @@ def _repeater_label(r) -> str:
     return names.label(r["name"], r["prefix"])
 
 
+def _position_text(r) -> str:
+    return f"{r['lat']:.6f}, {r['lon']:.6f}" if Store.is_located(r["lat"], r["lon"]) else "no location"
+
+
 def cmd_repeater_add(args: argparse.Namespace, cfg: Config) -> int:
+    if args.all:
+        if args.key or args.lat is not None or args.lon is not None or args.name:
+            raise StoreError("--all adds every repeater that reported but is not in the table; do not give a key, position or name")
+        with _open(cfg) as store:
+            added = store.add_heard_repeaters(time.time() - args.hours * 3600)
+        if not added:
+            print(f"nothing to add: no repeaters that reported in the last {args.hours:g}h are missing from the table")
+            return 0
+        for r in added:
+            print(f"added repeater {_repeater_label(r)} ({_position_text(r)})")
+        print(f"added {len(added)} repeater(s)")
+        _warn_unlocated(added)
+        return 0
+    if not args.key:
+        raise StoreError("usage: repeater add <key-or-prefix> [<lat> <lon>]   or   repeater add --all")
     with _open(cfg) as store:
         r = store.add_repeater(args.key, args.lat, args.lon, name=args.name, window_s=args.window)
-    print(f"added repeater {_repeater_label(r)} (prefix {bytes(r['prefix']).hex()}) at {r['lat']:.6f}, {r['lon']:.6f}")
+    print(f"added repeater {_repeater_label(r)} (prefix {bytes(r['prefix']).hex()}), {_position_text(r)}")
+    _warn_unlocated([r])
+    return 0
+
+
+def _warn_unlocated(rows) -> None:
+    unlocated = [r for r in rows if not Store.is_located(r["lat"], r["lon"])]
+    if unlocated:
+        print(
+            f"{len(unlocated)} of them have no location yet and are left out of positioning until one is advertised "
+            "(set it on the repeater and send an advert) or given with 'beaconctl repeater locate'"
+        )
+
+
+def cmd_repeater_locate(args: argparse.Namespace, cfg: Config) -> int:
+    with _open(cfg) as store:
+        r = store.locate_repeater(args.ref, args.lat, args.lon)
+    print(f"repeater {_repeater_label(r)} is at {_position_text(r)}; the next advert with a position replaces it")
     return 0
 
 
 def cmd_repeater_list(args: argparse.Namespace, cfg: Config) -> int:
+    now = time.time()
     with _open(cfg) as store:
-        rows = [
-            [
-                r["name"] or "-",
-                bytes(r["prefix"]).hex(),
-                f"{r['lat']:.6f}",
-                f"{r['lon']:.6f}",
-                "-" if r["window_s"] is None else f"{r['window_s']:g}s",
-                "yes" if r["enabled"] else "no",
-            ]
-            for r in store.repeaters()
-        ]
-    print(table(rows, ["NAME", "PREFIX", "LAT", "LON", "WINDOW", "ENABLED"]) if rows else "no repeaters")
+        rows = []
+        for r in store.repeaters():
+            located = Store.is_located(r["lat"], r["lon"])
+            rows.append(
+                [
+                    r["name"] or "-",
+                    bytes(r["prefix"]).hex(),
+                    f"{r['lat']:.6f}" if located else "-",
+                    f"{r['lon']:.6f}" if located else "-",
+                    r["location_source"] if located else "-",
+                    fmt_age(r["location_updated_at"], now) if located else "-",
+                    "-" if r["window_s"] is None else f"{r['window_s']:g}s",
+                    "yes" if r["enabled"] else "no",
+                ]
+            )
+    print(table(rows, ["NAME", "PREFIX", "LAT", "LON", "SOURCE", "UPDATED", "WINDOW", "ENABLED"]) if rows else "no repeaters")
     return 0
 
 
@@ -309,7 +350,11 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         print(f"\nrepeaters heard but not in the repeater table, their reports are ignored (last {args.hours:g}h):")
         for u in unknown_r:
             prefix = bytes(u["repeater_prefix"]).hex()
-            print(f"  {prefix}  {u['n']} observations, last {fmt_age(u['last_seen'], now)}   add: beaconctl repeater add {prefix} <lat> <lon>")
+            where = f"at {u['lat']:.6f}, {u['lon']:.6f}" if u["lat"] is not None else "no location advertised"
+            print(
+                f"  {prefix}  {repr(u['name']) if u['name'] else '(no name advertised)'}  {where}  {u['n']} observations, "
+                f"last {fmt_age(u['last_seen'], now)}   add: beaconctl repeater add {prefix}"
+            )
     return 0
 
 
@@ -425,6 +470,11 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
         problems.append("no repeaters in the repeater table")
     for r in repeaters:
         w = r["window_s"]
+        if not Store.is_located(r["lat"], r["lon"]):
+            problems.append(
+                f"repeater {_repeater_label(r)}: no location, so it is left out of positioning; set it on the repeater and send "
+                "an advert ('advert' in its CLI), or use 'beaconctl repeater locate'"
+            )
         if w is None:
             problems.append(f"repeater {_repeater_label(r)}: beacon.window not recorded; set it with 'beaconctl repeater window'")
         elif w >= shortest:

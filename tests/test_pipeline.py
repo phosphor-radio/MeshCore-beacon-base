@@ -365,3 +365,28 @@ def test_a_name_never_changes_a_beacons_counters(env):
     p.process_names(names_rx(A, (BEACON_PREFIX, "Roof")))
     b = beacon(store)
     assert (b["hwm"], b["rejects_since_accept"], b["epoch"], b["enabled"]) == (100, 0, 0, 1)
+
+
+def test_repeaters_are_checked_before_beacons(env):
+    store, p = env
+    rogue = bytes(range(0x30, 0x50))
+    stranger = bytes(range(0xE0, 0xE8))
+    # unknown repeater, unknown beacon: the repeater is what is wrong, and no beacon gets listed through it
+    assert statuses(p.process(rx(rogue, obs(1, beacon=stranger)))) == [("unknown_repeater", "")]
+    assert store.unknown_beacons(0) == [] and len(store.unknown_repeaters(0)) == 1
+    # known repeater, unknown beacon
+    assert statuses(p.process(rx(A, obs(1, beacon=stranger), t=1100.0))) == [("unknown_beacon", "")]
+    # disabled repeater and disabled beacon: the repeater is reported
+    store.set_repeater_enabled("ra", False)
+    store.set_beacon_enabled(B1, False)
+    assert statuses(p.process(rx(A, obs(1), t=1200.0))) == [("disabled", "repeater")]
+
+
+def test_repeaters_can_be_onboarded_before_any_beacon_is_on_the_allowlist(tmp_path):
+    with Store.open(tmp_path / "t.db") as store:
+        p = Pipeline(store, boot="b")
+        p.process(rx(A, obs(1), t=1000.0))
+        assert [bytes(r["repeater_prefix"]) for r in store.unknown_repeaters(0)] == [A[:8]]
+        store.add_heard_repeaters(since=0)
+        p.process(rx(A, obs(2), t=1300.0))
+        assert [bytes(r["beacon_prefix"]) for r in store.unknown_beacons(0)] == [BEACON_PREFIX]

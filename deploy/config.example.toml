@@ -16,6 +16,12 @@ channel_name = "beacon-reports"
 # Apply [radio] to the companion on connect. When false, a mismatch is only logged as a warning.
 manage_radio = false
 
+# Take each repeater's position and name from the adverts the companion hears (repeaters advertise them; nothing is typed in).
+learn_repeaters = true
+# Run the base companion in manual-add mode, so it stores no contacts and every advert reaches the base in full with its
+# position. This is saved in the companion; set false to leave the companion's own setting alone.
+manual_add_contacts = true
+
 # Safety-net queue drain, in seconds, in case a "messages waiting" notification is missed.
 poll_interval = 30
 command_timeout = 5

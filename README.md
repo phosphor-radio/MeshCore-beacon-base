@@ -3,7 +3,7 @@
 Base station software for the MeshCore beacon tracking system. It collects beacon sightings reported by fixed repeaters,
 rejects replayed or unknown beacons, and (later) estimates and maps where each beacon is.
 
-> **Status: phase B2 plus beacon names.** `beacon-ingest` decodes reports and beacon name announcements from a companion,
+> **Status: phase B2 plus beacon names and repeater positions.** `beacon-ingest` decodes reports and beacon name announcements from a companion,
 > applies the allowlist, high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and
 > repeaters by key prefix and shows a lockout and its one-step fix. B1 and the beacon names (repeater
 > firmware `28bb4985` in the firmware repository) are verified on hardware; B2 is tested against a fake companion.
@@ -80,11 +80,11 @@ mkdir -p ~/.config/beacon-base
 cp deploy/config.example.toml ~/.config/beacon-base/config.toml    # then set companion.port
 beaconctl channel generate                   # new 16-byte report channel key, saved to secrets.toml (mode 0600)
                                              # paste the printed key into each repeater: beacon.channel <hex>
-beaconctl status                             # lists beacons the repeaters report that are not on the allowlist yet
-beaconctl beacon add <prefix>                # add one by the 16-character key prefix status shows (or: beacon add --all)
-beaconctl repeater add <key-or-prefix> 40.1234 -75.5678 --name north-ridge --window 20
-beaconctl check                              # sanity-check the setup
 beacon-ingest                                # own the companion port and store reports (systemd service later)
+beaconctl status                             # lists repeaters that report but are not trusted yet, then the same for beacons
+beaconctl repeater add --all                 # trust them; position and name come from their adverts (or: repeater add <prefix>)
+beaconctl beacon add --all                   # then the beacons they report (or: beacon add <prefix>)
+beaconctl check                              # sanity-check the setup
 beaconctl status                             # one line per beacon, rejected and silent first
 ```
 
@@ -98,14 +98,33 @@ beaconctl status                             # one line per beacon, rejected and
 | `beacon add --all [--hours H]` | Add every beacon the repeaters have reported (default last 24 h) that is not on the allowlist. It adds whatever the repeaters report, so check `status` first if other people's beacons may be in range. |
 | `beacon list` / `beacon status <prefix>` | The allowlist, and one beacon in detail. |
 | `beacon enable\|disable\|remove\|reset <prefix>` or `--all` / `-a` | One beacon, or every beacon on the allowlist. `remove` keeps history; `reset` clears the high-water mark so the next report becomes the new baseline (do it while the beacon is transmitting). |
-| `repeater add <key-or-prefix> <lat> <lon> [--name N] [--window S]` / `list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table. The name is optional display text. Commands take the repeater's key prefix (six or more hex digits) or its name. Reports and name announcements from repeaters not in the table are ignored. |
+| `repeater add <key-or-prefix> [<lat> <lon>] [--name N] [--window S]` | Trust a repeater. Without `<lat> <lon>` its position comes from its advert; if none was heard it is added unlocated at 0, 0. The advertised name replaces `--name`. |
+| `repeater add --all [--hours H]` | Trust every repeater that has sent reports (default last 24 h) but is not in the table. Repeaters that were only heard advertising are never added. |
+| `repeater locate <prefix-or-name> <lat> <lon>` | Set a position by hand (testing, before the repeater has advertised, or when it can't be set on the repeater). The next advert with a position replaces it. |
+| `repeater list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table, which also shows where each position came from. Commands take the key prefix (six or more hex digits) or the name. Reports and name announcements from repeaters not in the table are ignored. |
 | `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), plus beacons and repeaters heard but not on the lists. |
 | `rejects [--beacon X] [--limit N]` | Recent observations that were not accepted, with the reason. |
 | `time` / `time set "YYYY-MM-DD HH:MM:SS"` / `time confirm` | Show or fix the clock state. The Pi has no internet, so its clock is set by hand; times stay provisional until then. |
-| `check` | Warn about missing setup and repeater report windows that are too long for the beacon interval. |
+| `check` | Fails on missing setup, repeaters with no location and repeater report windows that are too long for the beacon interval. |
 | `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports and name announcements without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
 | `ingest [--port P]` | Same as `beacon-ingest`. |
 | `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
+
+### Repeater positions and names
+
+Repeaters get their position from the Android app, over the mesh, and then advertise it. The base companion hears those
+adverts and `beacon-ingest` records them: the position, the name and the repeater's full public key. It works before or
+after the repeater is trusted. The latest advert wins, and an advert without a position (a repeater nobody has located
+advertises 0, 0) never erases a known one. A repeater with no position is `unlocated`: its reports are accepted as usual, it
+is flagged in `repeater list` and fails `beaconctl check`, and the position estimator will leave it out.
+
+- The base companion runs in manual-add mode so it stores no contacts and every advert reaches the base in full
+  (`companion.manual_add_contacts`, on by default; it is saved in the companion).
+- Repeaters send a flood advert every 47 hours by default. After setting a position, run `advert` in the repeater's CLI or
+  the base waits for the next one. The advert has to reach the base companion (within 8 hops and in radio range); otherwise
+  use `repeater locate`.
+- Repeaters are onboarded **before** beacons: reports from a repeater that is not trusted are stored but change nothing, and
+  beacons and their names are only taken from trusted repeaters.
 
 ### Beacons, prefixes and names
 

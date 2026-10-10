@@ -28,6 +28,7 @@ class Collector(Handler):
         self.reports = []
         self.drops = []
         self.raw_drops = []
+        self.adverts = []
         self.names = []
         self.connects = 0
         self.synced = 0
@@ -41,6 +42,9 @@ class Collector(Handler):
 
     def on_connected(self, info):
         self._note(lambda: setattr(self, "connects", self.connects + 1))
+
+    def on_repeater_advert(self, advert):
+        self._note(lambda: self.adverts.append(advert))
 
     def on_names(self, rx):
         self._note(lambda: self.names.append(rx))
@@ -283,3 +287,103 @@ def test_a_malformed_name_announcement_is_dropped_with_its_raw_frame(fake):
     assert [r for r, _ in run.handler.drops] == ["bad_names", "bad_names"]
     assert len(run.handler.raw_drops) == 2 and run.handler.names == []
     assert run.session.stats["dropped_bad_names"] == 2
+
+
+# --- repeater adverts: where a repeater's position and name come from -----------------------------------------------------
+
+REPEATER_TYPE = companion.ADV_TYPE_REPEATER
+RKEY = bytes(range(1, 33))
+
+
+def test_the_contact_list_is_read_on_connect_and_only_repeaters_are_passed_on(fake):
+    fake.contacts[RKEY] = (REPEATER_TYPE, "North Ridge", 77, 40.5, -75.25)
+    fake.contacts[bytes(range(50, 82))] = (companion.ADV_TYPE_SENSOR, "beacon", 1, 0.0, 0.0)
+    fake.contacts[bytes(range(90, 122))] = (companion.ADV_TYPE_CHAT, "someone", 1, 1.0, 1.0)
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+    (a,) = run.handler.adverts
+    assert (a.public_key, a.name, a.lat, a.lon, a.advert_timestamp) == (RKEY, "North Ridge", 40.5, -75.25, 77)
+    assert a.heard_at is None  # from the contact list, not heard live
+
+
+def test_a_new_advert_push_carries_the_position(fake):
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.advert(RKEY, "North Ridge", lat=40.5, lon=-75.25, counter=5)
+        run.handler.wait(lambda: len(run.handler.adverts) == 1)
+    a = run.handler.adverts[0]
+    assert (a.public_key, a.name, a.lat, a.lon, a.advert_timestamp) == (RKEY, "North Ridge", 40.5, -75.25, 5)
+    assert a.heard_at is not None
+
+
+def test_the_base_companion_is_put_in_manual_add_mode_so_every_advert_arrives_in_full(fake):
+    assert not fake.manual_add
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        assert fake.manual_add
+        fake.advert(RKEY, "North Ridge", lat=40.5, lon=-75.25, counter=1)
+        fake.advert(RKEY, "North Ridge", lat=41.5, lon=-76.25, counter=2)  # moved: still a full advert, nothing was stored
+        run.handler.wait(lambda: len(run.handler.adverts) == 2)
+    assert [(a.lat, a.lon) for a in run.handler.adverts] == [(40.5, -75.25), (41.5, -76.25)]
+    assert fake.contacts == {}  # the companion stored nothing
+    assert [c for c in fake.commands if c[0] == companion.CMD_SET_OTHER_PARAMS] == [bytes([companion.CMD_SET_OTHER_PARAMS, 1])]
+
+
+def test_manual_add_mode_is_only_written_when_it_differs(fake):
+    fake.manual_add = True
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+    assert not [c for c in fake.commands if c[0] == companion.CMD_SET_OTHER_PARAMS]
+
+
+def test_manual_add_mode_can_be_opted_out_of(fake):
+    with Running(make_config(fake, manual_add_contacts=False)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        assert not fake.manual_add
+        fake.advert(RKEY, "North Ridge", lat=40.5, lon=-75.25, counter=1)  # now stored, as the firmware default
+        fake.advert(RKEY, "North Ridge", lat=42.0, lon=-77.0, counter=2)  # known: a bare push, the position is read back
+        run.handler.wait(lambda: len(run.handler.adverts) == 2)
+        assert any(c[0] == companion.CMD_GET_CONTACT_BY_KEY for c in fake.commands)
+    assert [(a.lat, a.lon) for a in run.handler.adverts] == [(40.5, -75.25), (42.0, -77.0)]
+
+
+def test_a_bare_advert_for_a_contact_missing_from_the_list_is_looked_up_by_key(fake):
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.contacts[RKEY] = (REPEATER_TYPE, "Late", 9, 12.0, 34.0)
+        fake.write_frame(bytes([companion.PUSH_ADVERT]) + RKEY)
+        run.handler.wait(lambda: len(run.handler.adverts) == 1)
+    assert (run.handler.adverts[0].name, run.handler.adverts[0].lat) == ("Late", 12.0)
+
+
+def test_other_kinds_of_node_are_looked_up_once_and_not_passed_on(fake):
+    chat = bytes(range(7, 39))
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.contacts[chat] = (companion.ADV_TYPE_CHAT, "someone", 1, 1.0, 1.0)
+        for _ in range(3):
+            fake.write_frame(bytes([companion.PUSH_ADVERT]) + chat)
+        fake.write_frame(bytes([companion.PUSH_MSG_WAITING]))
+        time.sleep(0.5)
+    assert len([c for c in fake.commands if c[0] == companion.CMD_GET_CONTACT_BY_KEY]) == 1
+    assert run.handler.adverts == []
+
+
+def test_learning_repeaters_can_be_switched_off(fake):
+    fake.contacts[RKEY] = (REPEATER_TYPE, "North Ridge", 1, 40.0, -75.0)
+    with Running(make_config(fake, learn_repeaters=False)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.advert(bytes(range(60, 92)), "other", lat=1.0, lon=1.0)
+        time.sleep(0.3)
+    assert run.handler.adverts == []
+    assert not fake.manual_add  # and the companion's mode is left alone
+    assert not [c for c in fake.commands if c[0] in (companion.CMD_GET_CONTACTS, companion.CMD_SET_OTHER_PARAMS)]
+
+
+def test_a_failing_contact_list_does_not_stop_reports(fake):
+    fake.contacts_error = 4  # iterator busy
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.enqueue_report(report(obs(0xA1, 1)))
+        run.handler.wait(lambda: len(run.handler.reports) == 1)
+        assert run.error is None and run.handler.connects == 1

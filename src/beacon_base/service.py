@@ -11,7 +11,7 @@ from collections import Counter
 
 from . import clock, names
 from .config import Config, ConfigError, load_config
-from .ingest import CompanionSession, ConnectionInfo, Handler, RawFrame, ReceivedNames, ReceivedReport
+from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, RawFrame, ReceivedNames, ReceivedReport
 from .link import CompanionError
 from .pipeline import Pipeline
 from .runtime import setup_logging, stop_on_signals
@@ -61,6 +61,24 @@ class PipelineHandler(Handler):
             " (late)" if rx.late else "",
             ", ".join(f"{n} {status}" for status, n in sorted(summary.items())) or "no entries",
         )
+
+    def on_repeater_advert(self, advert: HeardRepeater) -> None:
+        effect = self._store.record_repeater_advert(
+            advert.public_key, advert.name, advert.lat, advert.lon, advert.advert_timestamp, advert.heard_at
+        )
+        if effect is None:
+            log.debug("ignored an advert from repeater %s, which has no position", names.prefix_label(advert.public_key))
+            return
+        who = names.label(advert.name, advert.public_key[:8])
+        if effect.position is not None:
+            old = effect.old_position
+            if effect.trusted and old not in (None, (0.0, 0.0)):
+                log.info("repeater %s moved to %.6f, %.6f (was %.6f, %.6f)", who, *effect.position, *old)
+            else:
+                log.info("repeater %s is at %.6f, %.6f%s", who, *effect.position, "" if effect.trusted else " (not in the repeater table)")
+            self.counts["repeater_positions"] += 1
+        if effect.trusted and effect.name is not None and effect.old_name != effect.name:
+            log.info("repeater %s is named %r", names.prefix_label(advert.public_key), effect.name)
 
     def on_names(self, rx: ReceivedNames) -> None:
         changes = self._pipeline.process_names(rx)

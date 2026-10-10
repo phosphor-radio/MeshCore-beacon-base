@@ -271,3 +271,87 @@ def test_onboarding_a_beacon_from_the_reports_alone(env, tmp_path, capsys):
     assert "not on the allowlist" not in out
     row = [l for l in out.splitlines() if new_prefix.hex() in l][0]
     assert row.split()[:3] == ["ok", "Roof", new_prefix.hex()]
+
+
+# --- repeater adverts -------------------------------------------------------------------------------------------------------
+
+
+def adverts_in(store):
+    return {bytes(r["prefix"]): r for r in store.conn.execute("SELECT * FROM repeater_adverts")}
+
+
+def test_a_trusted_repeaters_advert_updates_its_position_and_name_last_write_wins(env):
+    fake, store, handler, _ = env
+    wait_for(lambda: fake.manual_add)
+    fake.advert(REPEATER_A_KEY, "North Ridge", lat=40.5, lon=-75.25, counter=1)
+    wait_for(lambda: store.repeater(REPEATER_A_KEY[:8].hex())["lat"] == 40.5)
+    r = store.repeater(REPEATER_A_KEY[:8].hex())
+    assert (r["lat"], r["lon"], r["name"], r["location_source"]) == (40.5, -75.25, "North Ridge", "advert")
+    assert bytes(r["pubkey"]) == REPEATER_A_KEY
+    fake.advert(REPEATER_A_KEY, "Ridge 2", lat=41.0, lon=-76.0, counter=2)  # corrected at the repeater
+    wait_for(lambda: store.repeater(REPEATER_A_KEY[:8].hex())["lat"] == 41.0)
+    assert store.repeater(REPEATER_A_KEY[:8].hex())["name"] == "Ridge 2"
+    assert handler.counts["repeater_positions"] == 2
+
+
+def test_an_advert_heard_before_the_repeater_is_trusted_is_used_when_it_is_added(env):
+    fake, store, handler, _ = env
+    wait_for(lambda: fake.manual_add)
+    new_key = bytes(range(0x30, 0x50))
+    fake.advert(new_key, "Hilltop", lat=39.0, lon=-74.0, counter=1)
+    wait_for(lambda: new_key[:8] in adverts_in(store))
+    assert store.repeaters() and all(bytes(r["prefix"]) != new_key[:8] for r in store.repeaters())  # heard, not trusted
+    r = store.add_repeater(new_key[:8].hex())
+    assert (r["lat"], r["lon"], r["name"], r["location_source"]) == (39.0, -74.0, "Hilltop", "advert")
+
+
+def test_an_advert_without_a_position_from_an_untrusted_repeater_is_not_kept(env):
+    fake, store, handler, _ = env
+    wait_for(lambda: fake.manual_add)
+    fake.advert(bytes(range(0x30, 0x50)), "Nowhere", lat=0.0, lon=0.0)
+    fake.advert(REPEATER_B_KEY, "Named at last", lat=0.0, lon=0.0)  # trusted: its name is still taken
+    wait_for(lambda: store.repeater(REPEATER_B_KEY[:8].hex())["name"] == "Named at last")
+    assert adverts_in(store) == {}
+    assert store.repeater(REPEATER_B_KEY[:8].hex())["lat"] == 1  # the position it had is not erased
+
+
+def test_onboarding_a_repeater_from_its_reports_and_its_advert(env, tmp_path, capsys):
+    from beacon_base.cli import main
+
+    fake, store, handler, _ = env
+    wait_for(lambda: fake.manual_add)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[database]\npath = "t.db"\n[clock]\nassume_synced = true\n')
+    new_key = bytes(range(0x30, 0x50))
+    fake.enqueue_report(wire.encode_report(new_key, [wire.Observation(BEACON_PREFIX, 1, -90, -8, 3900)]))
+    fake.advert(new_key, "Hilltop", lat=39.0, lon=-74.0, counter=1)
+    wait_for(lambda: count(store) == 1 and new_key[:8] in adverts_in(store))
+
+    assert main(["-c", str(cfg), "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"{new_key[:8].hex()}  'Hilltop'  at 39.000000, -74.000000" in out and f"repeater add {new_key[:8].hex()}" in out
+
+    assert main(["-c", str(cfg), "repeater", "add", "--all"]) == 0
+    assert "Hilltop" in capsys.readouterr().out
+    r = store.repeater(new_key[:8].hex())
+    assert (r["lat"], r["lon"]) == (39.0, -74.0)
+    assert main(["-c", str(cfg), "status"]) == 0
+    assert "not in the repeater table" not in capsys.readouterr().out
+    fake.enqueue_report(wire.encode_report(new_key, [wire.Observation(BEACON_PREFIX, 2, -90, -8, 3900)]))
+    wait_for(lambda: count(store) == 2)
+    assert store.beacon(B1)["hwm"] == 2
+
+
+def test_repeater_adverts_in_the_contact_list_are_applied_at_connect(tmp_path):
+    with FakeCompanion() as fake, Store.open(tmp_path / "t.db") as store:
+        fake.contacts[REPEATER_A_KEY] = (2, "Listed", 5, 38.0, -73.0)
+        store.add_repeater(REPEATER_A_KEY[:8].hex())
+        cfg = Config(companion=CompanionConfig(port=fake.path, command_timeout=2.0), radio=RadioConfig(), channel_key=KEY)
+        handler = PipelineHandler(store, Pipeline(store, assume_synced=True))
+        session = CompanionSession(cfg, handler)
+        stop = threading.Event()
+        t = threading.Thread(target=session.run, args=(stop,), daemon=True)
+        t.start()
+        wait_for(lambda: store.repeater(REPEATER_A_KEY[:8].hex())["lat"] == 38.0)
+        stop.set()
+        t.join(timeout=5)
