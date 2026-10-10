@@ -141,3 +141,53 @@ def test_listen_json(cfg_file, capsys):
     assert rec["beacon"] == "0001020304050607" and rec["counter"] == 42
     assert (rec["rssi"], rec["snr"], rec["batt_mv"]) == (-101, -2.25, 3777)
     assert rec["hops"] == "direct" and rec["late"] is True
+
+
+def test_listen_prints_name_announcements(cfg_file, capsys):
+    main(["-c", cfg_file, "channel", "generate"])
+    capsys.readouterr()
+    with FakeCompanion() as fake:
+        fake.send_push_on_enqueue = False
+        key = bytes(range(32))
+        fake.enqueue_report(
+            wire.encode_names(key, [wire.NameEntry(bytes(range(8)), b"Roof"), wire.NameEntry(bytes(range(8, 16)), b"\x07")]),
+            data_type=wire.NAMES_DATA_TYPE,
+        )
+        fake.enqueue_report(wire.encode_report(key, [wire.Observation(bytes(range(8)), 1, -90, -8, 3800)]))
+        assert main(["-c", cfg_file, "listen", "--port", fake.path, "--count", "1"]) == 0
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(lines) == 2  # the empty-after-cleaning name is not printed
+    assert "beacon=0001020304050607 name='Roof'" in lines[0] and "repeater=0001020304050607" in lines[0]
+    assert "ctr=1" in lines[1]
+
+
+def test_listen_json_includes_names(cfg_file, capsys):
+    main(["-c", cfg_file, "channel", "generate"])
+    capsys.readouterr()
+    with FakeCompanion() as fake:
+        fake.send_push_on_enqueue = False
+        key = bytes(range(32))
+        fake.enqueue_report(wire.encode_names(key, [wire.NameEntry(bytes(range(8)), b"Roof")]), data_type=wire.NAMES_DATA_TYPE)
+        fake.enqueue_report(wire.encode_report(key, [wire.Observation(bytes(range(8)), 1, -90, -8, 3800)]))
+        assert main(["-c", cfg_file, "listen", "--port", fake.path, "--count", "1", "--json"]) == 0
+    recs = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
+    assert recs[0]["type"] == "name" and recs[0]["name"] == "Roof" and recs[0]["beacon"] == "0001020304050607"
+    assert "type" not in recs[1] and recs[1]["counter"] == 1
+
+
+def test_the_simulator_announces_names_in_packets_that_fit(cfg_file):
+    with FakeCompanion() as fake:
+        fake.send_push_on_enqueue = False
+        sim = Simulator(fake, beacons=20, repeaters=2, seed=3)
+        n = sim.announce_names()
+        assert n == len(fake.queue) and n >= 4  # 20 beacons need several packets per repeater
+        seen = {}
+        from beacon_base import companion
+
+        for frame in fake.queue:
+            data = companion.parse_channel_data(frame)
+            assert data.data_type == wire.NAMES_DATA_TYPE and len(data.payload) <= wire.MAX_GROUP_DATA_LENGTH
+            for e in wire.decode_names(data.payload).entries:
+                seen[e.beacon_id] = e.name.decode()
+        assert seen == {bid: sim.beacon_name(i) for i, bid in enumerate(sim.beacon_ids)}
+        assert any(v.startswith("beacon-") for v in seen.values()) and any(v.startswith("sim-beacon-") for v in seen.values())

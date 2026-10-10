@@ -56,6 +56,19 @@ class ReceivedReport:
     payload: bytes  # the undecoded report, kept for the audit trail
 
 
+@dataclass(frozen=True)
+class ReceivedNames:
+    """A name announcement: what a repeater says its heard beacons call themselves."""
+
+    announcement: wire.NameAnnouncement
+    companion_snr_x4: int
+    path_len: int
+    rx_wall: float
+    rx_mono: float
+    late: bool
+    payload: bytes
+
+
 class Handler:
     """Receives session events. Override what you need; every method may be left alone."""
 
@@ -66,9 +79,12 @@ class Handler:
 
     def on_report(self, rx: ReceivedReport) -> None: ...
 
+    def on_names(self, rx: ReceivedNames) -> None:
+        """A repeater announced the names of beacons it hears."""
+
     def on_drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:
         """A frame that is not a usable beacon report. reason is one of CompanionSession.DROP_REASONS. raw is set for
-        ``bad_report``, a frame on the report channel that failed to decode."""
+        ``bad_report`` or ``bad_names``, a frame on the report channel that failed to decode."""
 
     def on_disconnected(self, error: str | None) -> None: ...
 
@@ -87,7 +103,7 @@ def _describe_radio(freq_khz: int, bw_hz: int, sf: int, cr: int) -> str:
 
 
 class CompanionSession:
-    DROP_REASONS = ("other_message", "other_channel", "other_data_type", "bad_frame", "bad_report")
+    DROP_REASONS = ("other_message", "other_channel", "other_data_type", "bad_frame", "bad_report", "bad_names")
 
     def __init__(
         self,
@@ -245,10 +261,13 @@ class CompanionSession:
         if data.channel_index != self._cfg.companion.channel_index:
             self._drop("other_channel", f"channel {data.channel_index}")
             return
-        if data.data_type != wire.REPORT_DATA_TYPE:
+        if data.data_type not in (wire.REPORT_DATA_TYPE, wire.NAMES_DATA_TYPE):
             self._drop("other_data_type", f"data_type {data.data_type:#06x}")
             return
         rx_wall, rx_mono = time.time(), time.monotonic()
+        if data.data_type == wire.NAMES_DATA_TYPE:
+            self._handle_names(data, rx_wall, rx_mono)
+            return
         try:
             report = wire.decode_report(data.payload)
         except wire.WireError as e:
@@ -266,6 +285,18 @@ class CompanionSession:
                 late=self._first_drain,
                 payload=data.payload,
             )
+        )
+
+    def _handle_names(self, data: companion.ChannelData, rx_wall: float, rx_mono: float) -> None:
+        try:
+            announcement = wire.decode_names(data.payload)
+        except wire.WireError as e:
+            raw = RawFrame(data.payload, data.snr_x4, data.path_len, rx_wall, rx_mono, self._first_drain)
+            self._drop("bad_names", f"{e}: {data.payload.hex()}", raw)
+            return
+        self.stats["name_messages"] += 1
+        self._handler.on_names(
+            ReceivedNames(announcement, data.snr_x4, data.path_len, rx_wall, rx_mono, self._first_drain, data.payload)
         )
 
     def _drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:

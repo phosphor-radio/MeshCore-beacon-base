@@ -28,6 +28,7 @@ class Collector(Handler):
         self.reports = []
         self.drops = []
         self.raw_drops = []
+        self.names = []
         self.connects = 0
         self.synced = 0
         self.disconnects = []
@@ -40,6 +41,9 @@ class Collector(Handler):
 
     def on_connected(self, info):
         self._note(lambda: setattr(self, "connects", self.connects + 1))
+
+    def on_names(self, rx):
+        self._note(lambda: self.names.append(rx))
 
     def on_synced(self):
         self._note(lambda: setattr(self, "synced", self.synced + 1))
@@ -254,3 +258,28 @@ def test_radio_frequency_off_by_one_khz_counts_as_matching(fake):
     with Running(make_config(fake, manage_radio=True)) as run:
         run.handler.wait(lambda: run.handler.connects == 1)
     assert not [c for c in fake.commands if c[0] == companion.CMD_SET_RADIO_PARAMS]
+
+
+def test_name_announcements_are_decoded_and_routed_separately_from_reports(fake):
+    entries = [wire.NameEntry(bytes([1] * 8), b"beacon-010101"), wire.NameEntry(bytes([2] * 8), "Caf\u00e9".encode())]
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+        fake.enqueue_report(wire.encode_names(REPEATER, entries), data_type=wire.NAMES_DATA_TYPE, snr_x4=12, path_len=3)
+        fake.enqueue_report(report(obs(0xA1, 1)))
+        run.handler.wait(lambda: len(run.handler.names) == 1 and len(run.handler.reports) == 1)
+    n = run.handler.names[0]
+    assert n.announcement.repeater_id == REPEATER[:8]
+    assert [(e.beacon_id, e.name) for e in n.announcement.entries] == [(bytes([1] * 8), b"beacon-010101"), (bytes([2] * 8), "Caf\u00e9".encode())]
+    assert (n.companion_snr_x4, n.path_len) == (12, 3) and n.rx_wall > 1.6e9 and n.payload
+    assert run.session.stats["name_messages"] == 1 and run.session.stats["reports"] == 1
+
+
+def test_a_malformed_name_announcement_is_dropped_with_its_raw_frame(fake):
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+        fake.enqueue_report(b"\x05" + bytes(12), data_type=wire.NAMES_DATA_TYPE)
+        fake.enqueue_report(wire.encode_names(REPEATER, [wire.NameEntry(bytes(8), b"ok")])[:-1], data_type=wire.NAMES_DATA_TYPE)  # truncated
+        run.handler.wait(lambda: len(run.handler.drops) == 2)
+    assert [r for r, _ in run.handler.drops] == ["bad_names", "bad_names"]
+    assert len(run.handler.raw_drops) == 2 and run.handler.names == []
+    assert run.session.stats["dropped_bad_names"] == 2

@@ -9,8 +9,9 @@ repeaters hear them and publish batched reports on a private `GRP_DATA` channel;
 reports through a MeshCore **companion node over USB**, enforces replay protection, stores everything, and serves a map.
 Scale is about 30 beacons and 10 repeaters.
 
-**Status: B1 is done and verified on hardware. B2 (store and pipeline) is code complete and tested without hardware;
-running it against real beacons and repeaters is outstanding. B3 onwards is not started.** The plans are the source of truth:
+**Status: B1 is done and verified on hardware. B2 (store and pipeline) and the beacon names work (plan
+`docs/plan/beacon-names.md`, N1 and N2) are code complete and tested without hardware; running them against real beacons
+and repeaters is outstanding (N3). B3 onwards is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -59,7 +60,8 @@ Package layout (`+` marks planned modules that do not exist yet):
 ```
 pyproject.toml, README.md, CLAUDE.md
 docs/              plan/, wire-format.md      (+ operations.md)
-src/beacon_base/   wire.py       report decoder/encoder, mirrors the firmware format
+src/beacon_base/   wire.py       report and name-announcement decoders/encoders, mirror the firmware formats
+                   names.py      cleaning untrusted names (sanitize_name), how names are shown (label)
                    companion.py  companion protocol: command builders, response parsers (pure, no I/O)
                    link.py       serial framing, FrameDecoder resync, CompanionLink request/response
                    ingest.py     CompanionSession: reconnect loop, channel provisioning, queue drain; Handler hooks
@@ -88,6 +90,11 @@ change nothing; an unknown repeater can never move a high-water mark; a counter 
 `late` if that transmission was already seen (not a lockout, not counted in `rejects_since_accept`) or `below_hwm`
 (counts, and makes the beacon `rejected`); reset clears the mark and bumps `epoch`, and dedupe/grouping are per epoch.
 Beacons are identified by the 8-byte prefix only (no full beacon key is stored; the reports are the source of truth).
+Commands take a beacon as that prefix, or the first 6+ hex digits of it (`Store.beacon(ref)`); repeaters as a prefix or a
+name (`Store.repeater(ref)`). **Names never identify anything**: beacon names are display text announced by repeaters
+(`wire` type 0xFFBF, handled by `Pipeline.process_names`, only from known enabled repeaters, cleaned by
+`names.sanitize_name`, latest wins, stored in `beacon_names` keyed by prefix whether or not the beacon is allowlisted) and
+repeater names are optional operator text. Neither is unique. In messages use `names.label(name, prefix)`.
 Once a database is deployed, schema changes must be a new numbered migration in `store.MIGRATIONS`; before the first
 deployment migration 1 may still be edited, and the development database deleted.
 
@@ -140,9 +147,10 @@ The firmware repo builds with PlatformIO, not from here. Environments the base c
 
 ## Wire format and test fixtures
 
-The firmware repo owns the report format; `wire.py` here mirrors it. Phase B0 (done, firmware commit `55fe473a`) added the
-golden-vector test there, and `tests/fixtures/beacon_report_v1.json` is its output; `tests/fixtures/README.md` records the
-commit and how to regenerate. `tests/test_wire.py` consumes it. Never hand-edit the fixture; regenerate it from the
+The firmware repo owns the report and name-announcement formats; `wire.py` here mirrors them. Phase B0 (firmware commit
+`55fe473a`) added the golden-vector test for reports and the names work (`28bb4985`) the one for names; the fixtures
+`tests/fixtures/beacon_report_v1.json` and `beacon_names_v1.json` are their output, and `tests/fixtures/README.md` records
+the commits and how to regenerate. `tests/test_wire.py` consumes both. Never hand-edit the fixture; regenerate it from the
 firmware repo when the format changes. `docs/wire-format.md` documents the format on this side.
 
 ## Working conventions

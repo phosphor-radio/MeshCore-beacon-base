@@ -3,10 +3,12 @@
 Base station software for the MeshCore beacon tracking system. It collects beacon sightings reported by fixed repeaters,
 rejects replayed or unknown beacons, and (later) estimates and maps where each beacon is.
 
-> **Status: phase B2 (store and pipeline).** `beacon-ingest` decodes reports from a companion, applies the allowlist,
-> high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and repeaters and shows a
-> lockout and its one-step fix. B1 is verified on hardware; B2 is tested against a fake companion only. No web UI yet (B4)
-> and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md).
+> **Status: phase B2 plus beacon names.** `beacon-ingest` decodes reports and beacon name announcements from a companion,
+> applies the allowlist, high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and
+> repeaters by key prefix and shows a lockout and its one-step fix. B1 is verified on hardware; B2 and the names are tested
+> against a fake companion only (the repeater firmware that sends names is in the firmware repository, commit `28bb4985`).
+> No web UI yet (B4) and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> [docs/plan/beacon-names.md](docs/plan/beacon-names.md).
 
 ## How the system works
 
@@ -79,8 +81,8 @@ cp deploy/config.example.toml ~/.config/beacon-base/config.toml    # then set co
 beaconctl channel generate                   # new 16-byte report channel key, saved to secrets.toml (mode 0600)
                                              # paste the printed key into each repeater: beacon.channel <hex>
 beaconctl status                             # lists beacons the repeaters report that are not on the allowlist yet
-beaconctl beacon add beacon-001 <prefix>     # add one by the 16-character key prefix status shows
-beaconctl repeater add north-ridge <key-or-prefix> 40.1234 -75.5678 --window 20
+beaconctl beacon add <prefix>                # add one by the 16-character key prefix status shows (or: beacon add --all)
+beaconctl repeater add <key-or-prefix> 40.1234 -75.5678 --name north-ridge --window 20
 beaconctl check                              # sanity-check the setup
 beacon-ingest                                # own the companion port and store reports (systemd service later)
 beaconctl status                             # one line per beacon, rejected and silent first
@@ -92,27 +94,35 @@ beaconctl status                             # one line per beacon, rejected and
 | Command | What it does |
 |---|---|
 | `channel generate [--force]` / `channel set <hex\|-> [--force]` / `channel show` | Create, store or print the report channel key. Replacing an existing key needs `--force`, since every repeater would need updating. |
-| `beacon add <name> <prefix>` | Allowlist a beacon by the 8-byte key prefix its reports carry (16 hex characters, shown by `status`). A full 64-character key, for example from the beacon's serial `pubkey` command, is accepted and reduced to its prefix. A prefix or name that is already used is refused. |
-| `beacon add --all [--hours H] [--name-prefix P]` | Add every beacon the repeaters have reported (default last 24 h) that is not on the allowlist, named `<prefix>-<first 6 hex digits>` (`beacon-f5b165`). It adds whatever the repeaters report, so check `status` first if other people's beacons may be in range. |
-| `beacon list` / `status <name>` | The allowlist. |
-| `beacon enable\|disable\|remove\|reset <name>` or `--all` / `-a` | One beacon, or every beacon on the allowlist. `remove` keeps history; `reset` re-baselines. |
-| `beacon reset <name>` | Clear the high-water mark; the next report becomes the new baseline. Do it while the beacon is transmitting. |
-| `repeater add <name> <key> <lat> <lon> [--window S]` / `list` / `remove` / `enable` / `disable` / `window <name> <S>` | The repeater table. Reports from repeaters not in it are stored but ignored. |
+| `beacon add <prefix>` | Allowlist a beacon by the 8-byte key prefix its reports carry (16 hex characters, shown by `status`). A full 64-character key, for example from the beacon's serial `pubkey` command, is accepted and reduced to its prefix. A prefix already on the list is refused. |
+| `beacon add --all [--hours H]` | Add every beacon the repeaters have reported (default last 24 h) that is not on the allowlist. It adds whatever the repeaters report, so check `status` first if other people's beacons may be in range. |
+| `beacon list` / `beacon status <prefix>` | The allowlist, and one beacon in detail. |
+| `beacon enable\|disable\|remove\|reset <prefix>` or `--all` / `-a` | One beacon, or every beacon on the allowlist. `remove` keeps history; `reset` clears the high-water mark so the next report becomes the new baseline (do it while the beacon is transmitting). |
+| `repeater add <key-or-prefix> <lat> <lon> [--name N] [--window S]` / `list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table. The name is optional display text. Commands take the repeater's key prefix (six or more hex digits) or its name. Reports and name announcements from repeaters not in the table are ignored. |
 | `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), plus beacons and repeaters heard but not on the lists. |
 | `rejects [--beacon X] [--limit N]` | Recent observations that were not accepted, with the reason. |
 | `time` / `time set "YYYY-MM-DD HH:MM:SS"` / `time confirm` | Show or fix the clock state. The Pi has no internet, so its clock is set by hand; times stay provisional until then. |
 | `check` | Warn about missing setup and repeater report windows that are too long for the beacon interval. |
-| `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
+| `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports and name announcements without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
 | `ingest [--port P]` | Same as `beacon-ingest`. |
 | `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
 
-### Adding beacons
+### Beacons, prefixes and names
 
-Repeater reports identify a beacon by an 8-byte prefix of its public key, and that prefix is all the base keeps or needs:
-the allowlist, high-water mark and dedupe all work on it. So the onboarding workflow is: configure the beacons, let them
-transmit, run `beaconctl status`, and add each one it lists under "heard but not on the allowlist" with
-`beaconctl beacon add <name> <prefix>`, or add them all at once with `beaconctl beacon add --all`. To pre-register a beacon before it transmits, use the prefix (or the full key) from
-its serial `pubkey` command.
+Everything about a beacon is keyed by the first 8 bytes of its public key, the **prefix**: reports carry nothing more, and
+the allowlist, high-water mark and dedupe all work on it. Commands take the prefix exactly as `beaconctl status` prints it,
+so copy and paste works, or the first six or more hex digits of it when that is unambiguous.
+
+A beacon's **name** is display text only. It is set on the beacon (`set name <name>` on its serial CLI; with no name set a
+beacon uses `beacon-` plus the first three bytes of its key, `beacon-f5b165`), travels in the beacon's signed advert, and
+is announced to the base by every repeater that hears it (on first sight, when it changes, and every few hours). The base
+stores the latest announcement per prefix, including for beacons not on the allowlist yet, cleans it (control characters
+and escape sequences are removed) and shows it. Names are not unique and never used to find a beacon. A beacon whose name
+has not been announced yet is shown by its prefix.
+
+Onboarding: configure the beacons, let them transmit, run `beaconctl status`, and add each one it lists under "heard but
+not on the allowlist" with `beaconctl beacon add <prefix>`, or all at once with `beaconctl beacon add --all`. To pre-register
+a beacon before it transmits, use the prefix (or the full key) from its serial `pubkey` command.
 
 ### When a beacon is locked out
 
@@ -122,10 +132,10 @@ repeaters that sent them and the fix:
 
 ```
 STATE     NAME        PREFIX            HWM      HEARD   BATT   DETAIL
-rejected  beacon-001  a0a1a2a3a4a5a6a7  1000000  12s ago 3.98V  3 replays rejected since 14:00:03 (counters 300-302, hwm 1000000) via north-ridge; fix: beaconctl beacon reset beacon-001
+rejected  Roof  a0a1a2a3a4a5a6a7  1000000  12s ago 3.98V  3 replays rejected since 14:00:03 (counters 300-302, hwm 1000000) via north-ridge; fix: beaconctl beacon reset a0a1a2a3a4a5a6a7
 ```
 
-`beaconctl beacon reset beacon-001` clears it in one step. A report that arrives after a newer one from the same beacon was
+`beaconctl beacon reset a0a1a2a3a4a5a6a7` clears it in one step. A report that arrives after a newer one from the same beacon was
 accepted (a repeater with a long `beacon.window`) is rejected as `late` but is not a lockout; keep every repeater's
 window below the beacon interval (`beaconctl check` warns).
 

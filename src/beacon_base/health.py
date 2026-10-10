@@ -100,5 +100,5 @@ def assess(store: Store, cfg: BeaconConfig, now: float) -> list[BeaconHealth]:
                 baseline_pending=b["hwm"] is None,
             )
         )
-    out.sort(key=lambda h: (_ORDER[h.state], h.beacon["name"]))
+    out.sort(key=lambda h: (_ORDER[h.state], h.beacon["name"] is None, (h.beacon["name"] or "").lower(), bytes(h.beacon["prefix"])))
     return out

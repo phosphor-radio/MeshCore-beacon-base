@@ -6,7 +6,8 @@ in [beacon-project.md](beacon-project.md), and sets up the architecture for the 
 
 Status: B0 done (firmware commit `55fe473a`). B1 done and verified on hardware (`beaconctl listen` against the XIAO S3 WIO
 companion). B2 is code complete and tested without hardware (fake companion); a run against real beacons and repeaters is
-outstanding. B3 onwards not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
+outstanding. The beacon names work ([beacon-names.md](beacon-names.md): firmware commit `28bb4985`, base N1 and N2) is also
+code complete and tested without hardware. B3 onwards not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
 made while implementing B2 are marked "(B2)".
 
 ## Decisions
@@ -110,12 +111,15 @@ Names are indicative; migrations are numbered from the start so schema changes a
 (any report of the beacon, accepted or not, for the `silent` state), `observations.epoch`, and `repeaters.window_s` (the
 repeater's `beacon.window`, for `beaconctl check`). The database file defaults to `beacon.db` next to the config.
 
-- `beacons`: `prefix` (the 8-byte key prefix, primary key), `name`, `enabled`, `hwm` (highest
+- `beacons`: `prefix` (the 8-byte key prefix, primary key), `enabled`, `hwm` (highest
   accepted counter, NULL means "next report becomes the baseline"), `hwm_at`, `notes`. **This table is the allowlist.**
-  Adding a beacon whose prefix or name is already used is refused. No full beacon key is stored (decision 8). Also denormalised for fast display:
-  `last_accept_at`, `last_reject_at`, `last_reject_counter`, `rejects_since_accept`.
-- `repeaters`: `prefix` (8 bytes, primary key), `pubkey` (optional), `name`, `lat`, `lon`, `enabled`. Authoritative
-  repeater locations. Optionally importable from the companion's contact list (`CMD_GET_CONTACTS` returns lat/lon for
+  Adding a prefix that is already on it is refused. No full beacon key and no name is stored (decision 8). Also
+  denormalised for fast display: `last_accept_at`, `last_reject_at`, `last_reject_counter`, `rejects_since_accept`.
+- `beacon_names`: `prefix` (primary key), `name`, `first_seen`, `updated_at`, `repeater_prefix`. The name repeaters last
+  announced for a prefix ([beacon-names.md](beacon-names.md)), display only, for any prefix whether or not it is allowlisted.
+  Beacon rows read through a join, so `beacon["name"]` is the announced name or NULL.
+- `repeaters`: `prefix` (8 bytes, primary key), `pubkey` (optional), `name` (optional, not unique), `lat`, `lon`,
+  `enabled`. Authoritative repeater locations. Optionally importable from the companion's contact list (`CMD_GET_CONTACTS` returns lat/lon for
   repeaters that advertise), but the table wins.
 - `raw_frames`: every beacon-report frame as received (`rx_time`, companion SNR, path length, payload, `late`). Audit
   trail and replay source for debugging; pruned by age.
@@ -186,7 +190,7 @@ mistake). What the operator needs is to see it immediately and fix it in one ste
   - `unconfigured`: reports seen from a beacon prefix that is not on the allowlist (listed separately, one line per
     prefix, with an "add" shortcut).
 - **CLI.** `beaconctl status` prints one line per beacon with the state, sorted so `rejected` and `silent` come first.
-  `beaconctl rejects [--beacon X]` lists recent rejected observations with reasons. `beaconctl beacon reset <name>` is
+  `beaconctl rejects [--beacon X]` lists recent rejected observations with reasons. `beaconctl beacon reset <prefix>` is
   the one-step fix; it prints the counters involved so the operator can sanity check it.
 - **Web.** A banner whenever any beacon is `rejected`, listing them with a **Reset** button each (token protected),
   and the same states on the map markers (red for rejected, grey for silent).
@@ -222,11 +226,13 @@ Beacons have no clock and reports carry no time (decision 7 of the main plan), s
 - `beaconctl channel generate` creates a random 16-byte key, stores it in `secrets.toml` next to the base config (mode
   0600, never in git; kept separate so the hand-edited config can be shared) and prints the hex to paste into each
   repeater's `beacon.channel`. It refuses to replace an existing key without `--force`. `beaconctl channel show` prints it again.
-- `beaconctl beacon add <name> <prefix>`; the 16-character prefix is listed by `beaconctl status` once a repeater has reported
+- `beaconctl beacon add <prefix>`; the 16-character prefix is listed by `beaconctl status` once a repeater has reported
   the beacon, or comes from the beacon's serial `pubkey` command (a full key is accepted and reduced to its prefix).
   Onboarding is: configure the beacons, let them transmit, then add them from the unlisted list in `status`.
-- `beaconctl repeater add <name> <pubkey-or-prefix> <lat> <lon>`; the key comes from the repeater's CLI.
-- `beaconctl beacon reset <name>`, `... list`, `... status` (last heard, counter, battery, which repeaters hear it).
+- `beaconctl repeater add <pubkey-or-prefix> <lat> <lon> [--name N] [--window S]`; the key comes from the repeater's CLI. The
+  name is optional display text.
+- `beaconctl beacon reset <prefix>`, `... list`, `... status <prefix>` (last heard, counter, battery, which repeaters hear
+  it). A beacon is addressed by its prefix or the first six or more hex digits of it; names are never used to find one.
 - `beaconctl time` shows and sets the clock state (see "Time"), `beaconctl status` and `beaconctl rejects` as above.
 - `beaconctl listen` prints decoded reports live for bring-up (this is the "see it working" tool for the current
   hardware problem).

@@ -23,8 +23,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Protocol
 
-from . import clock, store, wire
-from .ingest import ReceivedReport
+from . import clock, names, store, wire
+from .ingest import ReceivedNames, ReceivedReport
 from .store import ACCEPTED, DISABLED, DUPLICATE, REPLAY, UNKNOWN_BEACON, UNKNOWN_REPEATER, Store
 
 log = logging.getLogger(__name__)
@@ -37,6 +37,19 @@ class RawFrameLike(Protocol):
     rx_wall: float
     rx_mono: float
     late: bool
+
+
+@dataclass(frozen=True)
+class NameChange:
+    """A stored beacon name: old is None the first time the name is learned."""
+
+    beacon_prefix: bytes
+    old: str | None
+    new: str
+
+    @property
+    def changed(self) -> bool:
+        return self.old != self.new
 
 
 @dataclass(frozen=True)
@@ -70,10 +83,28 @@ class Pipeline:
             raw_id = self._insert_raw(db, rx, "ok", "")
             return [self._observe(db, rx, raw_id, trusted, rx.report.repeater_id, o) for o in rx.report.observations]
 
-    def record_bad_report(self, rx: RawFrameLike, detail: str) -> None:
+    def record_bad_report(self, rx: RawFrameLike, detail: str, outcome: str = "bad_report") -> None:
         """Keep the audit trail for a frame that is on the report channel but does not decode."""
         with self._store.transaction() as db:
-            self._insert_raw(db, rx, "bad_report", detail)
+            self._insert_raw(db, rx, outcome, detail)
+
+    def process_names(self, rx: ReceivedNames) -> list[NameChange]:
+        """Store the names a repeater announced. Only repeaters in the table (and enabled) are believed, so a stranger cannot
+        fill the table; a name that cleans down to nothing is skipped. The latest announcement wins."""
+        repeater = self._store.conn.execute(
+            "SELECT enabled FROM repeaters WHERE prefix = ?", (rx.announcement.repeater_id,)
+        ).fetchone()
+        if repeater is None or not repeater["enabled"]:
+            return []
+        changes = []
+        with self._store.transaction():
+            for entry in rx.announcement.entries:
+                name = names.sanitize_name(entry.name)
+                if name is None:
+                    continue
+                old = self._store.record_name(entry.beacon_id, name, rx.announcement.repeater_id, rx.rx_wall)
+                changes.append(NameChange(entry.beacon_id, old, name))
+        return changes
 
     # --- internals --------------------------------------------------------------------------------------------------
 
@@ -89,7 +120,7 @@ class Pipeline:
         self, db: sqlite3.Connection, rx: RawFrameLike, raw_id: int, trusted: bool, repeater_prefix: bytes, o: wire.Observation
     ) -> Verdict:
         now = rx.rx_wall
-        beacon = db.execute("SELECT * FROM beacons WHERE prefix = ?", (o.beacon_id,)).fetchone()
+        beacon = db.execute(Store._BEACON_SELECT + " WHERE b.prefix = ?", (o.beacon_id,)).fetchone()
         repeater = db.execute("SELECT * FROM repeaters WHERE prefix = ?", (repeater_prefix,)).fetchone()
         epoch = beacon["epoch"] if beacon is not None else 0
 

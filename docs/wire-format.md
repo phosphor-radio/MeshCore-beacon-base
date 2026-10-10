@@ -47,6 +47,29 @@ Followed by `count` entries of 16 bytes:
 
 A full packet is 9 entries, 154 of the 165 data bytes a `GRP_DATA` packet can carry.
 
+## Name announcements (`data_type` 0xFFBF)
+
+A repeater tells the base what the beacons it hears call themselves. It is a separate message on the same channel, so the
+report format above is unchanged. Sent on first sight of a beacon since the repeater booted, when the name changes, and
+every `beacon.name_refresh` hours (default 4). Golden vectors: [`tests/fixtures/beacon_names_v1.json`](../tests/fixtures/README.md),
+decoder: `wire.decode_names`.
+
+Header, 10 bytes (as for reports): version `1`, repeater key prefix (8), entry count (1). Then `count` variable-length entries:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | beacon public key prefix |
+| 8 | 1 | name length |
+| 9 | name length | name, UTF-8, no NUL |
+
+- Same drop rules as reports: an unknown version, a short header, a count above 17 or an entry running past the end drops the
+  whole message and is logged. Trailing bytes are ignored and zero-length names are skipped.
+- A beacon's name is at most 18 bytes, so an entry is at most 27 bytes and a message holds 5 of them (7 with the 13-byte
+  default names, `beacon-` plus the first three key bytes in hex).
+- Names are untrusted display text. The base cleans them (`names.sanitize_name`: invalid UTF-8 replaced, control, format
+  and separator characters turned into spaces, whitespace collapsed, at most 32 bytes) and ignores announcements from
+  repeaters that are not in its repeater table.
+
 ## Decoder rules
 
 - An unknown version, a header shorter than 10 bytes, a count above 9, or fewer bytes than the count needs is an error:

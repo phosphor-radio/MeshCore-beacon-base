@@ -19,7 +19,28 @@ class Simulator:
         self._batt = [self._rng.randrange(3500, 4150) for _ in self.beacon_ids]
 
     def beacon_name(self, index: int) -> str:
+        """Alternate the two kinds of name a real beacon has: the default derived from its key, and an explicit one."""
+        if index % 2 == 0:
+            return f"beacon-{self.beacon_ids[index].hex()[:6]}"
         return f"sim-beacon-{index + 1}"
+
+    def announce_names(self) -> int:
+        """Every repeater announces the names of all the beacons, as repeaters do on first sight and on their refresh.
+        Returns the number of messages queued."""
+        queued = 0
+        for key in self.repeater_keys:
+            entries = [wire.NameEntry(bid, self.beacon_name(i).encode()) for i, bid in enumerate(self.beacon_ids)]
+            while entries:
+                chunk: list[wire.NameEntry] = []
+                size = wire.NAMES_HEADER_LEN
+                while entries and size + wire.NAMES_ENTRY_OVERHEAD + len(entries[0].name) <= wire.MAX_GROUP_DATA_LENGTH:
+                    size += wire.NAMES_ENTRY_OVERHEAD + len(entries[0].name)
+                    chunk.append(entries.pop(0))
+                self._fake.enqueue_report(
+                    wire.encode_names(key, chunk), channel_index=self._channel_index, data_type=wire.NAMES_DATA_TYPE
+                )
+                queued += 1
+        return queued
 
     def tick(self) -> int:
         """Every beacon sends once; each repeater reports the beacons it heard. Returns the number of reports queued."""

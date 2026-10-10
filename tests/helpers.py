@@ -19,3 +19,6 @@ def obs(counter, beacon=BEACON_PREFIX, rssi=-90, snr_x4=-8, batt=3800):
 def rx(repeater_key, *observations, t=1000.0, mono=100.0, late=False, snr_x4=20):
     payload = wire.encode_report(repeater_key, list(observations))
     return ReceivedReport(wire.decode_report(payload), snr_x4, 1, t, mono, late, payload)
+
+B1 = BEACON_PREFIX.hex()    # how the CLI and store address beacons: by key prefix
+B2 = BEACON2_PREFIX.hex()

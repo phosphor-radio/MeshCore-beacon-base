@@ -9,9 +9,9 @@ import sys
 import threading
 from collections import Counter
 
-from . import clock
+from . import clock, names
 from .config import Config, ConfigError, load_config
-from .ingest import CompanionSession, ConnectionInfo, Handler, RawFrame, ReceivedReport
+from .ingest import CompanionSession, ConnectionInfo, Handler, RawFrame, ReceivedNames, ReceivedReport
 from .link import CompanionError
 from .pipeline import Pipeline
 from .runtime import setup_logging, stop_on_signals
@@ -41,12 +41,12 @@ class PipelineHandler(Handler):
     def on_report(self, rx: ReceivedReport) -> None:
         self._check_clock_step(rx)
         verdicts = self._pipeline.process(rx)
-        beacons, repeaters = self._store.names()
+        _, repeaters = self._store.names()
         summary: Counter[str] = Counter()
         for v in verdicts:
             summary[v.status] += 1
             self.counts[v.status] += 1
-            who = f"{v.beacon_name or v.beacon_prefix.hex()} counter {v.counter} via {v.repeater_name or v.repeater_prefix.hex()}"
+            who = f"{names.label(v.beacon_name, v.beacon_prefix)} counter {v.counter} via {names.label(v.repeater_name, v.repeater_prefix)}"
             if v.status == "accepted":
                 log.debug("accepted %s", who)
             elif v.status == "duplicate":
@@ -55,18 +55,36 @@ class PipelineHandler(Handler):
                 log.info("late report (a newer transmission was already accepted): %s", who)
             else:
                 log.warning("%s%s: %s", v.status, f" ({v.reason})" if v.reason else "", who)
-        repeater = repeaters.get(bytes(rx.report.repeater_id)) or rx.report.repeater_id.hex()
         log.info(
             "report from %s%s: %s",
-            repeater,
+            names.label(repeaters.get(bytes(rx.report.repeater_id)), rx.report.repeater_id),
             " (late)" if rx.late else "",
             ", ".join(f"{n} {status}" for status, n in sorted(summary.items())) or "no entries",
         )
 
+    def on_names(self, rx: ReceivedNames) -> None:
+        changes = self._pipeline.process_names(rx)
+        if not changes and rx.announcement.entries:
+            self.counts["names_ignored"] += 1
+            log.warning(
+                "ignored a name announcement from %s, which is not an enabled repeater in the table",
+                rx.announcement.repeater_id.hex(),
+            )
+            return
+        for c in changes:
+            if c.old is None:
+                log.info("learned the name of beacon %s: %r", names.prefix_label(c.beacon_prefix), c.new)
+                self.counts["names_learned"] += 1
+            elif c.changed:
+                log.info("beacon %s renamed %r -> %r", names.prefix_label(c.beacon_prefix), c.old, c.new)
+                self.counts["names_changed"] += 1
+            else:
+                log.debug("name of beacon %s unchanged: %r", names.prefix_label(c.beacon_prefix), c.new)
+
     def on_drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:
         if raw is not None:
-            self._pipeline.record_bad_report(raw, detail)
-            log.warning("dropped a malformed report: %s", detail.split(":", 1)[0])
+            self._pipeline.record_bad_report(raw, detail, "bad_names" if reason == "bad_names" else "bad_report")
+            log.warning("dropped a malformed %s: %s", "name announcement" if reason == "bad_names" else "report", detail.split(":", 1)[0])
         else:
             log.debug("ignored frame (%s): %s", reason, detail)
 

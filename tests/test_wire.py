@@ -56,3 +56,70 @@ def test_encode_rejects_bad_input():
         wire.encode_report(bytes(4), [o])
     with pytest.raises(ValueError):
         wire.encode_report(bytes(32), [wire.Observation(bytes(7), 1, 0, 0, 0)])
+
+
+# --- name announcements -----------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def golden_names():
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).parent / "fixtures" / "beacon_names_v1.json").read_text())
+
+
+def test_names_constants_match_firmware(golden_names):
+    c = golden_names["constants"]
+    assert wire.NAMES_DATA_TYPE == c["data_type"] == 0xFFBF
+    assert wire.NAMES_VERSION == golden_names["version"]
+    assert wire.ID_LEN == c["id_len"]
+    assert wire.NAMES_HEADER_LEN == c["header_len"]
+    assert wire.NAMES_ENTRY_OVERHEAD == c["entry_overhead"]
+    assert wire.MAX_GROUP_DATA_LENGTH == c["max_group_data_length"]
+
+
+def _expected(entries):
+    return [(bytes.fromhex(e["beacon_id"]), bytes.fromhex(e["name_hex"])) for e in entries]
+
+
+def test_decodes_golden_name_messages(golden_names):
+    for case in golden_names["messages"]:
+        msg = wire.decode_names(bytes.fromhex(case["hex"]))
+        assert msg.repeater_id.hex() == golden_names["repeater_id"], case["name"]
+        assert [(e.beacon_id, e.name) for e in msg.entries] == _expected(case["entries"]), case["name"]
+        # the name text in the vector matches the bytes
+        assert [e.name.decode() for e in msg.entries] == [e["name"] for e in case["entries"]], case["name"]
+
+
+def test_encodes_golden_name_messages(golden_names):
+    key = bytes.fromhex(golden_names["repeater_key"])
+    for case in golden_names["messages"]:
+        entries = [wire.NameEntry(bytes.fromhex(e["beacon_id"]), bytes.fromhex(e["name_hex"])) for e in case["entries"]]
+        assert wire.encode_names(key, entries).hex() == case["hex"], case["name"]
+
+
+def test_name_decode_only_cases(golden_names):
+    for case in golden_names["decode_only"]:
+        data = bytes.fromhex(case["hex"])
+        if case["expect_count"] < 0:
+            with pytest.raises(wire.WireError):
+                wire.decode_names(data)
+        else:
+            msg = wire.decode_names(data)
+            assert [(e.beacon_id, e.name) for e in msg.entries] == _expected(case["entries"]), case["name"]
+            assert len(msg.entries) == case["expect_count"], case["name"]
+
+
+def test_name_encode_rejects_bad_input():
+    e = wire.NameEntry(bytes(8), b"x")
+    with pytest.raises(ValueError):
+        wire.encode_names(bytes(32), [])
+    with pytest.raises(ValueError):
+        wire.encode_names(bytes(4), [e])
+    with pytest.raises(ValueError):
+        wire.encode_names(bytes(32), [wire.NameEntry(bytes(7), b"x")])
+    with pytest.raises(ValueError):
+        wire.encode_names(bytes(32), [wire.NameEntry(bytes(8), b"")])
+    with pytest.raises(ValueError):
+        wire.encode_names(bytes(32), [wire.NameEntry(bytes([i] * 8), b"x" * 40) for i in range(5)])  # over 165 bytes

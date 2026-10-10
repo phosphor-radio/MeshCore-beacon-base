@@ -15,9 +15,11 @@ NOW = 100_000.0
 def env(tmp_path):
     store = Store.open(tmp_path / "t.db")
     for name, key in (("b1", BEACON_KEY), ("b2", BEACON2_KEY)):
-        store.add_beacon(name, key.hex())
-    store.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
-    store.add_repeater("rb", REPEATER_B_KEY.hex(), 1, 1)
+        store.add_beacon(key.hex())
+        with store.transaction():
+            store.record_name(key[:8], name, REPEATER_A_KEY[:8])  # the names repeaters announced
+    store.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
+    store.add_repeater(REPEATER_B_KEY.hex(), 1, 1, name="rb")
     yield store, Pipeline(store, boot="b")
     store.close()
 
@@ -74,7 +76,7 @@ def test_reset_clears_the_rejected_state(env):
     p.process(rx(REPEATER_A_KEY, obs(1000), t=NOW - 60))
     p.process(rx(REPEATER_A_KEY, obs(3), t=NOW - 30))
     assert states(store)["b1"] == "rejected"
-    store.reset_beacon("b1")
+    store.reset_beacon(BEACON_KEY[:8].hex())
     h = {h.beacon["name"]: h for h in health.assess(store, CFG, NOW)}["b1"]
     assert h.state == "ok" and h.baseline_pending and h.rejects is None
     p.process(rx(REPEATER_A_KEY, obs(4), t=NOW - 10))
@@ -86,7 +88,7 @@ def test_rejects_before_a_reset_do_not_reappear_in_the_summary(env):
     store, p = env
     p.process(rx(REPEATER_A_KEY, obs(1000), t=NOW - 90))
     p.process(rx(REPEATER_A_KEY, obs(3), t=NOW - 80))
-    store.reset_beacon("b1")
+    store.reset_beacon(BEACON_KEY[:8].hex())
     p.process(rx(REPEATER_A_KEY, obs(50), t=NOW - 70))  # new baseline
     p.process(rx(REPEATER_A_KEY, obs(40), t=NOW - 60))  # a fresh lockout
     h = {h.beacon["name"]: h for h in health.assess(store, CFG, NOW)}["b1"]
@@ -95,7 +97,7 @@ def test_rejects_before_a_reset_do_not_reappear_in_the_summary(env):
 
 def test_disabled_beacon(env):
     store, _ = env
-    store.set_beacon_enabled("b1", False)
+    store.set_beacon_enabled(BEACON_KEY[:8].hex(), False)
     assert states(store) == {"b2": "silent", "b1": "disabled"}
 
 

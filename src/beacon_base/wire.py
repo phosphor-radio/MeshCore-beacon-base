@@ -1,7 +1,8 @@
-"""Beacon report wire format.
+"""Beacon report and name announcement wire formats.
 
-Mirrors ``src/helpers/BeaconReport.h`` in the firmware repository, which owns the format. ``tests/fixtures`` holds the
-golden vectors generated from the firmware, and ``tests/test_wire.py`` checks this module against them.
+Mirror ``src/helpers/BeaconReport.h`` and ``src/helpers/BeaconNames.h`` in the firmware repository, which owns the
+formats. ``tests/fixtures`` holds the golden vectors generated from the firmware, and ``tests/test_wire.py`` checks this
+module against them.
 
 A report is the data of one ``GRP_DATA`` packet with ``data_type`` ``REPORT_DATA_TYPE``::
 
@@ -80,3 +81,74 @@ def encode_report(repeater_key: bytes, observations: list[Observation] | tuple[O
             raise ValueError(f"beacon id must be {ID_LEN} bytes")
         parts.append(_ENTRY.pack(o.beacon_id, o.counter, o.rssi, o.snr_x4, o.batt_mv))
     return b"".join(parts)
+
+
+# --- name announcements ---------------------------------------------------------------------------------------------------
+#
+# A second GRP_DATA type on the same channel: a repeater tells the base what a beacon calls itself.
+#
+#     header (10 bytes):  [version:1][repeater key prefix:8][entry count:1]
+#     entry (variable):   [beacon key prefix:8][name length:1][name: UTF-8, no NUL]
+
+NAMES_DATA_TYPE = 0xFFBF
+NAMES_VERSION = 1
+NAMES_HEADER_LEN = 1 + ID_LEN + 1
+NAMES_ENTRY_OVERHEAD = ID_LEN + 1
+NAMES_MAX_ENTRIES = (MAX_GROUP_DATA_LENGTH - NAMES_HEADER_LEN) // NAMES_ENTRY_OVERHEAD
+
+
+@dataclass(frozen=True)
+class NameEntry:
+    beacon_id: bytes  # beacon public key prefix
+    name: bytes  # raw UTF-8 as sent; untrusted, see names.sanitize_name
+
+
+@dataclass(frozen=True)
+class NameAnnouncement:
+    repeater_id: bytes
+    entries: tuple[NameEntry, ...]
+
+
+def decode_names(data: bytes) -> NameAnnouncement:
+    """Decode a name announcement. Same rules as the firmware decoder: an unknown version, a short header, a count above
+    what a packet can hold, or an entry running past the end raise WireError; trailing bytes are ignored and entries with a
+    zero-length name are skipped."""
+    if len(data) < NAMES_HEADER_LEN:
+        raise WireError(f"name message too short ({len(data)} bytes)")
+    version = data[0]
+    if version != NAMES_VERSION:
+        raise WireError(f"unknown name message version {version}")
+    count = data[NAMES_HEADER_LEN - 1]
+    if count > NAMES_MAX_ENTRIES:
+        raise WireError(f"entry count {count} exceeds the maximum of {NAMES_MAX_ENTRIES}")
+    pos = NAMES_HEADER_LEN
+    entries = []
+    for i in range(count):
+        if pos + NAMES_ENTRY_OVERHEAD > len(data):
+            raise WireError(f"name message truncated in entry {i}")
+        beacon_id = bytes(data[pos : pos + ID_LEN])
+        name_len = data[pos + ID_LEN]
+        pos += NAMES_ENTRY_OVERHEAD
+        if pos + name_len > len(data):
+            raise WireError(f"name message truncated: entry {i} name runs past the end")
+        if name_len:
+            entries.append(NameEntry(beacon_id, bytes(data[pos : pos + name_len])))
+        pos += name_len
+    return NameAnnouncement(bytes(data[1 : 1 + ID_LEN]), tuple(entries))
+
+
+def encode_names(repeater_key: bytes, entries: list[NameEntry] | tuple[NameEntry, ...]) -> bytes:
+    """Encode a name announcement (used by the simulator and tests)."""
+    if len(repeater_key) < ID_LEN:
+        raise ValueError(f"repeater key must be at least {ID_LEN} bytes")
+    if not 1 <= len(entries) <= NAMES_MAX_ENTRIES:
+        raise ValueError(f"a name message holds 1 to {NAMES_MAX_ENTRIES} entries")
+    parts = [bytes([NAMES_VERSION]) + bytes(repeater_key[:ID_LEN]) + bytes([len(entries)])]
+    for e in entries:
+        if len(e.beacon_id) != ID_LEN or not 1 <= len(e.name) <= 255:
+            raise ValueError("a name entry needs an 8-byte beacon id and a 1-255 byte name")
+        parts.append(e.beacon_id + bytes([len(e.name)]) + e.name)
+    data = b"".join(parts)
+    if len(data) > MAX_GROUP_DATA_LENGTH:
+        raise ValueError(f"name message is {len(data)} bytes, more than the {MAX_GROUP_DATA_LENGTH} a packet carries")
+    return data

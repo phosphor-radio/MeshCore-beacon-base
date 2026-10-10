@@ -13,7 +13,7 @@ from beacon_base.pipeline import Pipeline
 from beacon_base.service import PipelineHandler
 from beacon_base.store import Store
 
-from helpers import BEACON_KEY, BEACON_PREFIX, REPEATER_A_KEY, REPEATER_B_KEY, obs, rx
+from helpers import B1, BEACON_KEY, BEACON_PREFIX, REPEATER_A_KEY, REPEATER_B_KEY, obs, rx
 
 KEY = bytes(range(16))
 
@@ -29,9 +29,9 @@ def wait_for(predicate, timeout=8.0):
 @pytest.fixture
 def env(tmp_path):
     with FakeCompanion() as fake, Store.open(tmp_path / "t.db") as store:
-        store.add_beacon("b1", BEACON_KEY.hex())
-        store.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
-        store.add_repeater("rb", REPEATER_B_KEY.hex(), 1, 1)
+        store.add_beacon(BEACON_KEY.hex())
+        store.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
+        store.add_repeater(REPEATER_B_KEY.hex(), 1, 1, name="rb")
         cfg = Config(companion=CompanionConfig(port=fake.path, command_timeout=2.0), radio=RadioConfig(), channel_key=KEY)
         pipeline = Pipeline(store, assume_synced=True)
         handler = PipelineHandler(store, pipeline)
@@ -53,7 +53,7 @@ def test_reports_from_the_companion_land_in_the_database(env):
     fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(BEACON_PREFIX, 10, -90, -8, 3900)]))
     fake.enqueue_report(wire.encode_report(REPEATER_B_KEY, [wire.Observation(BEACON_PREFIX, 10, -95, -12, 3900)]))
     wait_for(lambda: count(store) == 2)
-    b = store.beacon("b1")
+    b = store.beacon(B1)
     assert b["hwm"] == 10
     assert store.conn.execute("SELECT n_repeaters FROM transmissions").fetchone()[0] == 2
     assert handler.counts["accepted"] == 2
@@ -67,7 +67,7 @@ def test_replays_and_unknown_beacons_are_recorded_not_applied(env):
     wait_for(lambda: count(store) == 3)
     rows = [(r["status"], r["reason"]) for r in store.conn.execute("SELECT status, reason FROM observations ORDER BY id")]
     assert rows == [("accepted", ""), ("replay", "below_hwm"), ("unknown_beacon", "")]
-    assert store.beacon("b1")["hwm"] == 100
+    assert store.beacon(B1)["hwm"] == 100
 
 
 def test_malformed_report_is_kept_in_the_audit_trail(env):
@@ -95,7 +95,7 @@ def test_backlog_replayed_after_an_outage_keeps_counters_in_order(env):
         fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(BEACON_PREFIX, c, -90, -8, 3900)]))
     fake.reconnect()
     wait_for(lambda: count(store) == 5)
-    assert store.beacon("b1")["hwm"] == 5
+    assert store.beacon(B1)["hwm"] == 5
     assert store.conn.execute("SELECT count(*) FROM raw_frames WHERE late = 1").fetchone()[0] == 5
 
 
@@ -120,12 +120,12 @@ def test_hwm_and_reset_survive_ingest_restart(tmp_path):
                 return dict(handler.counts)
 
         with Store.open(path) as s:
-            s.add_beacon("b1", BEACON_KEY.hex())
-            s.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
+            s.add_beacon(BEACON_KEY.hex())
+            s.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
         assert run_ingest([100, 101]) == {"accepted": 2}
         assert run_ingest([50]) == {"replay": 1}  # still locked out after a restart
         with Store.open(path) as s:
-            s.reset_beacon("b1")
+            s.reset_beacon(B1)
         assert run_ingest([50]) == {"accepted": 1}
 
 
@@ -134,8 +134,8 @@ def test_hwm_and_reset_survive_ingest_restart(tmp_path):
 
 def test_clock_step_seen_by_ingest_corrects_earlier_observations(tmp_path):
     with Store.open(tmp_path / "t.db") as store:
-        store.add_beacon("b1", BEACON_KEY.hex())
-        store.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
+        store.add_beacon(BEACON_KEY.hex())
+        store.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
         pipeline = Pipeline(store, boot="boot-x")
         handler = PipelineHandler(store, pipeline)
         base = handler._offset  # the clock offset when ingest started
@@ -160,8 +160,8 @@ def test_clock_step_seen_by_ingest_corrects_earlier_observations(tmp_path):
 
 def test_small_clock_drift_is_not_a_step(tmp_path):
     with Store.open(tmp_path / "t.db") as store:
-        store.add_beacon("b1", BEACON_KEY.hex())
-        store.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
+        store.add_beacon(BEACON_KEY.hex())
+        store.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
         handler = PipelineHandler(store, Pipeline(store, boot="boot-x"))
         base = handler._offset
         handler.on_report(rx(REPEATER_A_KEY, obs(1), t=base + 100.0 + 2.0, mono=100.0))  # 2 s of slew
@@ -170,8 +170,8 @@ def test_small_clock_drift_is_not_a_step(tmp_path):
 
 def test_step_already_recorded_by_beaconctl_is_not_recorded_twice(tmp_path):
     with Store.open(tmp_path / "t.db") as store:
-        store.add_beacon("b1", BEACON_KEY.hex())
-        store.add_repeater("ra", REPEATER_A_KEY.hex(), 1, 1)
+        store.add_beacon(BEACON_KEY.hex())
+        store.add_repeater(REPEATER_A_KEY.hex(), 1, 1, name="ra")
         pipeline = Pipeline(store, boot="boot-x")
         handler = PipelineHandler(store, pipeline)
         base = handler._offset
@@ -184,8 +184,69 @@ def test_step_already_recorded_by_beaconctl_is_not_recorded_twice(tmp_path):
         assert handler._offset == pytest.approx(new_offset)
 
 
+def announce(fake, repeater_key, *entries, **kw):
+    fake.enqueue_report(
+        wire.encode_names(repeater_key, [wire.NameEntry(p, n.encode() if isinstance(n, str) else n) for p, n in entries]),
+        data_type=wire.NAMES_DATA_TYPE,
+        **kw,
+    )
+
+
+def names_in(store):
+    return {bytes(r["prefix"]): r["name"] for r in store.conn.execute("SELECT prefix, name FROM beacon_names")}
+
+
+def test_announced_names_are_stored_for_any_prefix_and_the_latest_wins(env):
+    fake, store, handler, _ = env
+    other = bytes(range(60, 68))
+    announce(fake, REPEATER_A_KEY, (BEACON_PREFIX, "Roof"), (other, "beacon-3c3d3e"))
+    wait_for(lambda: len(names_in(store)) == 2)
+    assert names_in(store) == {BEACON_PREFIX: "Roof", other: "beacon-3c3d3e"}
+    announce(fake, REPEATER_B_KEY, (BEACON_PREFIX, "Front gate"))  # a rename, heard by another repeater
+    wait_for(lambda: names_in(store)[BEACON_PREFIX] == "Front gate")
+    row = store.conn.execute("SELECT * FROM beacon_names WHERE prefix = ?", (BEACON_PREFIX,)).fetchone()
+    assert bytes(row["repeater_prefix"]) == REPEATER_B_KEY[:8] and row["updated_at"] >= row["first_seen"]
+    assert handler.counts["names_learned"] == 2 and handler.counts["names_changed"] == 1
+
+
+def test_names_from_an_unknown_or_disabled_repeater_are_ignored(env):
+    fake, store, handler, _ = env
+    rogue = bytes(range(0x30, 0x50))
+    store.set_repeater_enabled("rb", False)
+    announce(fake, rogue, (BEACON_PREFIX, "Evil"))
+    announce(fake, REPEATER_B_KEY, (BEACON_PREFIX, "Also evil"))
+    announce(fake, REPEATER_A_KEY, (BEACON_PREFIX, "Good"))
+    wait_for(lambda: names_in(store) == {BEACON_PREFIX: "Good"})
+    assert handler.counts["names_ignored"] == 2
+
+
+def test_announced_names_are_cleaned(env):
+    fake, store, handler, _ = env
+    announce(fake, REPEATER_A_KEY, (BEACON_PREFIX, b"\x1b[31mRed\x1b[0m\nroof"), (bytes(range(1, 9)), b"\x07\x07"))
+    wait_for(lambda: BEACON_PREFIX in names_in(store))
+    assert names_in(store) == {BEACON_PREFIX: "[31mRed [0m roof"}  # the second name was nothing but control characters
+
+
+def test_a_malformed_name_message_is_kept_for_the_audit_trail_and_changes_nothing(env):
+    fake, store, handler, _ = env
+    fake.enqueue_report(b"\x09" + bytes(20), data_type=wire.NAMES_DATA_TYPE)
+    wait_for(lambda: len(store.bad_reports()) == 1)
+    row = store.bad_reports()[0]
+    assert row["outcome"] == "bad_names" and "unknown name message version 9" in row["detail"]
+    assert names_in(store) == {}
+
+
+def test_reports_and_names_interleave(env):
+    fake, store, handler, _ = env
+    fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(BEACON_PREFIX, 1, -90, -8, 3900)]))
+    announce(fake, REPEATER_A_KEY, (BEACON_PREFIX, "Roof"))
+    fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(BEACON_PREFIX, 2, -90, -8, 3900)]))
+    wait_for(lambda: count(store) == 2 and names_in(store) == {BEACON_PREFIX: "Roof"})
+    assert store.beacon(B1)["name"] == "Roof"
+
+
 def test_onboarding_a_beacon_from_the_reports_alone(env, tmp_path, capsys):
-    """Let the beacon transmit, find its prefix in 'status', add it, and its next report is accepted."""
+    """Let the beacon transmit and announce its name, find its prefix and name in 'status', add it by prefix."""
     from beacon_base.cli import main
 
     fake, store, handler, _ = env
@@ -193,16 +254,20 @@ def test_onboarding_a_beacon_from_the_reports_alone(env, tmp_path, capsys):
     cfg.write_text('[database]\npath = "t.db"\n[clock]\nassume_synced = true\n')
     new_prefix = bytes(range(150, 158))
     fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(new_prefix, 1, -90, -8, 3900)]))
-    wait_for(lambda: count(store) == 1)
+    announce(fake, REPEATER_A_KEY, (new_prefix, "Roof"))
+    wait_for(lambda: count(store) == 1 and names_in(store).get(new_prefix) == "Roof")
 
     assert main(["-c", str(cfg), "status"]) == 0
     out = capsys.readouterr().out
-    assert f"beaconctl beacon add <name> {new_prefix.hex()}" in out
+    assert "'Roof'" in out and f"beaconctl beacon add {new_prefix.hex()}" in out
 
-    assert main(["-c", str(cfg), "beacon", "add", "beacon-007", new_prefix.hex()]) == 0
-    capsys.readouterr()
+    assert main(["-c", str(cfg), "beacon", "add", new_prefix.hex()]) == 0
+    assert "Roof" in capsys.readouterr().out
     fake.enqueue_report(wire.encode_report(REPEATER_A_KEY, [wire.Observation(new_prefix, 2, -90, -8, 3900)]))
     wait_for(lambda: count(store) == 2)
-    assert store.beacon("beacon-007")["hwm"] == 2
+    assert store.beacon(new_prefix.hex())["hwm"] == 2
     assert main(["-c", str(cfg), "status"]) == 0
-    assert "not on the allowlist" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not on the allowlist" not in out
+    row = [l for l in out.splitlines() if new_prefix.hex() in l][0]
+    assert row.split()[:3] == ["ok", "Roof", new_prefix.hex()]

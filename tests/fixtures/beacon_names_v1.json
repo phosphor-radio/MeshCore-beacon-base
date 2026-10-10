@@ -1,0 +1,60 @@
+{
+  "format": "beacon_names",
+  "version": 1,
+  "constants": {
+    "data_type": 65471,
+    "id_len": 8,
+    "header_len": 10,
+    "entry_overhead": 9,
+    "max_group_data_length": 165
+  },
+  "repeater_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "repeater_id": "0001020304050607",
+  "messages": [
+    {"name": "plan_example", "hex": "01000102030405060702a0a1a2a3a4a5a6a70a626561636f6e2d303031112233445566778804526f6f66", "entries": [
+      {"beacon_id": "a0a1a2a3a4a5a6a7", "name": "beacon-001", "name_hex": "626561636f6e2d303031"},
+      {"beacon_id": "1122334455667788", "name": "Roof", "name_hex": "526f6f66"}
+    ]},
+    {"name": "default_name", "hex": "01000102030405060701f5b16501020304050d626561636f6e2d663562313635", "entries": [
+      {"beacon_id": "f5b1650102030405", "name": "beacon-f5b165", "name_hex": "626561636f6e2d663562313635"}
+    ]},
+    {"name": "utf8_name", "hex": "0100010203040506070120212223242526270a436166c3a920f09f948b", "entries": [
+      {"beacon_id": "2021222324252627", "name": "Café 🔋", "name_hex": "436166c3a920f09f948b"}
+    ]},
+    {"name": "max_beacon_name_18", "hex": "010001020304050607014041424344454647126162636465666768696a6b6c6d6e6f707172", "entries": [
+      {"beacon_id": "4041424344454647", "name": "abcdefghijklmnopqr", "name_hex": "6162636465666768696a6b6c6d6e6f707172"}
+    ]},
+    {"name": "fills_packet", "hex": "0100010203040506070630313233343536371261616161616161616161616161616161616138393a3b3c3d3e3f1262626262626262626262626262626262626240414243444546471263636363636363636363636363636363636348494a4b4c4d4e4f1264646464646464646464646464646464646450515253545556571265656565656565656565656565656565656558595a5b5c5d5e5f0b7a7a7a7a7a7a7a7a7a7a7a", "entries": [
+      {"beacon_id": "3031323334353637", "name": "aaaaaaaaaaaaaaaaaa", "name_hex": "616161616161616161616161616161616161"},
+      {"beacon_id": "38393a3b3c3d3e3f", "name": "bbbbbbbbbbbbbbbbbb", "name_hex": "626262626262626262626262626262626262"},
+      {"beacon_id": "4041424344454647", "name": "cccccccccccccccccc", "name_hex": "636363636363636363636363636363636363"},
+      {"beacon_id": "48494a4b4c4d4e4f", "name": "dddddddddddddddddd", "name_hex": "646464646464646464646464646464646464"},
+      {"beacon_id": "5051525354555657", "name": "eeeeeeeeeeeeeeeeee", "name_hex": "656565656565656565656565656565656565"},
+      {"beacon_id": "58595a5b5c5d5e5f", "name": "zzzzzzzzzzz", "name_hex": "7a7a7a7a7a7a7a7a7a7a7a"}
+    ]}
+  ],
+  "decode_only": [
+    {"name": "reject_empty", "hex": "", "expect_count": -1},
+    {"name": "reject_short_header", "hex": "010001020304050607", "expect_count": -1},
+    {"name": "reject_version_0", "hex": "00000102030405060702a0a1a2a3a4a5a6a70a626561636f6e2d303031112233445566778804526f6f66", "expect_count": -1},
+    {"name": "reject_version_2", "hex": "02000102030405060702a0a1a2a3a4a5a6a70a626561636f6e2d303031112233445566778804526f6f66", "expect_count": -1},
+    {"name": "reject_version_255", "hex": "ff000102030405060702a0a1a2a3a4a5a6a70a626561636f6e2d303031112233445566778804526f6f66", "expect_count": -1},
+    {"name": "reject_entry_header_truncated", "hex": "010001020304050607010001020304", "expect_count": -1},
+    {"name": "reject_name_runs_past_end", "hex": "01000102030405060701a0a1a2a3a4a5a6a70a62656163", "expect_count": -1},
+    {"name": "reject_count_exceeds_entries", "hex": "01000102030405060702f5b16501020304050d626561636f6e2d663562313635", "expect_count": -1},
+    {"name": "accept_empty_batch", "hex": "01000102030405060700", "expect_count": 0, "entries": [
+    ]},
+    {"name": "accept_trailing_bytes", "hex": "01000102030405060702a0a1a2a3a4a5a6a70a626561636f6e2d303031112233445566778804526f6f660000", "expect_count": 2, "entries": [
+      {"beacon_id": "a0a1a2a3a4a5a6a7", "name": "beacon-001", "name_hex": "626561636f6e2d303031"},
+      {"beacon_id": "1122334455667788", "name": "Roof", "name_hex": "526f6f66"}
+    ]},
+    {"name": "accept_zero_length_name_skipped", "hex": "01000102030405060702000000000000000000112233445566778804526f6f66", "expect_count": 1, "entries": [
+      {"beacon_id": "1122334455667788", "name": "Roof", "name_hex": "526f6f66"}
+    ]},
+    {"name": "accept_all_zero_length_names", "hex": "01000102030405060702000000000000000000000102030405060700", "expect_count": 0, "entries": [
+    ]},
+    {"name": "accept_name_longer_than_32", "hex": "0100010203040506070150515253545556572878787878787878787878787878787878787878787878787878787878787878787878787878787878", "expect_count": 1, "entries": [
+      {"beacon_id": "5051525354555657", "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "name_hex": "78787878787878787878787878787878787878787878787878787878787878787878787878787878"}
+    ]}
+  ]
+}

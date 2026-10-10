@@ -13,8 +13,9 @@ import threading
 
 from . import __version__, admin
 from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
-from .ingest import CompanionSession, ConnectionInfo, Handler, ReceivedReport
+from .ingest import CompanionSession, ConnectionInfo, Handler, ReceivedNames, ReceivedReport
 from .link import CompanionError
+from .names import sanitize_name
 from .runtime import setup_logging, stop_on_signals
 from .store import Store, StoreError
 
@@ -72,6 +73,19 @@ class PrintHandler(Handler):
                 self._stop.set()
                 return
 
+    def on_names(self, rx: ReceivedNames) -> None:
+        if self._stop.is_set():
+            return
+        when = datetime.datetime.fromtimestamp(rx.rx_wall).isoformat(timespec="seconds")
+        for e in rx.announcement.entries:
+            name = sanitize_name(e.name)
+            if name is None:
+                continue
+            if self._json:
+                print(json.dumps({"type": "name", "time": when, "repeater": rx.announcement.repeater_id.hex(), "beacon": e.beacon_id.hex(), "name": name}), flush=True)
+            else:
+                print(f"{when}      repeater={rx.announcement.repeater_id.hex()} beacon={e.beacon_id.hex()} name={name!r}", flush=True)
+
     def on_drop(self, reason: str, detail: str, raw=None) -> None:
         print(f"dropped ({reason}): {detail}", file=sys.stderr, flush=True)
 
@@ -127,10 +141,10 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
         sim = Simulator(fake, cfg.companion.channel_index, args.beacons, args.repeaters, args.seed)
         if args.provision:
             with Store.open(cfg.db_path) as store:
-                for i, beacon_id in enumerate(sim.beacon_ids):
-                    store.add_beacon(sim.beacon_name(i), beacon_id.hex(), "simulated")
+                for beacon_id in sim.beacon_ids:
+                    store.add_beacon(beacon_id.hex(), "simulated")
                 for i, key in enumerate(sim.repeater_keys, 1):
-                    store.add_repeater(f"sim-repeater-{i}", key.hex(), 40.0 + 0.01 * i, -75.0 + 0.01 * i, window_s=20)
+                    store.add_repeater(key.hex(), 40.0 + 0.01 * i, -75.0 + 0.01 * i, name=f"sim-repeater-{i}", window_s=20)
             print(f"added the simulated beacons and repeaters to {cfg.db_path}")
         print(f"fake companion on {fake.path}")
         print(f"  ingest with:  beacon-ingest --port {fake.path}   (or: beaconctl listen --port ...)")
@@ -138,8 +152,13 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
             print(f"  beacon {i}:    {beacon_id.hex()}")
         for i, key in enumerate(sim.repeater_keys, 1):
             print(f"  repeater {i}:  {key.hex()}", flush=True)
+        sim.announce_names()
+        ticks = 0
         while not stop.wait(args.interval):
             sim.tick()
+            ticks += 1
+            if ticks % args.names_every == 0:
+                sim.announce_names()
     return 0
 
 
@@ -185,28 +204,31 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--beacons", type=int, default=3)
     sim.add_argument("--repeaters", type=int, default=3)
     sim.add_argument("--seed", type=int, default=1)
+    sim.add_argument("--names-every", type=int, default=12, metavar="N", help="repeat the repeaters' name announcements every N ticks")
     sim.add_argument("--provision", action="store_true", help="also add the simulated beacons and repeaters to the database")
     sim.set_defaults(func=cmd_simulate)
     return p
 
 
+REF_HELP = "the beacon's key prefix, or the first six or more hex digits of it, as 'beaconctl status' shows"
+REPEATER_REF_HELP = "the repeater's key prefix (six or more hex digits) or its name"
+
+
 def _add_admin_commands(sub) -> None:
     beacon = sub.add_parser("beacon", help="beacon allowlist").add_subparsers(dest="beacon_command", required=True)
-    p = beacon.add_parser("add", help="allowlist a beacon by the 8-byte key prefix its reports carry, or every heard one with --all")
-    p.add_argument("name", nargs="?")
+    p = beacon.add_parser("add", help="allowlist a beacon by the 8-byte key prefix its reports carry, or every reported one with --all")
     p.add_argument("prefix", nargs="?", help="16 hex characters, as listed by 'beaconctl status' (a full 64-character key is also accepted)")
     p.add_argument("--notes")
     p.add_argument("-a", "--all", action="store_true", help="add every beacon repeaters have reported that is not on the allowlist")
     p.add_argument("--hours", type=float, default=24.0, help="with --all: how far back to look for reported beacons")
-    p.add_argument("--name-prefix", default="beacon", help="with --all: names are <prefix>-<first hex digits of the key prefix>")
     p.set_defaults(func=admin.cmd_beacon_add)
     beacon.add_parser("list", help="list allowlisted beacons").set_defaults(func=admin.cmd_beacon_list)
     p = beacon.add_parser("status", help="details of one beacon")
-    p.add_argument("name")
+    p.add_argument("ref", metavar="prefix", help=REF_HELP)
     p.set_defaults(func=admin.cmd_beacon_status)
 
     def one_or_all(parser) -> None:
-        parser.add_argument("name", nargs="?")
+        parser.add_argument("ref", nargs="?", metavar="prefix", help=REF_HELP)
         parser.add_argument("-a", "--all", action="store_true", help="every beacon on the allowlist")
 
     p = beacon.add_parser("reset", help="clear the high-water mark; the next report becomes the new baseline")
@@ -222,22 +244,22 @@ def _add_admin_commands(sub) -> None:
 
     repeater = sub.add_parser("repeater", help="repeater table").add_subparsers(dest="repeater_command", required=True)
     p = repeater.add_parser("add", help="add a repeater and its location")
-    p.add_argument("name")
     p.add_argument("key", help="public key (64 hex characters) or its 8-byte prefix (16 hex characters)")
     p.add_argument("lat", type=float)
     p.add_argument("lon", type=float)
+    p.add_argument("--name", help="optional display name; not unique, and never required")
     p.add_argument("--window", type=float, help="the repeater's beacon.window in seconds, checked by 'beaconctl check'")
     p.set_defaults(func=admin.cmd_repeater_add)
     repeater.add_parser("list", help="list repeaters").set_defaults(func=admin.cmd_repeater_list)
     p = repeater.add_parser("remove", help="remove a repeater")
-    p.add_argument("name")
+    p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
     p.set_defaults(func=admin.cmd_repeater_remove)
     for verb, enable in (("enable", True), ("disable", False)):
         p = repeater.add_parser(verb, help=f"{verb} a repeater without removing it")
-        p.add_argument("name")
+        p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
         p.set_defaults(func=admin.cmd_repeater_enable, enable=enable)
     p = repeater.add_parser("window", help="record a repeater's beacon.window")
-    p.add_argument("name")
+    p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
     p.add_argument("seconds", type=float)
     p.set_defaults(func=admin.cmd_repeater_window)
 
@@ -245,7 +267,7 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("--hours", type=float, default=24.0, help="how far back to look for unlisted beacons and repeaters")
     p.set_defaults(func=admin.cmd_status)
     p = sub.add_parser("rejects", help="recent observations that were not accepted")
-    p.add_argument("--beacon", help="only this beacon")
+    p.add_argument("--beacon", metavar="prefix", help="only this beacon (key prefix, six or more hex digits)")
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(func=admin.cmd_rejects)
 

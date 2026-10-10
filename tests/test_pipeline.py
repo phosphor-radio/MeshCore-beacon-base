@@ -3,10 +3,13 @@
 import pytest
 
 from beacon_base import clock
+from beacon_base import wire
 from beacon_base.pipeline import Pipeline
 from beacon_base.store import Store
 
 from helpers import (
+    B1,
+    B2,
     BEACON2_KEY,
     BEACON2_PREFIX,
     BEACON_KEY,
@@ -24,10 +27,10 @@ A, B, C = REPEATER_A_KEY, REPEATER_B_KEY, REPEATER_C_KEY
 @pytest.fixture
 def env(tmp_path):
     store = Store.open(tmp_path / "t.db")
-    store.add_beacon("b1", BEACON_KEY.hex())
-    store.add_beacon("b2", BEACON2_KEY.hex())
+    store.add_beacon(BEACON_KEY.hex())
+    store.add_beacon(BEACON2_KEY.hex())
     for name, key in (("ra", A), ("rb", B), ("rc", C)):
-        store.add_repeater(name, key.hex(), 40.0, -75.0)
+        store.add_repeater(key.hex(), 40.0, -75.0, name=name)
     pipeline = Pipeline(store, boot="boot-1")
     yield store, pipeline
     store.close()
@@ -37,8 +40,8 @@ def statuses(verdicts):
     return [(v.status, v.reason) for v in verdicts]
 
 
-def beacon(store, name="b1"):
-    return store.beacon(name)
+def beacon(store, ref=B1):
+    return store.beacon(ref)
 
 
 def test_first_report_sets_the_baseline(env):
@@ -47,7 +50,15 @@ def test_first_report_sets_the_baseline(env):
     v = p.process(rx(A, obs(500)))
     assert statuses(v) == [("accepted", "")]
     assert beacon(store)["hwm"] == 500
-    assert v[0].beacon_name == "b1" and v[0].repeater_name == "ra"
+    assert v[0].beacon_name is None and v[0].repeater_name == "ra"  # no name announced for the beacon yet
+
+
+def test_verdicts_carry_the_announced_beacon_name(env):
+    store, p = env
+    with store.transaction():
+        store.record_name(BEACON_PREFIX, "Roof", A[:8])
+    (v,) = p.process(rx(A, obs(1)))
+    assert v.beacon_name == "Roof"
 
 
 def test_increasing_counters_advance_the_mark_and_finalise_the_previous_transmission(env):
@@ -129,9 +140,9 @@ def test_unknown_repeater_cannot_set_the_baseline(env):
 
 def test_disabled_beacon_and_repeater_are_not_processed(env):
     store, p = env
-    store.set_beacon_enabled("b2", False)
+    store.set_beacon_enabled(B2, False)
     assert statuses(p.process(rx(A, obs(1, beacon=BEACON2_PREFIX)))) == [("disabled", "beacon")]
-    assert store.beacon("b2")["hwm"] is None
+    assert store.beacon(B2)["hwm"] is None
     store.set_repeater_enabled("rb", False)
     assert statuses(p.process(rx(B, obs(1)))) == [("disabled", "repeater")]
     assert beacon(store)["hwm"] is None
@@ -142,7 +153,7 @@ def test_reset_makes_the_next_report_the_baseline(env):
     store, p = env
     p.process(rx(A, obs(1_000_000)))  # e.g. a forged report that locks the beacon out
     assert statuses(p.process(rx(A, obs(301), t=1100))) == [("replay", "below_hwm")]
-    info = store.reset_beacon("b1")
+    info = store.reset_beacon(B1)
     assert (info.old_hwm, info.last_reject_counter, info.rejects_since_accept) == (1_000_000, 301, 1)
     b = beacon(store)
     assert b["hwm"] is None and b["rejects_since_accept"] == 0
@@ -153,7 +164,7 @@ def test_reset_makes_the_next_report_the_baseline(env):
 def test_counters_that_restart_after_a_reset_are_not_deduped_against_old_ones(env):
     store, p = env
     p.process(rx(A, obs(5)))
-    store.reset_beacon("b1")  # e.g. the beacon's flash was erased and its counter restarted
+    store.reset_beacon(B1)  # e.g. the beacon's flash was erased and its counter restarted
     assert statuses(p.process(rx(A, obs(5), t=1300))) == [("accepted", "")]
     assert store.conn.execute("SELECT count(*) FROM transmissions").fetchone()[0] == 2
     assert statuses(p.process(rx(A, obs(5), t=1301))) == [("duplicate", "")]
@@ -186,7 +197,7 @@ def test_entries_in_one_report_are_judged_independently(env):
     p.process(rx(A, obs(50), obs(7, beacon=BEACON2_PREFIX)))
     v = p.process(rx(A, obs(49), obs(8, beacon=BEACON2_PREFIX), obs(1, beacon=bytes(8)), t=1300))
     assert statuses(v) == [("replay", "below_hwm"), ("accepted", ""), ("unknown_beacon", "")]
-    assert beacon(store, "b1")["hwm"] == 50 and beacon(store, "b2")["hwm"] == 8
+    assert beacon(store, B1)["hwm"] == 50 and beacon(store, B2)["hwm"] == 8
 
 
 def test_accept_clears_the_rejected_state(env):
@@ -202,12 +213,12 @@ def test_accept_clears_the_rejected_state(env):
 def test_state_survives_a_restart(tmp_path):
     path = tmp_path / "t.db"
     with Store.open(path) as s:
-        s.add_beacon("b1", BEACON_KEY.hex())
-        s.add_repeater("ra", A.hex(), 1, 1)
+        s.add_beacon(BEACON_KEY.hex())
+        s.add_repeater(A.hex(), 1, 1, name="ra")
         Pipeline(s, boot="boot-1").process(rx(A, obs(100)))
     with Store.open(path) as s:  # a new process
         p = Pipeline(s, boot="boot-1")
-        assert s.beacon("b1")["hwm"] == 100
+        assert s.beacon(B1)["hwm"] == 100
         assert statuses(p.process(rx(A, obs(99), t=1100))) == [("replay", "below_hwm")]
         assert statuses(p.process(rx(A, obs(100), t=1101))) == [("duplicate", "")]
         assert statuses(p.process(rx(A, obs(101), t=1300))) == [("accepted", "")]
@@ -231,7 +242,7 @@ def test_a_failure_part_way_leaves_the_database_consistent(env, monkeypatch):
         p.process(rx(A, obs(11), obs(12, beacon=BEACON2_PREFIX), t=1300))
     after = {t: store.conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in before}
     assert after == before
-    assert beacon(store)["hwm"] == 10 and beacon(store, "b2")["hwm"] is None
+    assert beacon(store)["hwm"] == 10 and beacon(store, B2)["hwm"] is None
     monkeypatch.undo()
     # and the same report goes through cleanly afterwards
     assert statuses(p.process(rx(A, obs(11), obs(12, beacon=BEACON2_PREFIX), t=1300))) == [("accepted", ""), ("accepted", "")]
@@ -314,3 +325,43 @@ def test_assume_synced_trusts_the_clock(env):
     p = Pipeline(store, assume_synced=True, boot="boot-9")
     p.process(rx(A, obs(1)))
     assert store.conn.execute("SELECT time_trusted FROM observations").fetchone()[0] == 1
+
+
+# --- announced names ----------------------------------------------------------------------------------------------------
+
+
+def names_rx(repeater_key, *entries, t=1000.0):
+    from beacon_base.ingest import ReceivedNames
+
+    payload = wire.encode_names(repeater_key, [wire.NameEntry(p, n if isinstance(n, bytes) else n.encode()) for p, n in entries])
+    return ReceivedNames(wire.decode_names(payload), 20, 1, t, 100.0, False, payload)
+
+
+def test_names_from_a_known_repeater_are_stored_cleaned_and_reported_as_changes(env):
+    store, p = env
+    other = bytes(range(70, 78))
+    changes = p.process_names(names_rx(A, (BEACON_PREFIX, "Roof"), (other, b"\x1b[1mBold\x1b[0m"), (bytes(8), b"\x07")))
+    assert [(c.beacon_prefix, c.old, c.new, c.changed) for c in changes] == [(BEACON_PREFIX, None, "Roof", True), (other, None, "[1mBold [0m", True)]
+    changes = p.process_names(names_rx(B, (BEACON_PREFIX, "Roof"), t=2000.0))
+    assert [(c.old, c.new, c.changed) for c in changes] == [("Roof", "Roof", False)]
+    changes = p.process_names(names_rx(B, (BEACON_PREFIX, "Front gate"), t=3000.0))
+    assert [(c.old, c.new, c.changed) for c in changes] == [("Roof", "Front gate", True)]
+    assert store.beacon(B1)["name"] == "Front gate"
+    row = store.conn.execute("SELECT * FROM beacon_names WHERE prefix = ?", (BEACON_PREFIX,)).fetchone()
+    assert (row["first_seen"], row["updated_at"], bytes(row["repeater_prefix"])) == (1000.0, 3000.0, B[:8])
+
+
+def test_names_from_unknown_or_disabled_repeaters_are_ignored(env):
+    store, p = env
+    assert p.process_names(names_rx(bytes(range(0x30, 0x50)), (BEACON_PREFIX, "Evil"))) == []
+    store.set_repeater_enabled("rb", False)
+    assert p.process_names(names_rx(B, (BEACON_PREFIX, "Also evil"))) == []
+    assert store.conn.execute("SELECT count(*) FROM beacon_names").fetchone()[0] == 0
+
+
+def test_a_name_never_changes_a_beacons_counters(env):
+    store, p = env
+    p.process(rx(A, obs(100)))
+    p.process_names(names_rx(A, (BEACON_PREFIX, "Roof")))
+    b = beacon(store)
+    assert (b["hwm"], b["rejects_since_accept"], b["epoch"], b["enabled"]) == (100, 0, 0, 1)

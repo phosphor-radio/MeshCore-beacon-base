@@ -1,4 +1,4 @@
-"""beaconctl against a database: the allowlist, lockout visibility and one-step reset, time, check."""
+"""beaconctl against a database: the allowlist by prefix, lockout visibility and one-step reset, time, check."""
 
 import time
 
@@ -9,7 +9,7 @@ from beacon_base.cli import main
 from beacon_base.pipeline import Pipeline
 from beacon_base.store import Store
 
-from helpers import BEACON2_KEY, BEACON_KEY, REPEATER_A_KEY, REPEATER_B_KEY, obs, rx
+from helpers import B1, B2, BEACON2_KEY, BEACON2_PREFIX, BEACON_KEY, BEACON_PREFIX, REPEATER_A_KEY, REPEATER_B_KEY, obs, rx
 
 
 @pytest.fixture
@@ -34,44 +34,88 @@ def feed(tmp_path, *reports):
             pipeline.process(r)
 
 
+def announce(tmp_path, prefix, name, repeater=REPEATER_A_KEY):
+    """What a repeater's name announcement leaves in the database."""
+    with Store.open(tmp_path / "beacon.db") as store, store.transaction():
+        store.record_name(prefix, name, repeater[:8])
+
+
 def provision(cfg_file, capsys):
-    assert run(cfg_file, "beacon", "add", "b1", BEACON_KEY[:8].hex()) == 0
-    assert run(cfg_file, "beacon", "add", "b2", BEACON2_KEY.hex()) == 0  # a full key is accepted, its prefix is kept
-    assert run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "40.1", "-75.2", "--window", "20") == 0
-    assert run(cfg_file, "repeater", "add", "east", REPEATER_B_KEY[:8].hex(), "40.2", "-75.1") == 0
+    assert run(cfg_file, "beacon", "add", B1) == 0
+    assert run(cfg_file, "beacon", "add", BEACON2_KEY.hex()) == 0  # a full key is accepted, its prefix is kept
+    assert run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "40.1", "-75.2", "--name", "north", "--window", "20") == 0
+    assert run(cfg_file, "repeater", "add", REPEATER_B_KEY[:8].hex(), "40.2", "-75.1") == 0  # no name
     capsys.readouterr()
 
 
-def test_beacon_and_repeater_provisioning(cfg_file, capsys):
-    provision(cfg_file, capsys)
-    code, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
-    assert code == 0 and "b1" in out and BEACON_KEY[:8].hex() in out
-    code, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+# --- provisioning ---------------------------------------------------------------------------------------------------------
+
+
+def test_beacon_and_repeater_provisioning(cfg_file, tmp_path, capsys):
+    announce(tmp_path, BEACON_PREFIX, "Roof")
+    assert run(cfg_file, "beacon", "add", B1) == 0
+    assert run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "40.1", "-75.2", "--name", "north", "--window", "20") == 0
+    assert run(cfg_file, "repeater", "add", REPEATER_B_KEY[:8].hex(), "40.2", "-75.1") == 0
+    capsys.readouterr()
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    row = out.splitlines()[1].split()
+    assert row[:3] == ["Roof", B1, "yes"]
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
     assert "north" in out and "20s" in out and "40.200000" in out
-    assert run(cfg_file, "beacon", "disable", "b2") == 0
-    assert run(cfg_file, "beacon", "remove", "b2") == 0
-    assert run(cfg_file, "repeater", "window", "east", "15") == 0
-    assert run(cfg_file, "repeater", "disable", "east") == 0
-    assert run(cfg_file, "repeater", "remove", "east") == 0
+    lines = out.splitlines()
+    assert lines[1].split()[0] == "north" and lines[2].split()[0] == "-"  # named first, then the unnamed one
+    assert run(cfg_file, "beacon", "disable", B1) == 0
+    assert run(cfg_file, "repeater", "window", "east", "15") != 0  # no repeater has that name
+    assert run(cfg_file, "repeater", "window", REPEATER_B_KEY[:3].hex() + REPEATER_B_KEY[3:4].hex(), "15") == 0
+    assert run(cfg_file, "repeater", "disable", "north") == 0
+    assert run(cfg_file, "repeater", "remove", "north") == 0
+    assert run(cfg_file, "beacon", "remove", B1[:8]) == 0
     capsys.readouterr()
-    code, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
-    assert "b1" in out and "b2" not in out
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert "no beacons" in out
+
+
+def test_add_prints_the_announced_name_or_says_there_is_none(cfg_file, tmp_path, capsys):
+    announce(tmp_path, BEACON_PREFIX, "Roof")
+    _, out, _ = run(cfg_file, "beacon", "add", B1, capsys=capsys)
+    assert f"added beacon {B1} (Roof)" in out
+    _, out, _ = run(cfg_file, "beacon", "add", B2, capsys=capsys)
+    assert "no name announced yet" in out
 
 
 def test_provisioning_errors_exit_2(cfg_file, capsys):
     provision(cfg_file, capsys)
-    code, _, err = run(cfg_file, "beacon", "add", "b3", BEACON_KEY[:8].hex(), capsys=capsys)
-    assert code == 2 and "already has the prefix" in err
-    code, _, err = run(cfg_file, "beacon", "add", "b3", "1234", capsys=capsys)
+    code, _, err = run(cfg_file, "beacon", "add", B1, capsys=capsys)
+    assert code == 2 and "already on the allowlist" in err
+    code, _, err = run(cfg_file, "beacon", "add", "1234", capsys=capsys)
     assert code == 2 and "8 bytes" in err
-    code, _, err = run(cfg_file, "beacon", "reset", "ghost", capsys=capsys)
-    assert code == 2 and "no beacon named" in err
-    code, _, err = run(cfg_file, "repeater", "add", "bad", "11" * 8, "95", "0", capsys=capsys)
+    code, _, err = run(cfg_file, "beacon", "reset", "aabbccdd", capsys=capsys)
+    assert code == 2 and "no beacon on the allowlist matches" in err
+    code, _, err = run(cfg_file, "beacon", "reset", "abc", capsys=capsys)
+    assert code == 2 and "at least 6" in err
+    code, _, err = run(cfg_file, "beacon", "reset", "Roof", capsys=capsys)
+    assert code == 2 and "not a hex" in err
+    code, _, err = run(cfg_file, "repeater", "add", "11" * 8, "95", "0", capsys=capsys)
     assert code == 2
+    code, _, err = run(cfg_file, "repeater", "disable", "nobody", capsys=capsys)
+    assert code == 2 and "no repeater matches" in err
+
+
+def test_beacons_are_addressed_by_an_abbreviated_prefix(cfg_file, capsys):
+    provision(cfg_file, capsys)
+    assert run(cfg_file, "beacon", "disable", B1[:6]) == 0
+    assert run(cfg_file, "beacon", "enable", B1[:12]) == 0
+    assert run(cfg_file, "beacon", "enable", B1 + "ff" * 24) == 0  # a full key is read as its prefix
+    code, out, _ = run(cfg_file, "beacon", "status", B1[:7], capsys=capsys)
+    assert code == 0 and B1 in out
+
+
+# --- lockout ------------------------------------------------------------------------------------------------------------
 
 
 def test_lockout_is_visible_in_status_and_cleared_by_one_reset(cfg_file, tmp_path, capsys):
     provision(cfg_file, capsys)
+    announce(tmp_path, BEACON_PREFIX, "Roof")
     now = time.time()
     feed(tmp_path, rx(REPEATER_A_KEY, obs(1_000_000), t=now - 600))  # a forged high counter sets the mark
     feed(tmp_path, *[rx(REPEATER_A_KEY, obs(300 + i), t=now - 60 + i) for i in range(3)])  # the real beacon is rejected
@@ -79,25 +123,25 @@ def test_lockout_is_visible_in_status_and_cleared_by_one_reset(cfg_file, tmp_pat
     code, out, _ = run(cfg_file, "status", capsys=capsys)
     assert code == 0
     lines = out.splitlines()
-    assert lines[1].startswith("rejected") and "b1" in lines[1]  # most urgent first
+    assert lines[1].startswith("rejected") and "Roof" in lines[1] and B1 in lines[1]  # most urgent first
     assert "3 replays rejected" in lines[1] and "counters 300-302" in lines[1] and "hwm 1000000" in lines[1]
     assert "north" in lines[1]
-    assert "beaconctl beacon reset b1" in lines[1]
-    assert lines[2].startswith("silent") and "b2" in lines[2]
+    assert f"beaconctl beacon reset {B1}" in lines[1]  # a prefix that can be pasted as it is
+    assert lines[2].startswith("silent") and B2 in lines[2]
 
     code, out, _ = run(cfg_file, "rejects", capsys=capsys)
-    assert out.count("replay/below_hwm") == 3 and "(hwm 1000000)" in out
+    assert out.count("replay/below_hwm") == 3 and "(hwm 1000000)" in out and "Roof (" + B1[:6] + ")" in out
 
-    code, out, _ = run(cfg_file, "beacon", "reset", "b1", capsys=capsys)
+    code, out, _ = run(cfg_file, "beacon", "reset", B1, capsys=capsys)
     assert code == 0
-    assert "high-water mark 1000000" in out and "3 rejects" in out and "last rejected counter 302" in out
+    assert "high-water mark 1000000" in out and "3 rejects" in out and "last rejected counter 302" in out and "Roof" in out
 
     code, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "rejected" not in out
     feed(tmp_path, rx(REPEATER_A_KEY, obs(303), t=time.time()))
     code, out, _ = run(cfg_file, "status", capsys=capsys)
-    b1 = [l for l in out.splitlines() if " b1 " in l][0]
-    assert b1.startswith("ok") and "303" in b1
+    b1 = [l for l in out.splitlines() if B1 in l][0]
+    assert b1.startswith("ok") and "Roof" in b1 and "303" in b1
 
 
 def test_state_survives_a_restart_between_commands(cfg_file, tmp_path, capsys):
@@ -108,16 +152,20 @@ def test_state_survives_a_restart_between_commands(cfg_file, tmp_path, capsys):
     assert "replay/below_hwm" in out
 
 
-def test_status_lists_unconfigured_beacons_with_the_add_command_and_unknown_repeaters(cfg_file, tmp_path, capsys):
+def test_status_lists_unlisted_beacons_with_their_name_and_unknown_repeaters(cfg_file, tmp_path, capsys):
     provision(cfg_file, capsys)
     stranger = bytes(range(0xE0, 0xE8))
+    nameless = bytes(range(0xD0, 0xD8))
     rogue = bytes(range(0x30, 0x50))
+    announce(tmp_path, stranger, "Shed")
     now = time.time()
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(7, beacon=stranger), obs(1), t=now - 10), rx(rogue, obs(9), t=now - 5))
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(7, beacon=stranger), obs(3, beacon=nameless), obs(1), t=now - 10), rx(rogue, obs(9), t=now - 5))
     _, out, _ = run(cfg_file, "status", capsys=capsys)
-    assert "not on the allowlist" in out and stranger.hex() in out
-    assert f"beaconctl beacon add <name> {stranger.hex()}" in out
-    assert "not in the repeater table" in out and rogue[:8].hex() in out and "beaconctl repeater add" in out
+    assert "not on the allowlist" in out
+    assert f"{stranger.hex()}  'Shed'" in out and f"add: beaconctl beacon add {stranger.hex()}" in out
+    assert f"{nameless.hex()}  (no name announced)" in out
+    assert "not in the repeater table" in out and rogue[:8].hex() in out
+    assert f"beaconctl repeater add {rogue[:8].hex()} <lat> <lon>" in out
 
 
 def test_status_on_an_empty_database(cfg_file, capsys):
@@ -127,12 +175,20 @@ def test_status_on_an_empty_database(cfg_file, capsys):
 
 def test_beacon_status_details(cfg_file, tmp_path, capsys):
     provision(cfg_file, capsys)
+    announce(tmp_path, BEACON_PREFIX, "Roof")
     now = time.time()
     feed(tmp_path, rx(REPEATER_A_KEY, obs(12, rssi=-97, snr_x4=-21, batt=3987), t=now - 30), rx(REPEATER_B_KEY, obs(12, batt=3987), t=now - 28))
-    code, out, _ = run(cfg_file, "beacon", "status", "b1", capsys=capsys)
+    code, out, _ = run(cfg_file, "beacon", "status", B1, capsys=capsys)
     assert code == 0
-    assert "[ok]" in out and "key prefix         " + BEACON_KEY[:8].hex() in out and "high-water mark    12" in out and "3.99V" in out
-    assert "north" in out and "-97 dBm" in out and "-5.25 dB" in out and "east" in out
+    assert out.startswith("Roof  [ok]") and f"key prefix         {B1}" in out
+    assert "high-water mark    12" in out and "3.99V" in out
+    assert "north" in out and "-97 dBm" in out and "-5.25 dB" in out and BEACON_PREFIX.hex() and REPEATER_B_KEY[:6].hex() in out
+
+
+def test_beacon_status_without_a_name_is_headed_by_the_prefix(cfg_file, capsys):
+    provision(cfg_file, capsys)
+    _, out, _ = run(cfg_file, "beacon", "status", B2, capsys=capsys)
+    assert out.startswith(f"{B2}  [silent]")
 
 
 def test_rejects_filter_and_bad_reports(cfg_file, tmp_path, capsys):
@@ -147,21 +203,23 @@ def test_rejects_filter_and_bad_reports(cfg_file, tmp_path, capsys):
         rx_mono = 1.0
         late = False
 
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(50), obs(60, beacon=BEACON2_KEY[:8]), t=now - 5))
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(10), obs(20, beacon=BEACON2_KEY[:8]), t=now - 4))
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(50), obs(60, beacon=BEACON2_PREFIX), t=now - 5))
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(10), obs(20, beacon=BEACON2_PREFIX), t=now - 4))
     with Store.open(tmp_path / "beacon.db") as store:
         Pipeline(store, assume_synced=True).record_bad_report(Bad, "unknown report version 9")
+        Pipeline(store, assume_synced=True).record_bad_report(Bad, "unknown name message version 9", "bad_names")
     _, out, _ = run(cfg_file, "rejects", capsys=capsys)
     assert out.count("replay") == 2 and "malformed reports" in out and "unknown report version 9" in out
-    _, out, _ = run(cfg_file, "rejects", "--beacon", "b2", capsys=capsys)
+    assert "unknown name message version 9" in out
+    _, out, _ = run(cfg_file, "rejects", "--beacon", B2[:6], capsys=capsys)
     assert out.count("replay") == 1 and "malformed" not in out
 
 
 def test_rejects_marks_provisional_times(tmp_path, capsys):
     cfg = tmp_path / "c2.toml"
     cfg.write_text("")  # clock not trusted
-    run(str(cfg), "beacon", "add", "b1", BEACON_KEY.hex())
-    run(str(cfg), "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    run(str(cfg), "beacon", "add", B1)
+    run(str(cfg), "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
     with Store.open(tmp_path / "beacon.db") as store:
         p = Pipeline(store)
         p.process(rx(REPEATER_A_KEY, obs(50), t=1000.0))
@@ -181,8 +239,8 @@ def test_time_set_confirms_the_clock_and_corrects_provisional_times(tmp_path, mo
     cfg.write_text("")
     calls = []
     monkeypatch.setattr(admin, "run_timedatectl", lambda *a: calls.append(a) or "")
-    run(str(cfg), "beacon", "add", "b1", BEACON_KEY.hex())
-    run(str(cfg), "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    run(str(cfg), "beacon", "add", B1)
+    run(str(cfg), "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
     mono = time.monotonic() - 50
     with Store.open(tmp_path / "beacon.db") as store:
         Pipeline(store).process(rx(REPEATER_A_KEY, obs(1), t=1000.0, mono=mono))  # stamped by a wrong clock
@@ -241,26 +299,30 @@ def test_time_confirm(tmp_path, monkeypatch, capsys):
 # --- check --------------------------------------------------------------------------------------------------------------
 
 
-def test_check_flags_repeater_windows(cfg_file, tmp_path, capsys):
+def _secrets(tmp_path):
     (tmp_path / "secrets.toml").write_text('[channel]\nkey = "' + "ab" * 16 + '"\n')
-    run(cfg_file, "beacon", "add", "b1", BEACON_KEY.hex())
-    run(cfg_file, "repeater", "add", "good", "11" * 8, "1", "1", "--window", "60")
-    run(cfg_file, "repeater", "add", "long", "22" * 8, "1", "1", "--window", "250")
-    run(cfg_file, "repeater", "add", "toolong", "33" * 8, "1", "1", "--window", "280")
-    run(cfg_file, "repeater", "add", "unknown", "44" * 8, "1", "1")
+
+
+def test_check_flags_repeater_windows(cfg_file, tmp_path, capsys):
+    _secrets(tmp_path)
+    run(cfg_file, "beacon", "add", B1)
+    run(cfg_file, "repeater", "add", "11" * 8, "1", "1", "--name", "good", "--window", "60")
+    run(cfg_file, "repeater", "add", "22" * 8, "1", "1", "--name", "long", "--window", "250")
+    run(cfg_file, "repeater", "add", "33" * 8, "1", "1", "--name", "toolong", "--window", "280")
+    run(cfg_file, "repeater", "add", "44" * 8, "1", "1")  # no name, no window
     capsys.readouterr()
     code, out, _ = run(cfg_file, "check", capsys=capsys)
     assert code == 1
     assert "good" not in out
-    assert "long: beacon.window 250s is above the advised 240s" in out
-    assert "toolong: beacon.window 280s is not below the shortest beacon interval (270s)" in out
-    assert "unknown: beacon.window not recorded" in out
+    assert "long (222222): beacon.window 250s is above the advised 240s" in out
+    assert "toolong (333333): beacon.window 280s is not below the shortest beacon interval (270s)" in out
+    assert "444444444444: beacon.window not recorded" in out
 
 
 def test_check_passes_on_a_good_setup(cfg_file, tmp_path, capsys):
-    (tmp_path / "secrets.toml").write_text('[channel]\nkey = "' + "ab" * 16 + '"\n')
-    run(cfg_file, "beacon", "add", "b1", BEACON_KEY.hex())
-    run(cfg_file, "repeater", "add", "r", "11" * 8, "1", "1", "--window", "60")
+    _secrets(tmp_path)
+    run(cfg_file, "beacon", "add", B1)
+    run(cfg_file, "repeater", "add", "11" * 8, "1", "1", "--window", "60")
     capsys.readouterr()
     code, out, _ = run(cfg_file, "check", capsys=capsys)
     assert code == 0 and out.startswith("ok:")
@@ -269,28 +331,27 @@ def test_check_passes_on_a_good_setup(cfg_file, tmp_path, capsys):
 def test_check_uses_the_configured_beacon_interval(tmp_path, capsys):
     cfg = tmp_path / "c.toml"
     cfg.write_text("[beacon]\ninterval_s = 30\n")
-    (tmp_path / "secrets.toml").write_text('[channel]\nkey = "' + "ab" * 16 + '"\n')
-    run(str(cfg), "beacon", "add", "b1", BEACON_KEY.hex())
-    run(str(cfg), "repeater", "add", "r", "11" * 8, "1", "1", "--window", "20")
-    run(str(cfg), "repeater", "add", "slow", "22" * 8, "1", "1", "--window", "60")
+    _secrets(tmp_path)
+    run(str(cfg), "beacon", "add", B1)
+    run(str(cfg), "repeater", "add", "11" * 8, "1", "1", "--name", "r", "--window", "20")
+    run(str(cfg), "repeater", "add", "22" * 8, "1", "1", "--name", "slow", "--window", "60")
     capsys.readouterr()
     code, out, _ = run(str(cfg), "check", capsys=capsys)
-    assert code == 1 and "r: beacon.window 20s is not below the shortest beacon interval (27s)" not in out
-    assert "r: beacon.window 20s is above the advised 24s" not in out
-    assert "slow: beacon.window 60s is not below the shortest beacon interval (27s)" in out
+    assert code == 1 and "r (111111): beacon.window 20s" not in out
+    assert "slow (222222): beacon.window 60s is not below the shortest beacon interval (27s)" in out
 
 
 def test_listed_beacons_and_repeaters_leave_the_unlisted_sections(cfg_file, tmp_path, capsys):
     rogue = bytes(range(0x30, 0x50))
-    run(cfg_file, "beacon", "add", "b1", BEACON_KEY[:8].hex())
-    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    run(cfg_file, "beacon", "add", B1)
+    run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
     now = time.time()
-    feed(tmp_path, rx(rogue, obs(5), t=now - 5), rx(REPEATER_A_KEY, obs(1, beacon=BEACON2_KEY[:8]), t=now - 4))
+    feed(tmp_path, rx(rogue, obs(5), t=now - 5), rx(REPEATER_A_KEY, obs(1, beacon=BEACON2_PREFIX), t=now - 4))
     capsys.readouterr()
     _, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "not in the repeater table" in out and "not on the allowlist" in out
-    run(cfg_file, "repeater", "add", "new", rogue.hex(), "1", "1")
-    run(cfg_file, "beacon", "add", "b2", BEACON2_KEY[:8].hex())
+    run(cfg_file, "repeater", "add", rogue.hex(), "1", "1")
+    run(cfg_file, "beacon", "add", B2)
     capsys.readouterr()
     _, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "not in the repeater table" not in out and "not on the allowlist" not in out
@@ -299,9 +360,12 @@ def test_listed_beacons_and_repeaters_leave_the_unlisted_sections(cfg_file, tmp_
 # --- bulk options (--all) -------------------------------------------------------------------------------------------------
 
 
+PREFIXES = [bytes([i + 1] * 8).hex() for i in range(3)]
+
+
 def add_three(cfg_file, capsys):
-    for i, name in enumerate(("b1", "b2", "b3")):
-        assert run(cfg_file, "beacon", "add", name, bytes([i + 1] * 8).hex()) == 0
+    for p in PREFIXES:
+        assert run(cfg_file, "beacon", "add", p) == 0
     capsys.readouterr()
 
 
@@ -319,14 +383,15 @@ def test_enable_disable_all(cfg_file, capsys):
 
 def test_reset_all_reports_each_beacon(cfg_file, tmp_path, capsys):
     add_three(cfg_file, capsys)
-    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(100, beacon=bytes([1] * 8)), obs(7, beacon=bytes([2] * 8)), t=time.time() - 5))
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(3, beacon=bytes([1] * 8)), t=time.time() - 4))  # b1 is locked out
+    run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
+    announce(tmp_path, bytes.fromhex(PREFIXES[0]), "Roof")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(100, beacon=bytes.fromhex(PREFIXES[0])), obs(7, beacon=bytes.fromhex(PREFIXES[1])), t=time.time() - 5))
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(3, beacon=bytes.fromhex(PREFIXES[0])), t=time.time() - 4))  # the first is locked out
     capsys.readouterr()
     code, out, _ = run(cfg_file, "beacon", "reset", "--all", capsys=capsys)
     assert code == 0
-    assert "reset b1: was high-water mark 100, 1 rejects" in out and "reset b2: was high-water mark 7" in out
-    assert "reset b3: was no high-water mark" in out and "each of these beacons" in out
+    assert "reset Roof (010101): was high-water mark 100, 1 rejects" in out and "was high-water mark 7" in out
+    assert "was no high-water mark" in out and "each of these beacons" in out
     _, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "rejected" not in out
 
@@ -345,37 +410,38 @@ def test_all_on_an_empty_allowlist_is_not_an_error(cfg_file, capsys):
         assert code == 0, verb
 
 
-def test_name_and_all_are_mutually_exclusive_and_one_is_required(cfg_file, capsys):
+def test_a_prefix_and_all_are_mutually_exclusive_and_one_is_required(cfg_file, capsys):
     add_three(cfg_file, capsys)
     for verb in ("enable", "disable", "reset", "remove"):
-        code, _, err = run(cfg_file, "beacon", verb, "b1", "--all", capsys=capsys)
+        code, _, err = run(cfg_file, "beacon", verb, PREFIXES[0], "--all", capsys=capsys)
         assert code == 2 and "not both" in err, verb
         code, _, err = run(cfg_file, "beacon", verb, capsys=capsys)
         assert code == 2 and "--all" in err, verb
     _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
-    assert out.count("b1") == 1 and "b3" in out  # nothing was touched
+    assert all(p in out for p in PREFIXES)  # nothing was touched
 
 
 def test_single_beacon_forms_still_work(cfg_file, capsys):
     add_three(cfg_file, capsys)
-    assert run(cfg_file, "beacon", "disable", "b2") == 0
-    assert run(cfg_file, "beacon", "reset", "b1") == 0
-    assert run(cfg_file, "beacon", "remove", "b3") == 0
+    assert run(cfg_file, "beacon", "disable", PREFIXES[1]) == 0
+    assert run(cfg_file, "beacon", "reset", PREFIXES[0]) == 0
+    assert run(cfg_file, "beacon", "remove", PREFIXES[2]) == 0
     capsys.readouterr()
     code, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
-    assert "b3" not in out and "b1" in out
+    assert PREFIXES[2] not in out and PREFIXES[0] in out
 
 
 def test_add_all_adds_every_reported_beacon_that_is_not_listed(cfg_file, tmp_path, capsys):
-    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
-    run(cfg_file, "beacon", "add", "mine", bytes([1] * 8).hex())
+    run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
+    run(cfg_file, "beacon", "add", PREFIXES[0])
     new1, new2 = bytes.fromhex("f5b165224a58b791"), bytes.fromhex("7bd5d47e446fcec2")
-    feed(tmp_path, rx(REPEATER_A_KEY, obs(1, beacon=bytes([1] * 8)), obs(5, beacon=new1), obs(9, beacon=new2), t=time.time() - 5))
+    announce(tmp_path, new1, "Roof")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(1, beacon=bytes.fromhex(PREFIXES[0])), obs(5, beacon=new1), obs(9, beacon=new2), t=time.time() - 5))
     capsys.readouterr()
     code, out, _ = run(cfg_file, "beacon", "add", "--all", capsys=capsys)
     assert code == 0
-    assert "added beacon beacon-7bd5d4 (prefix 7bd5d47e446fcec2)" in out and "added beacon beacon-f5b165" in out
-    assert "added 2 beacon(s)" in out and "mine" not in out
+    assert f"added beacon {new1.hex()} (Roof)" in out and f"added beacon {new2.hex()} (no name announced yet)" in out
+    assert "added 2 beacon(s)" in out and PREFIXES[0] not in out
     _, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "not on the allowlist" not in out
     code, out, _ = run(cfg_file, "beacon", "add", "-a", capsys=capsys)
@@ -383,16 +449,14 @@ def test_add_all_adds_every_reported_beacon_that_is_not_listed(cfg_file, tmp_pat
 
 
 def test_add_all_options_and_conflicts(cfg_file, tmp_path, capsys):
-    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    run(cfg_file, "repeater", "add", REPEATER_A_KEY.hex(), "1", "1", "--name", "north")
     feed(tmp_path, rx(REPEATER_A_KEY, obs(5, beacon=bytes([8] * 8)), t=time.time() - 3 * 3600))
     code, out, _ = run(cfg_file, "beacon", "add", "--all", "--hours", "1", capsys=capsys)
     assert code == 0 and "nothing to add" in out  # reported 3 hours ago
-    code, out, _ = run(cfg_file, "beacon", "add", "--all", "--name-prefix", "tag", capsys=capsys)
-    assert code == 0 and "tag-080808" in out
-    for argv in (["x", "--all"], ["x", bytes(8).hex(), "--all"], ["--all", "--notes", "n"]):
+    for argv in (["x" * 16, "--all"], ["--all", "--notes", "n"]):
         code, _, err = run(cfg_file, "beacon", "add", *argv, capsys=capsys)
         assert code == 2 and "--all" in err
     code, _, err = run(cfg_file, "beacon", "add", capsys=capsys)
     assert code == 2 and "usage" in err
-    code, _, err = run(cfg_file, "beacon", "add", "only-a-name", capsys=capsys)
-    assert code == 2 and "usage" in err
+    code, out, _ = run(cfg_file, "beacon", "add", "--all", capsys=capsys)
+    assert code == 0 and "added 1 beacon(s)" in out

@@ -8,7 +8,7 @@ import os
 import subprocess
 import time
 
-from . import clock, health
+from . import clock, health, names
 from .config import Config
 from .store import Store, StoreError
 
@@ -59,10 +59,6 @@ def table(rows: list[list[str]], header: list[str]) -> str:
     return "\n".join(line.rstrip() for line in lines)
 
 
-def _name_or_prefix(names: dict[bytes, str], prefix: bytes) -> str:
-    return names.get(bytes(prefix)) or bytes(prefix).hex()
-
-
 def _open(cfg: Config) -> Store:
     return Store.open(cfg.db_path)
 
@@ -80,41 +76,48 @@ def clock_state(store: Store, cfg: Config) -> tuple[bool, str]:
 
 
 # --- beacons -------------------------------------------------------------------------------------------------------------
+#
+# Beacons are addressed by their key prefix (as 'beaconctl status' shows it), or by the start of it, at least six digits.
+# Names are what repeaters announced, for display; they are never used to find a beacon.
 
 
 def _one_or_all(args: argparse.Namespace) -> bool:
-    """True for --all. Exactly one of a beacon name and --all must be given."""
-    if args.all and args.name:
-        raise StoreError("give a beacon name or --all, not both")
-    if not args.all and not args.name:
-        raise StoreError("give a beacon name, or --all for every beacon on the allowlist")
+    """True for --all. Exactly one of a beacon reference and --all must be given."""
+    if args.all and args.ref:
+        raise StoreError("give a beacon prefix or --all, not both")
+    if not args.all and not args.ref:
+        raise StoreError("give a beacon key prefix, or --all for every beacon on the allowlist")
     return args.all
+
+
+def _beacon_label(b) -> str:
+    return names.label(b["name"], b["prefix"])
 
 
 def cmd_beacon_add(args: argparse.Namespace, cfg: Config) -> int:
     if args.all:
-        if args.name or args.prefix or args.notes:
-            raise StoreError("--all adds every beacon that was heard but is not on the allowlist; do not give a name or prefix")
+        if args.prefix or args.notes:
+            raise StoreError("--all adds every beacon that was reported but is not on the allowlist; do not give a prefix")
         with _open(cfg) as store:
-            added = store.add_heard_beacons(time.time() - args.hours * 3600, args.name_prefix)
+            added = store.add_heard_beacons(time.time() - args.hours * 3600)
         if not added:
             print(f"nothing to add: no beacons reported in the last {args.hours:g}h are missing from the allowlist")
             return 0
         for b in added:
-            print(f"added beacon {b['name']} (prefix {bytes(b['prefix']).hex()})")
+            print(f"added beacon {bytes(b['prefix']).hex()} ({b['name'] or 'no name announced yet'})")
         print(f"added {len(added)} beacon(s); the next report from each becomes its baseline")
         return 0
-    if not args.name or not args.prefix:
-        raise StoreError("usage: beacon add <name> <prefix>   or   beacon add --all")
+    if not args.prefix:
+        raise StoreError("usage: beacon add <prefix>   or   beacon add --all")
     with _open(cfg) as store:
-        b = store.add_beacon(args.name, args.prefix, args.notes or "")
-    print(f"added beacon {b['name']} (prefix {bytes(b['prefix']).hex()}); the next report becomes its baseline")
+        b = store.add_beacon(args.prefix, args.notes or "")
+    print(f"added beacon {bytes(b['prefix']).hex()} ({b['name'] or 'no name announced yet'}); the next report becomes its baseline")
     return 0
 
 
 def cmd_beacon_list(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        rows = [[b["name"], bytes(b["prefix"]).hex(), "yes" if b["enabled"] else "no", b["notes"]] for b in store.beacons()]
+        rows = [[b["name"] or "-", bytes(b["prefix"]).hex(), "yes" if b["enabled"] else "no", b["notes"]] for b in store.beacons()]
     print(table(rows, ["NAME", "PREFIX", "ENABLED", "NOTES"]) if rows else "no beacons")
     return 0
 
@@ -122,13 +125,11 @@ def cmd_beacon_list(args: argparse.Namespace, cfg: Config) -> int:
 def cmd_beacon_remove(args: argparse.Namespace, cfg: Config) -> int:
     everything = _one_or_all(args)
     with _open(cfg) as store:
-        names = store.remove_all_beacons() if everything else [args.name]
-        if not everything:
-            store.remove_beacon(args.name)
+        gone = store.remove_all_beacons() if everything else [store.remove_beacon(args.ref)]
     if everything:
-        print(f"removed {len(names)} beacon(s) from the allowlist; their history is kept")
+        print(f"removed {len(gone)} beacon(s) from the allowlist; their history is kept")
     else:
-        print(f"removed beacon {args.name}; its history is kept")
+        print(f"removed beacon {_beacon_label(gone[0])}; its history is kept")
     return 0
 
 
@@ -136,17 +137,14 @@ def cmd_beacon_enable(args: argparse.Namespace, cfg: Config) -> int:
     everything = _one_or_all(args)
     word = "enabled" if args.enable else "disabled"
     with _open(cfg) as store:
-        if everything:
-            names = store.set_all_beacons_enabled(args.enable)
-        else:
-            store.set_beacon_enabled(args.name, args.enable)
-    print(f"{len(names)} beacon(s) {word}" if everything else f"beacon {args.name} {word}")
+        changed = store.set_all_beacons_enabled(args.enable) if everything else [store.set_beacon_enabled(args.ref, args.enable)]
+    print(f"{len(changed)} beacon(s) {word}" if everything else f"beacon {_beacon_label(changed[0])} {word}")
     return 0
 
 
 def _describe_reset(info) -> str:
     was = "no high-water mark" if info.old_hwm is None else f"high-water mark {info.old_hwm}"
-    text = f"reset {info.name}: was {was}"
+    text = f"reset {names.label(info.name, info.prefix)}: was {was}"
     if info.rejects_since_accept:
         text += f", {info.rejects_since_accept} rejects since the last accepted report (last rejected counter {info.last_reject_counter})"
     return text
@@ -155,7 +153,7 @@ def _describe_reset(info) -> str:
 def cmd_beacon_reset(args: argparse.Namespace, cfg: Config) -> int:
     everything = _one_or_all(args)
     with _open(cfg) as store:
-        infos = store.reset_all_beacons() if everything else [store.reset_beacon(args.name)]
+        infos = store.reset_all_beacons() if everything else [store.reset_beacon(args.ref)]
     for info in infos:
         print(_describe_reset(info))
     if everything and not infos:
@@ -169,8 +167,8 @@ def cmd_beacon_reset(args: argparse.Namespace, cfg: Config) -> int:
 def cmd_beacon_status(args: argparse.Namespace, cfg: Config) -> int:
     now = time.time()
     with _open(cfg) as store:
-        b = store.beacon(args.name)
-        h = next(x for x in health.assess(store, cfg.beacon, now) if x.beacon["name"] == args.name)
+        b = store.beacon(args.ref)
+        h = next(x for x in health.assess(store, cfg.beacon, now) if bytes(x.beacon["prefix"]) == bytes(b["prefix"]))
         _, repeaters = store.names()
         heard = store.conn.execute(
             """SELECT repeater_prefix, count(*) AS n, max(rx_time) AS last, max(id) AS last_id
@@ -182,8 +180,10 @@ def cmd_beacon_status(args: argparse.Namespace, cfg: Config) -> int:
             bytes(r["repeater_prefix"]): store.conn.execute("SELECT rssi, snr_x4 FROM observations WHERE id = ?", (r["last_id"],)).fetchone()
             for r in heard
         }
-    print(f"{b['name']}  [{h.state}]")
+    print(f"{b['name'] or bytes(b['prefix']).hex()}  [{h.state}]")
     print(f"  key prefix         {bytes(b['prefix']).hex()}")
+    if b["notes"]:
+        print(f"  notes              {b['notes']}")
     print(f"  enabled            {'yes' if b['enabled'] else 'no'}")
     hwm = "none (next report becomes the baseline)" if b["hwm"] is None else f"{b['hwm']} (since {fmt_time(b['hwm_at'])})"
     print(f"  high-water mark    {hwm}")
@@ -196,17 +196,22 @@ def cmd_beacon_status(args: argparse.Namespace, cfg: Config) -> int:
     print("  heard by (24h)" + ("" if heard else "     -"))
     for r in heard:
         v = last[bytes(r["repeater_prefix"])]
-        print(f"    {_name_or_prefix(repeaters, r['repeater_prefix']):<16} {r['n']:>4} reports, last {fmt_age(r['last'], now)}, rssi {v['rssi']} dBm, snr {v['snr_x4'] / 4:+.2f} dB")
+        who = names.label(repeaters.get(bytes(r["repeater_prefix"])), r["repeater_prefix"])
+        print(f"    {who:<24} {r['n']:>4} reports, last {fmt_age(r['last'], now)}, rssi {v['rssi']} dBm, snr {v['snr_x4'] / 4:+.2f} dB")
     return 0
 
 
 # --- repeaters -----------------------------------------------------------------------------------------------------------
 
 
+def _repeater_label(r) -> str:
+    return names.label(r["name"], r["prefix"])
+
+
 def cmd_repeater_add(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        r = store.add_repeater(args.name, args.key, args.lat, args.lon, args.window)
-    print(f"added repeater {r['name']} (prefix {bytes(r['prefix']).hex()}) at {r['lat']:.6f}, {r['lon']:.6f}")
+        r = store.add_repeater(args.key, args.lat, args.lon, name=args.name, window_s=args.window)
+    print(f"added repeater {_repeater_label(r)} (prefix {bytes(r['prefix']).hex()}) at {r['lat']:.6f}, {r['lon']:.6f}")
     return 0
 
 
@@ -214,7 +219,7 @@ def cmd_repeater_list(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
         rows = [
             [
-                r["name"],
+                r["name"] or "-",
                 bytes(r["prefix"]).hex(),
                 f"{r['lat']:.6f}",
                 f"{r['lon']:.6f}",
@@ -229,22 +234,22 @@ def cmd_repeater_list(args: argparse.Namespace, cfg: Config) -> int:
 
 def cmd_repeater_remove(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        store.remove_repeater(args.name)
-    print(f"removed repeater {args.name}")
+        r = store.remove_repeater(args.ref)
+    print(f"removed repeater {_repeater_label(r)}")
     return 0
 
 
 def cmd_repeater_enable(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        store.set_repeater_enabled(args.name, args.enable)
-    print(f"repeater {args.name} {'enabled' if args.enable else 'disabled'}")
+        r = store.set_repeater_enabled(args.ref, args.enable)
+    print(f"repeater {_repeater_label(r)} {'enabled' if args.enable else 'disabled'}")
     return 0
 
 
 def cmd_repeater_window(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        store.set_repeater_window(args.name, args.seconds)
-    print(f"recorded beacon.window {args.seconds:g}s for {args.name}; set the same value on the repeater itself")
+        r = store.set_repeater_window(args.ref, args.seconds)
+    print(f"recorded beacon.window {args.seconds:g}s for {_repeater_label(r)}; set the same value on the repeater itself")
     return 0
 
 
@@ -266,7 +271,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
                 r = h.rejects
                 detail = (
                     f"{r.count} replays rejected since {fmt_clock(r.first_at)} (counters {r.min_counter}-{r.max_counter}, "
-                    f"hwm {b['hwm']}) via {', '.join(r.repeater_names)}; fix: beaconctl beacon reset {b['name']}"
+                    f"hwm {b['hwm']}) via {', '.join(r.repeater_names)}; fix: beaconctl beacon reset {bytes(b['prefix']).hex()}"
                 )
             elif h.state == health.SILENT:
                 detail = "never heard" if b["last_heard_at"] is None else f"not heard for {fmt_age(b['last_heard_at'], now).removesuffix(' ago')}"
@@ -280,7 +285,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
             rows.append(
                 [
                     h.state,
-                    b["name"],
+                    b["name"] or "-",
                     bytes(b["prefix"]).hex(),
                     "-" if b["hwm"] is None else str(b["hwm"]),
                     fmt_age(b["last_heard_at"], now),
@@ -296,22 +301,20 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         for u in unknown_b:
             prefix = bytes(u["beacon_prefix"])
             print(
-                f"  {prefix.hex()}  {u['n']} reports, {u['n_repeaters']} repeater(s), last {fmt_age(u['last_seen'], now)}, "
-                f"counter {u['last_counter']}   add: beaconctl beacon add <name> {prefix.hex()}"
+                f"  {prefix.hex()}  {repr(u['name']) if u['name'] else '(no name announced)'}  {u['n']} reports, "
+                f"{u['n_repeaters']} repeater(s), last {fmt_age(u['last_seen'], now)}, counter {u['last_counter']}"
+                f"   add: beaconctl beacon add {prefix.hex()}"
             )
     if unknown_r:
         print(f"\nrepeaters heard but not in the repeater table, their reports are ignored (last {args.hours:g}h):")
         for u in unknown_r:
-            print(
-                f"  {bytes(u['repeater_prefix']).hex()}  {u['n']} observations, last {fmt_age(u['last_seen'], now)}"
-                "   add: beaconctl repeater add <name> <key> <lat> <lon>"
-            )
+            prefix = bytes(u["repeater_prefix"]).hex()
+            print(f"  {prefix}  {u['n']} observations, last {fmt_age(u['last_seen'], now)}   add: beaconctl repeater add {prefix} <lat> <lon>")
     return 0
 
 
 def cmd_rejects(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
-        beacons, repeaters = store.names()
         rows = store.rejects(args.beacon, args.limit)
         bad = store.bad_reports(5) if args.beacon is None else []
         out = []
@@ -322,8 +325,8 @@ def cmd_rejects(args: argparse.Namespace, cfg: Config) -> int:
                 [
                     fmt_time(r["rx_time"]) + ("" if r["time_trusted"] else "?"),
                     what,
-                    _name_or_prefix(beacons, r["beacon_prefix"]),
-                    _name_or_prefix(repeaters, r["repeater_prefix"]),
+                    names.label(r["beacon_name"], r["beacon_prefix"]),
+                    names.label(r["repeater_name"], r["repeater_prefix"]),
                     f"counter {r['counter']}{hwm}",
                 ]
             )
@@ -423,14 +426,14 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
     for r in repeaters:
         w = r["window_s"]
         if w is None:
-            problems.append(f"repeater {r['name']}: beacon.window not recorded; set it with 'beaconctl repeater window'")
+            problems.append(f"repeater {_repeater_label(r)}: beacon.window not recorded; set it with 'beaconctl repeater window'")
         elif w >= shortest:
             problems.append(
-                f"repeater {r['name']}: beacon.window {w:g}s is not below the shortest beacon interval ({shortest:g}s); "
+                f"repeater {_repeater_label(r)}: beacon.window {w:g}s is not below the shortest beacon interval ({shortest:g}s); "
                 "reports for one transmission will arrive after the next and be rejected as late"
             )
         elif w > advised:
-            problems.append(f"repeater {r['name']}: beacon.window {w:g}s is above the advised {advised:g}s (80% of the beacon interval)")
+            problems.append(f"repeater {_repeater_label(r)}: beacon.window {w:g}s is above the advised {advised:g}s (80% of the beacon interval)")
     for p in problems:
         print(f"warning: {p}")
     if not problems:

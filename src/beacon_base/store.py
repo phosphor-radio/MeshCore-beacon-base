@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from . import names as names_mod
 from . import wire
 
 PUBKEY_LEN = 32
@@ -34,7 +35,6 @@ MIGRATIONS: list[tuple[str, ...]] = [
     (
         """CREATE TABLE beacons (
             prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),  -- the 8-byte key prefix reports identify a beacon by
-            name TEXT NOT NULL UNIQUE,
             enabled INTEGER NOT NULL DEFAULT 1,
             hwm INTEGER,                      -- highest accepted counter; NULL: the next report becomes the baseline
             hwm_at REAL,
@@ -47,10 +47,17 @@ MIGRATIONS: list[tuple[str, ...]] = [
             last_reject_counter INTEGER,
             rejects_since_accept INTEGER NOT NULL DEFAULT 0
         )""",
+        """CREATE TABLE beacon_names (
+            prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),  -- announced by repeaters, so it exists before the beacon is added
+            name TEXT NOT NULL,
+            first_seen REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            repeater_prefix BLOB NOT NULL     -- who announced it last
+        )""",
         """CREATE TABLE repeaters (
             prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),
             pubkey BLOB UNIQUE CHECK (pubkey IS NULL OR length(pubkey) = 32),
-            name TEXT NOT NULL UNIQUE,
+            name TEXT,                        -- operator-assigned, optional, not unique
             lat REAL NOT NULL,
             lon REAL NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -124,7 +131,8 @@ class StoreError(Exception):
 
 @dataclass(frozen=True)
 class ResetInfo:
-    name: str
+    prefix: bytes
+    name: str | None
     old_hwm: int | None
     last_reject_counter: int | None
     rejects_since_accept: int
@@ -132,6 +140,17 @@ class ResetInfo:
 
 def _hex(b: bytes) -> str:
     return b.hex()
+
+
+def _ref_digits(ref: str, what: str) -> str:
+    """Normalise a command-line key reference to lowercase hex digits: at least six, and at most the 16 of a prefix (a longer
+    string, such as a full key, is cut to its first 16)."""
+    digits = ref.strip().lower()
+    if not digits or any(c not in "0123456789abcdef" for c in digits):
+        raise StoreError(f"{ref!r} is not a hex key prefix; give the start of the {what}'s key prefix, as 'beaconctl status' shows")
+    if len(digits) < names_mod.MIN_REF_DIGITS:
+        raise StoreError(f"give at least {names_mod.MIN_REF_DIGITS} hex digits of the {what}'s key prefix, got {len(digits)}")
+    return digits[: 2 * wire.ID_LEN]
 
 
 def parse_hex_key(text: str, what: str, lengths: tuple[int, ...]) -> bytes:
@@ -213,64 +232,73 @@ class Store:
             self.conn.execute("COMMIT")
 
     # --- beacons -------------------------------------------------------------------------------------------------------
+    #
+    # A beacon is its 8-byte key prefix. Its name is whatever repeaters last announced for that prefix (beacon_names), shown
+    # for display only; names are not unique and never used to find a beacon.
 
-    def add_beacon(self, name: str, key_hex: str, notes: str = "", now: float | None = None) -> sqlite3.Row:
+    _BEACON_SELECT = "SELECT b.*, n.name AS name FROM beacons b LEFT JOIN beacon_names n ON n.prefix = b.prefix"
+
+    def add_beacon(self, key_hex: str, notes: str = "", now: float | None = None) -> sqlite3.Row:
         """Allowlist a beacon by the 8-byte public key prefix its reports carry (16 hex characters). A full 64-character
         key is accepted for convenience, for example pasted from the beacon's serial 'pubkey' command; only its prefix is
         kept, since that is all the base ever sees."""
         raw = parse_hex_key(key_hex, "beacon key prefix", (wire.ID_LEN, PUBKEY_LEN))
-        name = self._check_name(name)
         prefix = raw[: wire.ID_LEN]
         with self.transaction() as db:
-            by_prefix = db.execute("SELECT name FROM beacons WHERE prefix = ?", (prefix,)).fetchone()
-            if by_prefix is not None:
-                raise StoreError(f"beacon {by_prefix['name']!r} already has the prefix {_hex(prefix)}")
-            if db.execute("SELECT 1 FROM beacons WHERE name = ?", (name,)).fetchone() is not None:
-                raise StoreError(f"a beacon named {name!r} already exists")
+            if db.execute("SELECT 1 FROM beacons WHERE prefix = ?", (prefix,)).fetchone() is not None:
+                raise StoreError(f"beacon {_hex(prefix)} is already on the allowlist")
             db.execute(
-                "INSERT INTO beacons (prefix, name, notes, created_at) VALUES (?, ?, ?, ?)",
-                (prefix, name, notes, time.time() if now is None else now),
+                "INSERT INTO beacons (prefix, notes, created_at) VALUES (?, ?, ?)",
+                (prefix, notes, time.time() if now is None else now),
             )
-        return self.beacon(name)
+        return self.beacon_by_prefix(prefix)
 
-    @staticmethod
-    def _check_name(name: str) -> str:
-        name = name.strip()
-        if not name or any(c.isspace() for c in name):
-            raise StoreError("names must be non-empty and contain no whitespace")
-        return name
-
-    def beacon(self, name: str) -> sqlite3.Row:
-        row = self.conn.execute("SELECT * FROM beacons WHERE name = ?", (name,)).fetchone()
+    def beacon_by_prefix(self, prefix: bytes) -> sqlite3.Row:
+        row = self.conn.execute(self._BEACON_SELECT + " WHERE b.prefix = ?", (bytes(prefix),)).fetchone()
         if row is None:
-            raise StoreError(f"no beacon named {name!r}")
+            raise StoreError(f"no beacon with the prefix {_hex(bytes(prefix))}")
         return row
 
     def beacons(self) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM beacons ORDER BY name").fetchall()
+        """The allowlist, by announced name (beacons without one last), then prefix."""
+        return self.conn.execute(self._BEACON_SELECT + " ORDER BY n.name IS NULL, lower(n.name), b.prefix").fetchall()
 
-    def remove_beacon(self, name: str) -> None:
-        with self.transaction() as db:
-            self.beacon(name)
-            db.execute("DELETE FROM beacons WHERE name = ?", (name,))
+    def beacon(self, ref: str) -> sqlite3.Row:
+        """The allowlisted beacon a command-line reference names: its key prefix, or the start of it (at least six hex
+        digits) when that is unambiguous. A longer string, such as a full key, is read as its first 16 digits."""
+        digits = _ref_digits(ref, "beacon")
+        found = [b for b in self.beacons() if bytes(b["prefix"]).hex().startswith(digits)]
+        if not found:
+            raise StoreError(f"no beacon on the allowlist matches {ref!r}")
+        if len(found) > 1:
+            options = ", ".join(names_mod.label(b["name"], b["prefix"]) for b in found)
+            raise StoreError(f"{ref!r} matches {len(found)} beacons: {options}; give more of the prefix")
+        return found[0]
 
-    def remove_all_beacons(self) -> list[str]:
-        """Empty the allowlist (observation history is kept). Returns the names removed."""
+    def remove_beacon(self, ref: str) -> sqlite3.Row:
         with self.transaction() as db:
-            names = [r["name"] for r in db.execute("SELECT name FROM beacons ORDER BY name")]
+            b = self.beacon(ref)
+            db.execute("DELETE FROM beacons WHERE prefix = ?", (b["prefix"],))
+        return b
+
+    def remove_all_beacons(self) -> list[sqlite3.Row]:
+        """Empty the allowlist (observation history is kept). Returns the beacons removed."""
+        with self.transaction() as db:
+            gone = self.beacons()
             db.execute("DELETE FROM beacons")
-        return names
+        return gone
 
-    def set_beacon_enabled(self, name: str, enabled: bool) -> None:
+    def set_beacon_enabled(self, ref: str, enabled: bool) -> sqlite3.Row:
         with self.transaction() as db:
-            self.beacon(name)
-            db.execute("UPDATE beacons SET enabled = ? WHERE name = ?", (int(enabled), name))
+            b = self.beacon(ref)
+            db.execute("UPDATE beacons SET enabled = ? WHERE prefix = ?", (int(enabled), b["prefix"]))
+        return b
 
-    def set_all_beacons_enabled(self, enabled: bool) -> list[str]:
+    def set_all_beacons_enabled(self, enabled: bool) -> list[sqlite3.Row]:
         with self.transaction() as db:
-            names = [r["name"] for r in db.execute("SELECT name FROM beacons ORDER BY name")]
+            changed = self.beacons()
             db.execute("UPDATE beacons SET enabled = ?", (int(enabled),))
-        return names
+        return changed
 
     @staticmethod
     def _reset(db: sqlite3.Connection, b: sqlite3.Row) -> ResetInfo:
@@ -278,21 +306,20 @@ class Store:
             "UPDATE beacons SET hwm = NULL, hwm_at = NULL, epoch = epoch + 1, rejects_since_accept = 0 WHERE prefix = ?",
             (b["prefix"],),
         )
-        return ResetInfo(b["name"], b["hwm"], b["last_reject_counter"], b["rejects_since_accept"])
+        return ResetInfo(bytes(b["prefix"]), b["name"], b["hwm"], b["last_reject_counter"], b["rejects_since_accept"])
 
-    def reset_beacon(self, name: str) -> ResetInfo:
+    def reset_beacon(self, ref: str) -> ResetInfo:
         """Clear the high-water mark so the next report becomes the new baseline, and clear the rejected state."""
         with self.transaction() as db:
-            return self._reset(db, self.beacon(name))
+            return self._reset(db, self.beacon(ref))
 
     def reset_all_beacons(self) -> list[ResetInfo]:
         with self.transaction() as db:
-            return [self._reset(db, b) for b in db.execute("SELECT * FROM beacons ORDER BY name").fetchall()]
+            return [self._reset(db, b) for b in self.beacons()]
 
-    def add_heard_beacons(self, since: float, name_prefix: str = "beacon", now: float | None = None) -> list[sqlite3.Row]:
+    def add_heard_beacons(self, since: float, now: float | None = None) -> list[sqlite3.Row]:
         """Add every beacon prefix that repeaters have reported since `since` but that is not on the allowlist, in one
-        transaction. Each is named <name_prefix>-<first hex digits of its prefix>, with more digits if that name is taken."""
-        name_prefix = self._check_name(name_prefix)
+        transaction."""
         stamp = time.time() if now is None else now
         with self.transaction() as db:
             heard = db.execute(
@@ -301,28 +328,37 @@ class Store:
                    ORDER BY beacon_prefix""",
                 (UNKNOWN_BEACON, since),
             ).fetchall()
-            taken = {r["name"] for r in db.execute("SELECT name FROM beacons")}
-            added = []
             for row in heard:
-                prefix = bytes(row["beacon_prefix"])
-                digits = 6
-                while f"{name_prefix}-{prefix.hex()[:digits]}" in taken and digits < 2 * wire.ID_LEN:
-                    digits += 2
-                name = f"{name_prefix}-{prefix.hex()[:digits]}"
-                if name in taken:
-                    raise StoreError(f"cannot find a free name for {prefix.hex()} starting with {name_prefix!r}")
-                taken.add(name)
-                db.execute("INSERT INTO beacons (prefix, name, created_at) VALUES (?, ?, ?)", (prefix, name, stamp))
-                added.append(name)
-            return [db.execute("SELECT * FROM beacons WHERE name = ?", (n,)).fetchone() for n in added]
+                db.execute("INSERT INTO beacons (prefix, created_at) VALUES (?, ?)", (bytes(row["beacon_prefix"]), stamp))
+            return [self.beacon_by_prefix(bytes(r["beacon_prefix"])) for r in heard]
+
+    # --- announced names ---------------------------------------------------------------------------------------------
+
+    def record_name(self, prefix: bytes, name: str, repeater_prefix: bytes, now: float | None = None) -> str | None:
+        """Store the name a repeater announced for a beacon prefix; the latest announcement wins. Returns the previous name
+        (None if there was none). Call inside a transaction."""
+        stamp = time.time() if now is None else now
+        old = self.conn.execute("SELECT name FROM beacon_names WHERE prefix = ?", (bytes(prefix),)).fetchone()
+        self.conn.execute(
+            """INSERT INTO beacon_names (prefix, name, first_seen, updated_at, repeater_prefix) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (prefix) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at,
+                                                  repeater_prefix = excluded.repeater_prefix""",
+            (bytes(prefix), name, stamp, stamp, bytes(repeater_prefix)),
+        )
+        return old["name"] if old is not None else None
+
+    def beacon_name(self, prefix: bytes) -> str | None:
+        row = self.conn.execute("SELECT name FROM beacon_names WHERE prefix = ?", (bytes(prefix),)).fetchone()
+        return row["name"] if row is not None else None
 
     # --- repeaters -------------------------------------------------------------------------------------------------
 
     def add_repeater(
-        self, name: str, key_hex: str, lat: float, lon: float, window_s: float | None = None
+        self, key_hex: str, lat: float, lon: float, name: str | None = None, window_s: float | None = None
     ) -> sqlite3.Row:
         raw = parse_hex_key(key_hex, "repeater public key or prefix", (wire.ID_LEN, PUBKEY_LEN))
-        name = self._check_name(name)
+        if name is not None:
+            name = names_mod.clean_name(name, 64)
         if not -90 <= lat <= 90 or not -180 <= lon <= 180:
             raise StoreError("latitude must be within +/-90 and longitude within +/-180")
         if window_s is not None and window_s <= 0:
@@ -330,56 +366,73 @@ class Store:
         prefix = raw[: wire.ID_LEN]
         pubkey = raw if len(raw) == PUBKEY_LEN else None
         with self.transaction() as db:
-            clash = db.execute("SELECT name, prefix FROM repeaters WHERE prefix = ? OR name = ?", (prefix, name)).fetchone()
+            clash = db.execute("SELECT name FROM repeaters WHERE prefix = ?", (prefix,)).fetchone()
             if clash is not None:
-                if bytes(clash["prefix"]) == prefix:
-                    raise StoreError(f"repeater {clash['name']!r} already has the prefix {_hex(prefix)}")
-                raise StoreError(f"a repeater named {name!r} already exists")
+                raise StoreError(f"repeater {names_mod.label(clash['name'], prefix)} is already in the repeater table")
             db.execute(
                 "INSERT INTO repeaters (prefix, pubkey, name, lat, lon, window_s) VALUES (?, ?, ?, ?, ?, ?)",
                 (prefix, pubkey, name, lat, lon, window_s),
             )
-        return self.repeater(name)
+        return self.repeater(prefix.hex())
 
-    def repeater(self, name: str) -> sqlite3.Row:
-        row = self.conn.execute("SELECT * FROM repeaters WHERE name = ?", (name,)).fetchone()
-        if row is None:
-            raise StoreError(f"no repeater named {name!r}")
-        return row
+    def repeater(self, ref: str) -> sqlite3.Row:
+        """The repeater a command-line reference names: the start of its key prefix (at least six hex digits) or its name,
+        whichever matches exactly one repeater."""
+        ref = ref.strip()
+        digits = ref.lower()
+        by_prefix = []
+        if len(digits) >= names_mod.MIN_REF_DIGITS and all(c in "0123456789abcdef" for c in digits):
+            digits = digits[: 2 * wire.ID_LEN]
+            by_prefix = [r for r in self.repeaters() if bytes(r["prefix"]).hex().startswith(digits)]
+        by_name = [r for r in self.repeaters() if r["name"] and r["name"].lower() == ref.lower()]
+        found = {bytes(r["prefix"]): r for r in by_prefix + by_name}
+        if not found:
+            raise StoreError(f"no repeater matches {ref!r}")
+        if len(found) > 1:
+            options = ", ".join(names_mod.label(r["name"], r["prefix"]) for r in found.values())
+            raise StoreError(f"{ref!r} matches {len(found)} repeaters: {options}; use the key prefix")
+        return next(iter(found.values()))
 
     def repeaters(self) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM repeaters ORDER BY name").fetchall()
+        return self.conn.execute("SELECT * FROM repeaters ORDER BY name IS NULL, lower(name), prefix").fetchall()
 
-    def remove_repeater(self, name: str) -> None:
+    def remove_repeater(self, ref: str) -> sqlite3.Row:
         with self.transaction() as db:
-            self.repeater(name)
-            db.execute("DELETE FROM repeaters WHERE name = ?", (name,))
+            r = self.repeater(ref)
+            db.execute("DELETE FROM repeaters WHERE prefix = ?", (r["prefix"],))
+        return r
 
-    def set_repeater_enabled(self, name: str, enabled: bool) -> None:
+    def set_repeater_enabled(self, ref: str, enabled: bool) -> sqlite3.Row:
         with self.transaction() as db:
-            self.repeater(name)
-            db.execute("UPDATE repeaters SET enabled = ? WHERE name = ?", (int(enabled), name))
+            r = self.repeater(ref)
+            db.execute("UPDATE repeaters SET enabled = ? WHERE prefix = ?", (int(enabled), r["prefix"]))
+        return r
 
-    def set_repeater_window(self, name: str, window_s: float | None) -> None:
+    def set_repeater_window(self, ref: str, window_s: float | None) -> sqlite3.Row:
         if window_s is not None and window_s <= 0:
             raise StoreError("window must be positive")
         with self.transaction() as db:
-            self.repeater(name)
-            db.execute("UPDATE repeaters SET window_s = ? WHERE name = ?", (window_s, name))
+            r = self.repeater(ref)
+            db.execute("UPDATE repeaters SET window_s = ? WHERE prefix = ?", (window_s, r["prefix"]))
+        return r
 
     def names(self) -> tuple[dict[bytes, str], dict[bytes, str]]:
-        """(beacon prefix -> name, repeater prefix -> name), for display."""
-        beacons = {bytes(r["prefix"]): r["name"] for r in self.conn.execute("SELECT prefix, name FROM beacons")}
-        repeaters = {bytes(r["prefix"]): r["name"] for r in self.conn.execute("SELECT prefix, name FROM repeaters")}
+        """(beacon prefix -> announced name, repeater prefix -> operator name), for display. Entries without a name are
+        left out."""
+        beacons = {bytes(r["prefix"]): r["name"] for r in self.conn.execute("SELECT prefix, name FROM beacon_names")}
+        repeaters = {
+            bytes(r["prefix"]): r["name"] for r in self.conn.execute("SELECT prefix, name FROM repeaters WHERE name IS NOT NULL")
+        }
         return beacons, repeaters
 
     # --- observations --------------------------------------------------------------------------------------------------
 
     def rejects(self, beacon: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
         """Recent observations that were not accepted (newest first), with the beacon's current high-water mark."""
-        sql = """SELECT o.*, b.name AS beacon_name, b.hwm AS beacon_hwm, r.name AS repeater_name
+        sql = """SELECT o.*, n.name AS beacon_name, b.hwm AS beacon_hwm, r.name AS repeater_name
                  FROM observations o
                  LEFT JOIN beacons b ON b.prefix = o.beacon_prefix
+                 LEFT JOIN beacon_names n ON n.prefix = o.beacon_prefix
                  LEFT JOIN repeaters r ON r.prefix = o.repeater_prefix
                  WHERE o.status NOT IN ('accepted', 'duplicate')"""
         args: list = []
@@ -399,10 +452,11 @@ class Store:
     def unknown_beacons(self, since: float) -> list[sqlite3.Row]:
         """Beacon prefixes that were reported but are not on the allowlist, one row per prefix."""
         return self.conn.execute(
-            """SELECT beacon_prefix, count(*) AS n, max(rx_time) AS last_seen, max(counter) AS last_counter,
-                      count(DISTINCT repeater_prefix) AS n_repeaters
-               FROM observations WHERE status = ? AND rx_time >= ? AND beacon_prefix NOT IN (SELECT prefix FROM beacons)
-               GROUP BY beacon_prefix ORDER BY last_seen DESC""",
+            """SELECT o.beacon_prefix, count(*) AS n, max(o.rx_time) AS last_seen, max(o.counter) AS last_counter,
+                      count(DISTINCT o.repeater_prefix) AS n_repeaters, bn.name AS name
+               FROM observations o LEFT JOIN beacon_names bn ON bn.prefix = o.beacon_prefix
+               WHERE o.status = ? AND o.rx_time >= ? AND o.beacon_prefix NOT IN (SELECT prefix FROM beacons)
+               GROUP BY o.beacon_prefix ORDER BY last_seen DESC""",
             (UNKNOWN_BEACON, since),
         ).fetchall()
 
