@@ -189,6 +189,45 @@ beacon-ingest --port /tmp/fake-companion-XXXX/ttyFAKE
 beaconctl status
 ```
 
+## Beacon repeater CLI
+
+The repeaters are MeshCore repeaters built with the beacon reporter (firmware repository, `WITH_BEACON_REPORTER`; the
+`Xiao_nrf52_beacon_repeater`, `Xiao_S3_beacon_repeater` and `Xiao_S3_WIO_beacon_repeater` environments). They have the stock
+repeater CLI plus the `beacon.*` commands below, over the repeater's serial port or remotely from the MeshCore app. A repeater
+hears beacon adverts, does not forward them, and reports them to the base on a private channel: observations (`0xFFBE`) every
+`beacon.window` seconds, and the beacons' names (`0xFFBF`) when it first hears a beacon, when a name changes and on a refresh
+timer. **Nothing is sent until a channel is set.** The commands are documented in full in the firmware repository's
+`docs/cli_commands.md`.
+
+| Command | What it does |
+|---|---|
+| `beacon.channel` | Show whether the report channel is set, and its hash byte. The secret is never shown. |
+| `beacon.channel <hex>` | Set the channel secret: 32 hex characters (128 bits, the only size companions support) or 64. Use the key from `beaconctl channel show`. Saved. |
+| `beacon.channel clear` | Forget the channel; the repeater goes back to only logging. |
+| `beacon.window` / `beacon.window <secs>` | Show or set how long a partial batch waits before it is sent (1-3600, default 60). Keep it below the shortest beacon interval (80% of it is the advice, 240 s for the default 300 s) or the base rejects the late reports. For a 30 s test interval use about 20. Tell the base with `beaconctl repeater window`; `beaconctl check` compares them. |
+| `beacon.names` / `beacon.names on\|off` | Show or switch name announcements (default on). Beacons without a name are not announced. |
+| `beacon.name_refresh` / `beacon.name_refresh <hours>` | Show or set how often a beacon's name is announced again (0-8760, default 4; `0` announces only on first sight or when the name changes). |
+| `beacon.log on\|off` | Print each beacon heard (`BEACON <id> counter=... rssi=... snr=... batt=...mV name="..."`) and each name queued (`NAME <id> "..." (first\|changed\|refresh)`) to the serial terminal. Not saved; off after a reboot. |
+| `beacon.stats` | Counters: beacons heard, observations reported, dropped, send failures, pending in the current batch, names sent. |
+
+Setting up a repeater so the base picks it up (see "Repeater positions and names" and "Discovering the mesh, then locking it"
+above):
+
+```
+beacon.channel <hex from 'beaconctl channel show'>
+beacon.window 60            # below 80% of the beacon interval
+set lat <degrees>           # normally set from the app using the phone's location
+set lon <degrees>
+set name <name>             # optional; the base shows the advertised name
+advert                      # send a flood advert now, instead of waiting for flood.advert.interval (default 47 h)
+beacon.log on               # bring-up: watch the beacons it hears
+```
+
+Stock repeater commands that matter here: `advert` (flood advert now), `set lat` / `set lon` (the position the base learns),
+`set name`, `get public.key`, and `get` / `set flood.advert.interval <hours>` (3-168, default 47) for how soon a changed
+position or name reaches the base. After a change, `beaconctl status` and `beaconctl repeater list` on the base show what
+arrived.
+
 ## Roadmap
 
 | Phase | Scope |
