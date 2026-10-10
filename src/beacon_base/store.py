@@ -254,20 +254,67 @@ class Store:
             self.beacon(name)
             db.execute("DELETE FROM beacons WHERE name = ?", (name,))
 
+    def remove_all_beacons(self) -> list[str]:
+        """Empty the allowlist (observation history is kept). Returns the names removed."""
+        with self.transaction() as db:
+            names = [r["name"] for r in db.execute("SELECT name FROM beacons ORDER BY name")]
+            db.execute("DELETE FROM beacons")
+        return names
+
     def set_beacon_enabled(self, name: str, enabled: bool) -> None:
         with self.transaction() as db:
             self.beacon(name)
             db.execute("UPDATE beacons SET enabled = ? WHERE name = ?", (int(enabled), name))
 
+    def set_all_beacons_enabled(self, enabled: bool) -> list[str]:
+        with self.transaction() as db:
+            names = [r["name"] for r in db.execute("SELECT name FROM beacons ORDER BY name")]
+            db.execute("UPDATE beacons SET enabled = ?", (int(enabled),))
+        return names
+
+    @staticmethod
+    def _reset(db: sqlite3.Connection, b: sqlite3.Row) -> ResetInfo:
+        db.execute(
+            "UPDATE beacons SET hwm = NULL, hwm_at = NULL, epoch = epoch + 1, rejects_since_accept = 0 WHERE prefix = ?",
+            (b["prefix"],),
+        )
+        return ResetInfo(b["name"], b["hwm"], b["last_reject_counter"], b["rejects_since_accept"])
+
     def reset_beacon(self, name: str) -> ResetInfo:
         """Clear the high-water mark so the next report becomes the new baseline, and clear the rejected state."""
         with self.transaction() as db:
-            b = self.beacon(name)
-            db.execute(
-                "UPDATE beacons SET hwm = NULL, hwm_at = NULL, epoch = epoch + 1, rejects_since_accept = 0 WHERE name = ?",
-                (name,),
-            )
-        return ResetInfo(name, b["hwm"], b["last_reject_counter"], b["rejects_since_accept"])
+            return self._reset(db, self.beacon(name))
+
+    def reset_all_beacons(self) -> list[ResetInfo]:
+        with self.transaction() as db:
+            return [self._reset(db, b) for b in db.execute("SELECT * FROM beacons ORDER BY name").fetchall()]
+
+    def add_heard_beacons(self, since: float, name_prefix: str = "beacon", now: float | None = None) -> list[sqlite3.Row]:
+        """Add every beacon prefix that repeaters have reported since `since` but that is not on the allowlist, in one
+        transaction. Each is named <name_prefix>-<first hex digits of its prefix>, with more digits if that name is taken."""
+        name_prefix = self._check_name(name_prefix)
+        stamp = time.time() if now is None else now
+        with self.transaction() as db:
+            heard = db.execute(
+                """SELECT DISTINCT beacon_prefix FROM observations
+                   WHERE status = ? AND rx_time >= ? AND beacon_prefix NOT IN (SELECT prefix FROM beacons)
+                   ORDER BY beacon_prefix""",
+                (UNKNOWN_BEACON, since),
+            ).fetchall()
+            taken = {r["name"] for r in db.execute("SELECT name FROM beacons")}
+            added = []
+            for row in heard:
+                prefix = bytes(row["beacon_prefix"])
+                digits = 6
+                while f"{name_prefix}-{prefix.hex()[:digits]}" in taken and digits < 2 * wire.ID_LEN:
+                    digits += 2
+                name = f"{name_prefix}-{prefix.hex()[:digits]}"
+                if name in taken:
+                    raise StoreError(f"cannot find a free name for {prefix.hex()} starting with {name_prefix!r}")
+                taken.add(name)
+                db.execute("INSERT INTO beacons (prefix, name, created_at) VALUES (?, ?, ?)", (prefix, name, stamp))
+                added.append(name)
+            return [db.execute("SELECT * FROM beacons WHERE name = ?", (n,)).fetchone() for n in added]
 
     # --- repeaters -------------------------------------------------------------------------------------------------
 

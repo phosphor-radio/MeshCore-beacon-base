@@ -82,7 +82,30 @@ def clock_state(store: Store, cfg: Config) -> tuple[bool, str]:
 # --- beacons -------------------------------------------------------------------------------------------------------------
 
 
+def _one_or_all(args: argparse.Namespace) -> bool:
+    """True for --all. Exactly one of a beacon name and --all must be given."""
+    if args.all and args.name:
+        raise StoreError("give a beacon name or --all, not both")
+    if not args.all and not args.name:
+        raise StoreError("give a beacon name, or --all for every beacon on the allowlist")
+    return args.all
+
+
 def cmd_beacon_add(args: argparse.Namespace, cfg: Config) -> int:
+    if args.all:
+        if args.name or args.prefix or args.notes:
+            raise StoreError("--all adds every beacon that was heard but is not on the allowlist; do not give a name or prefix")
+        with _open(cfg) as store:
+            added = store.add_heard_beacons(time.time() - args.hours * 3600, args.name_prefix)
+        if not added:
+            print(f"nothing to add: no beacons reported in the last {args.hours:g}h are missing from the allowlist")
+            return 0
+        for b in added:
+            print(f"added beacon {b['name']} (prefix {bytes(b['prefix']).hex()})")
+        print(f"added {len(added)} beacon(s); the next report from each becomes its baseline")
+        return 0
+    if not args.name or not args.prefix:
+        raise StoreError("usage: beacon add <name> <prefix>   or   beacon add --all")
     with _open(cfg) as store:
         b = store.add_beacon(args.name, args.prefix, args.notes or "")
     print(f"added beacon {b['name']} (prefix {bytes(b['prefix']).hex()}); the next report becomes its baseline")
@@ -97,28 +120,49 @@ def cmd_beacon_list(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_beacon_remove(args: argparse.Namespace, cfg: Config) -> int:
+    everything = _one_or_all(args)
     with _open(cfg) as store:
-        store.remove_beacon(args.name)
-    print(f"removed beacon {args.name}; its history is kept")
+        names = store.remove_all_beacons() if everything else [args.name]
+        if not everything:
+            store.remove_beacon(args.name)
+    if everything:
+        print(f"removed {len(names)} beacon(s) from the allowlist; their history is kept")
+    else:
+        print(f"removed beacon {args.name}; its history is kept")
     return 0
 
 
 def cmd_beacon_enable(args: argparse.Namespace, cfg: Config) -> int:
+    everything = _one_or_all(args)
+    word = "enabled" if args.enable else "disabled"
     with _open(cfg) as store:
-        store.set_beacon_enabled(args.name, args.enable)
-    print(f"beacon {args.name} {'enabled' if args.enable else 'disabled'}")
+        if everything:
+            names = store.set_all_beacons_enabled(args.enable)
+        else:
+            store.set_beacon_enabled(args.name, args.enable)
+    print(f"{len(names)} beacon(s) {word}" if everything else f"beacon {args.name} {word}")
     return 0
 
 
-def cmd_beacon_reset(args: argparse.Namespace, cfg: Config) -> int:
-    with _open(cfg) as store:
-        info = store.reset_beacon(args.name)
+def _describe_reset(info) -> str:
     was = "no high-water mark" if info.old_hwm is None else f"high-water mark {info.old_hwm}"
-    print(f"reset {info.name}: was {was}", end="")
+    text = f"reset {info.name}: was {was}"
     if info.rejects_since_accept:
-        print(f", {info.rejects_since_accept} rejects since the last accepted report (last rejected counter {info.last_reject_counter})", end="")
-    print()
-    print("the next report from this beacon becomes its new baseline; do this while it is transmitting")
+        text += f", {info.rejects_since_accept} rejects since the last accepted report (last rejected counter {info.last_reject_counter})"
+    return text
+
+
+def cmd_beacon_reset(args: argparse.Namespace, cfg: Config) -> int:
+    everything = _one_or_all(args)
+    with _open(cfg) as store:
+        infos = store.reset_all_beacons() if everything else [store.reset_beacon(args.name)]
+    for info in infos:
+        print(_describe_reset(info))
+    if everything and not infos:
+        print("no beacons")
+        return 0
+    which = "each of these beacons" if everything else "this beacon"
+    print(f"the next report from {which} becomes its new baseline; do this while they are transmitting")
     return 0
 
 

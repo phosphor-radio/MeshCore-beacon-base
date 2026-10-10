@@ -192,24 +192,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_admin_commands(sub) -> None:
     beacon = sub.add_parser("beacon", help="beacon allowlist").add_subparsers(dest="beacon_command", required=True)
-    p = beacon.add_parser("add", help="allowlist a beacon by the 8-byte key prefix its reports carry")
-    p.add_argument("name")
-    p.add_argument("prefix", help="16 hex characters, as listed by 'beaconctl status' (a full 64-character key is also accepted)")
+    p = beacon.add_parser("add", help="allowlist a beacon by the 8-byte key prefix its reports carry, or every heard one with --all")
+    p.add_argument("name", nargs="?")
+    p.add_argument("prefix", nargs="?", help="16 hex characters, as listed by 'beaconctl status' (a full 64-character key is also accepted)")
     p.add_argument("--notes")
+    p.add_argument("-a", "--all", action="store_true", help="add every beacon repeaters have reported that is not on the allowlist")
+    p.add_argument("--hours", type=float, default=24.0, help="with --all: how far back to look for reported beacons")
+    p.add_argument("--name-prefix", default="beacon", help="with --all: names are <prefix>-<first hex digits of the key prefix>")
     p.set_defaults(func=admin.cmd_beacon_add)
     beacon.add_parser("list", help="list allowlisted beacons").set_defaults(func=admin.cmd_beacon_list)
     p = beacon.add_parser("status", help="details of one beacon")
     p.add_argument("name")
     p.set_defaults(func=admin.cmd_beacon_status)
+
+    def one_or_all(parser) -> None:
+        parser.add_argument("name", nargs="?")
+        parser.add_argument("-a", "--all", action="store_true", help="every beacon on the allowlist")
+
     p = beacon.add_parser("reset", help="clear the high-water mark; the next report becomes the new baseline")
-    p.add_argument("name")
+    one_or_all(p)
     p.set_defaults(func=admin.cmd_beacon_reset)
     p = beacon.add_parser("remove", help="remove a beacon from the allowlist (history is kept)")
-    p.add_argument("name")
+    one_or_all(p)
     p.set_defaults(func=admin.cmd_beacon_remove)
     for verb, enable in (("enable", True), ("disable", False)):
         p = beacon.add_parser(verb, help=f"{verb} a beacon without removing it")
-        p.add_argument("name")
+        one_or_all(p)
         p.set_defaults(func=admin.cmd_beacon_enable, enable=enable)
 
     repeater = sub.add_parser("repeater", help="repeater table").add_subparsers(dest="repeater_command", required=True)

@@ -294,3 +294,105 @@ def test_listed_beacons_and_repeaters_leave_the_unlisted_sections(cfg_file, tmp_
     capsys.readouterr()
     _, out, _ = run(cfg_file, "status", capsys=capsys)
     assert "not in the repeater table" not in out and "not on the allowlist" not in out
+
+
+# --- bulk options (--all) -------------------------------------------------------------------------------------------------
+
+
+def add_three(cfg_file, capsys):
+    for i, name in enumerate(("b1", "b2", "b3")):
+        assert run(cfg_file, "beacon", "add", name, bytes([i + 1] * 8).hex()) == 0
+    capsys.readouterr()
+
+
+def test_enable_disable_all(cfg_file, capsys):
+    add_three(cfg_file, capsys)
+    code, out, _ = run(cfg_file, "beacon", "disable", "--all", capsys=capsys)
+    assert code == 0 and "3 beacon(s) disabled" in out
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert sum(l.endswith(" no") for l in out.splitlines()) == 3
+    code, out, _ = run(cfg_file, "beacon", "enable", "-a", capsys=capsys)
+    assert code == 0 and "3 beacon(s) enabled" in out
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert sum(l.endswith(" yes") for l in out.splitlines()) == 3
+
+
+def test_reset_all_reports_each_beacon(cfg_file, tmp_path, capsys):
+    add_three(cfg_file, capsys)
+    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(100, beacon=bytes([1] * 8)), obs(7, beacon=bytes([2] * 8)), t=time.time() - 5))
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(3, beacon=bytes([1] * 8)), t=time.time() - 4))  # b1 is locked out
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "beacon", "reset", "--all", capsys=capsys)
+    assert code == 0
+    assert "reset b1: was high-water mark 100, 1 rejects" in out and "reset b2: was high-water mark 7" in out
+    assert "reset b3: was no high-water mark" in out and "each of these beacons" in out
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "rejected" not in out
+
+
+def test_remove_all(cfg_file, capsys):
+    add_three(cfg_file, capsys)
+    code, out, _ = run(cfg_file, "beacon", "remove", "--all", capsys=capsys)
+    assert code == 0 and "removed 3 beacon(s)" in out
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert "no beacons" in out
+
+
+def test_all_on_an_empty_allowlist_is_not_an_error(cfg_file, capsys):
+    for verb in ("enable", "disable", "reset", "remove"):
+        code, out, _ = run(cfg_file, "beacon", verb, "--all", capsys=capsys)
+        assert code == 0, verb
+
+
+def test_name_and_all_are_mutually_exclusive_and_one_is_required(cfg_file, capsys):
+    add_three(cfg_file, capsys)
+    for verb in ("enable", "disable", "reset", "remove"):
+        code, _, err = run(cfg_file, "beacon", verb, "b1", "--all", capsys=capsys)
+        assert code == 2 and "not both" in err, verb
+        code, _, err = run(cfg_file, "beacon", verb, capsys=capsys)
+        assert code == 2 and "--all" in err, verb
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert out.count("b1") == 1 and "b3" in out  # nothing was touched
+
+
+def test_single_beacon_forms_still_work(cfg_file, capsys):
+    add_three(cfg_file, capsys)
+    assert run(cfg_file, "beacon", "disable", "b2") == 0
+    assert run(cfg_file, "beacon", "reset", "b1") == 0
+    assert run(cfg_file, "beacon", "remove", "b3") == 0
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert "b3" not in out and "b1" in out
+
+
+def test_add_all_adds_every_reported_beacon_that_is_not_listed(cfg_file, tmp_path, capsys):
+    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    run(cfg_file, "beacon", "add", "mine", bytes([1] * 8).hex())
+    new1, new2 = bytes.fromhex("f5b165224a58b791"), bytes.fromhex("7bd5d47e446fcec2")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(1, beacon=bytes([1] * 8)), obs(5, beacon=new1), obs(9, beacon=new2), t=time.time() - 5))
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "beacon", "add", "--all", capsys=capsys)
+    assert code == 0
+    assert "added beacon beacon-7bd5d4 (prefix 7bd5d47e446fcec2)" in out and "added beacon beacon-f5b165" in out
+    assert "added 2 beacon(s)" in out and "mine" not in out
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "not on the allowlist" not in out
+    code, out, _ = run(cfg_file, "beacon", "add", "-a", capsys=capsys)
+    assert code == 0 and "nothing to add" in out
+
+
+def test_add_all_options_and_conflicts(cfg_file, tmp_path, capsys):
+    run(cfg_file, "repeater", "add", "north", REPEATER_A_KEY.hex(), "1", "1")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(5, beacon=bytes([8] * 8)), t=time.time() - 3 * 3600))
+    code, out, _ = run(cfg_file, "beacon", "add", "--all", "--hours", "1", capsys=capsys)
+    assert code == 0 and "nothing to add" in out  # reported 3 hours ago
+    code, out, _ = run(cfg_file, "beacon", "add", "--all", "--name-prefix", "tag", capsys=capsys)
+    assert code == 0 and "tag-080808" in out
+    for argv in (["x", "--all"], ["x", bytes(8).hex(), "--all"], ["--all", "--notes", "n"]):
+        code, _, err = run(cfg_file, "beacon", "add", *argv, capsys=capsys)
+        assert code == 2 and "--all" in err
+    code, _, err = run(cfg_file, "beacon", "add", capsys=capsys)
+    assert code == 2 and "usage" in err
+    code, _, err = run(cfg_file, "beacon", "add", "only-a-name", capsys=capsys)
+    assert code == 2 and "usage" in err

@@ -125,3 +125,77 @@ def test_concurrent_migration_is_safe(tmp_path):
     assert a.schema_version() == b.schema_version() == len(MIGRATIONS)
     a.close()
     b.close()
+
+
+# --- bulk operations ----------------------------------------------------------------------------------------------------
+
+
+def test_bulk_enable_disable_remove_and_reset(store):
+    for i, name in enumerate(("a", "b", "c")):
+        store.add_beacon(name, bytes([i + 1] * 8).hex())
+    assert store.set_all_beacons_enabled(False) == ["a", "b", "c"]
+    assert all(b["enabled"] == 0 for b in store.beacons())
+    assert store.set_all_beacons_enabled(True) == ["a", "b", "c"]
+    assert all(b["enabled"] == 1 for b in store.beacons())
+
+    store.conn.execute("UPDATE beacons SET hwm = 50, rejects_since_accept = 2, last_reject_counter = 7 WHERE name = 'b'")
+    infos = store.reset_all_beacons()
+    assert [i.name for i in infos] == ["a", "b", "c"]
+    assert (infos[1].old_hwm, infos[1].rejects_since_accept, infos[1].last_reject_counter) == (50, 2, 7)
+    assert all(b["hwm"] is None and b["epoch"] == 1 and b["rejects_since_accept"] == 0 for b in store.beacons())
+
+    assert store.remove_all_beacons() == ["a", "b", "c"]
+    assert store.beacons() == []
+
+
+def test_bulk_operations_on_an_empty_allowlist(store):
+    assert store.set_all_beacons_enabled(True) == [] and store.reset_all_beacons() == [] and store.remove_all_beacons() == []
+
+
+def _report_unknown(store, *prefixes, t=1000.0, status="unknown_beacon"):
+    from beacon_base.pipeline import Pipeline
+    from helpers import REPEATER_A_KEY, obs, rx
+
+    if not store.conn.execute("SELECT 1 FROM repeaters").fetchone():
+        store.add_repeater("r", REPEATER_A_KEY.hex(), 1, 1)
+    Pipeline(store, boot="b").process(rx(REPEATER_A_KEY, *[obs(1, beacon=p) for p in prefixes], t=t))
+
+
+def test_add_heard_beacons_adds_only_unlisted_ones_with_derived_names(store):
+    known, new1, new2 = bytes([1] * 8), bytes.fromhex("f5b165224a58b791"), bytes.fromhex("7bd5d47e446fcec2")
+    store.add_beacon("mine", known.hex())
+    _report_unknown(store, known, new1, new2, new1)
+    added = store.add_heard_beacons(since=0, now=5.0)
+    assert [(r["name"], bytes(r["prefix"])) for r in added] == [("beacon-7bd5d4", new2), ("beacon-f5b165", new1)]
+    assert {b["name"] for b in store.beacons()} == {"mine", "beacon-7bd5d4", "beacon-f5b165"}
+    assert store.add_heard_beacons(since=0) == []  # nothing left
+
+
+def test_add_heard_beacons_respects_the_time_window_and_prefix_option(store):
+    old, recent = bytes([9] * 8), bytes([8] * 8)
+    _report_unknown(store, old, t=100.0)
+    _report_unknown(store, recent, t=5000.0)
+    added = store.add_heard_beacons(since=1000.0, name_prefix="tag")
+    assert [r["name"] for r in added] == ["tag-080808"]
+
+
+def test_add_heard_beacons_finds_a_free_name(store):
+    p = bytes.fromhex("f5b165224a58b791")
+    store.add_beacon("beacon-f5b165", bytes([3] * 8).hex())  # the derived name is taken by another beacon
+    _report_unknown(store, p)
+    (added,) = store.add_heard_beacons(since=0)
+    assert added["name"] == "beacon-f5b16522"
+
+
+def test_add_heard_beacons_ignores_disabled_and_other_statuses(store):
+    from helpers import BEACON_PREFIX
+
+    rogue = bytes(range(0x30, 0x50))
+    store.add_beacon("b", BEACON_PREFIX.hex())
+    store.set_beacon_enabled("b", False)
+    from beacon_base.pipeline import Pipeline
+    from helpers import obs, rx
+
+    store.add_repeater("r", bytes(range(0xA0, 0xC0)).hex(), 1, 1)
+    Pipeline(store, boot="b").process(rx(rogue, obs(1, beacon=BEACON_PREFIX), t=10.0))  # unknown repeater, known beacon
+    assert store.add_heard_beacons(since=0) == []

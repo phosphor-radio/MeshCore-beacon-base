@@ -93,7 +93,9 @@ beaconctl status                             # one line per beacon, rejected and
 |---|---|
 | `channel generate [--force]` / `channel set <hex\|-> [--force]` / `channel show` | Create, store or print the report channel key. Replacing an existing key needs `--force`, since every repeater would need updating. |
 | `beacon add <name> <prefix>` | Allowlist a beacon by the 8-byte key prefix its reports carry (16 hex characters, shown by `status`). A full 64-character key, for example from the beacon's serial `pubkey` command, is accepted and reduced to its prefix. A prefix or name that is already used is refused. |
-| `beacon list` / `status <name>` / `remove` / `enable` / `disable` | The allowlist. |
+| `beacon add --all [--hours H] [--name-prefix P]` | Add every beacon the repeaters have reported (default last 24 h) that is not on the allowlist, named `<prefix>-<first 6 hex digits>` (`beacon-f5b165`). It adds whatever the repeaters report, so check `status` first if other people's beacons may be in range. |
+| `beacon list` / `status <name>` | The allowlist. |
+| `beacon enable\|disable\|remove\|reset <name>` or `--all` / `-a` | One beacon, or every beacon on the allowlist. `remove` keeps history; `reset` re-baselines. |
 | `beacon reset <name>` | Clear the high-water mark; the next report becomes the new baseline. Do it while the beacon is transmitting. |
 | `repeater add <name> <key> <lat> <lon> [--window S]` / `list` / `remove` / `enable` / `disable` / `window <name> <S>` | The repeater table. Reports from repeaters not in it are stored but ignored. |
 | `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), plus beacons and repeaters heard but not on the lists. |
@@ -109,7 +111,7 @@ beaconctl status                             # one line per beacon, rejected and
 Repeater reports identify a beacon by an 8-byte prefix of its public key, and that prefix is all the base keeps or needs:
 the allowlist, high-water mark and dedupe all work on it. So the onboarding workflow is: configure the beacons, let them
 transmit, run `beaconctl status`, and add each one it lists under "heard but not on the allowlist" with
-`beaconctl beacon add <name> <prefix>`. To pre-register a beacon before it transmits, use the prefix (or the full key) from
+`beaconctl beacon add <name> <prefix>`, or add them all at once with `beaconctl beacon add --all`. To pre-register a beacon before it transmits, use the prefix (or the full key) from
 its serial `pubkey` command.
 
 ### When a beacon is locked out
