@@ -5,8 +5,7 @@ in [beacon-project.md](beacon-project.md), and sets up the architecture for the 
 (milestone 6) so they slot in without rework.
 
 Status: B0 done (firmware commit `55fe473a`). B1 done and verified on hardware (`beaconctl listen` against the XIAO S3 WIO
-companion). B2 is code complete and tested without hardware (fake companion); a run against real beacons and repeaters is
-outstanding. The beacon names work ([beacon-names.md](beacon-names.md): firmware commit `28bb4985`, base N1 and N2) is complete and
+companion). B2 is done and was verified on hardware (real beacons and repeaters). The beacon names work ([beacon-names.md](beacon-names.md): firmware commit `28bb4985`, base N1 and N2) is complete and
 passed its hardware check (N3). B3 onwards not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
 made while implementing B2 are marked "(B2)".
 
@@ -123,7 +122,8 @@ repeater's `beacon.window`, for `beaconctl check`). The database file defaults t
   `location_updated_at`, `enabled`. The position and name follow the repeater's adverts, last write wins
   ([repeater-onboarding.md](repeater-onboarding.md)).
 - `repeater_adverts`: `prefix` (primary key), `pubkey`, `name`, `lat`, `lon`, `advert_timestamp`, `first_seen`, `last_heard`.
-  Adverts with a valid position heard by the base companion, whether or not the repeater is trusted yet.
+  Every repeater advert heard by the base companion (`lat`/`lon` NULL until one carries a valid position), whether or not the
+  repeater is trusted yet. Also `settings` (key/value; the auto-add modes live there).
 - `raw_frames`: every beacon-report frame as received (`rx_time`, companion SNR, path length, payload, `late`). Audit
   trail and replay source for debugging; pruned by age.
 - `observations`: one row per entry in a report: `rx_time` (wall clock), `rx_mono` (seconds since boot, from the
@@ -150,9 +150,12 @@ report so it is idempotent and crash-safe. For each entry in a decoded report:
 
 1. **Format.** Unknown report version or malformed length: log and drop the whole report.
 2. **Repeater known.** (Checked before the allowlist since the repeater onboarding work, so repeaters are onboarded first.)
-   Unknown repeater prefix: store as `unknown_repeater` and change nothing else: a rogue or misconfigured repeater must not be
-   able to move a high-water mark or get beacons listed. It is shown in the UI as an action item.
-3. **Allowlist.** Look up `beacon_prefix`. Not found: store as `unknown_beacon`, nothing else changes.
+   Unknown repeater prefix: store as `unknown_repeater` and change nothing else: a repeater that is not trusted must not be
+   able to move a high-water mark or get a beacon trusted. It is listed, with the beacons it reported, as an action item.
+   With auto-add for repeaters on it is trusted here and processing goes on.
+3. **Allowlist.** Look up `beacon_prefix`. Not found (reported by a trusted repeater): store as `unknown_beacon`, nothing else
+   changes. With auto-add for beacons on it is trusted here and this report becomes its baseline. Both modes and the
+   discovery lists are described in [repeater-onboarding.md](repeater-onboarding.md).
 4. **High-water mark.**
    - `hwm` is NULL: accept, set `hwm = counter` (baseline).
    - `counter < hwm`: reject as `replay`. (B2) The reason is `late` if that `(beacon, counter)` transmission was already seen

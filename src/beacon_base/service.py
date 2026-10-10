@@ -47,6 +47,9 @@ class PipelineHandler(Handler):
             summary[v.status] += 1
             self.counts[v.status] += 1
             who = f"{names.label(v.beacon_name, v.beacon_prefix)} counter {v.counter} via {names.label(v.repeater_name, v.repeater_prefix)}"
+            if v.auto_added:
+                self.counts["auto_added"] += 1
+                log.info("auto-added %s (%s)", v.auto_added.replace("+", " and "), who)
             if v.status == "accepted":
                 log.debug("accepted %s", who)
             elif v.status == "duplicate":
@@ -66,29 +69,24 @@ class PipelineHandler(Handler):
         effect = self._store.record_repeater_advert(
             advert.public_key, advert.name, advert.lat, advert.lon, advert.advert_timestamp, advert.heard_at
         )
-        if effect is None:
-            log.debug("ignored an advert from repeater %s, which has no position", names.prefix_label(advert.public_key))
-            return
         who = names.label(advert.name, advert.public_key[:8])
+        if effect.added:
+            self.counts["auto_added"] += 1
+            log.info("auto-added repeater %s from its advert", who)
         if effect.position is not None:
             old = effect.old_position
-            if effect.trusted and old not in (None, (0.0, 0.0)):
+            if effect.trusted and not effect.added and old not in (None, (0.0, 0.0)):
                 log.info("repeater %s moved to %.6f, %.6f (was %.6f, %.6f)", who, *effect.position, *old)
             else:
                 log.info("repeater %s is at %.6f, %.6f%s", who, *effect.position, "" if effect.trusted else " (not in the repeater table)")
             self.counts["repeater_positions"] += 1
-        if effect.trusted and effect.name is not None and effect.old_name != effect.name:
+        elif effect.trusted is False:
+            log.debug("advert from repeater %s, which is not in the repeater table and has no position", who)
+        if effect.trusted and not effect.added and effect.name is not None and effect.old_name != effect.name:
             log.info("repeater %s is named %r", names.prefix_label(advert.public_key), effect.name)
 
     def on_names(self, rx: ReceivedNames) -> None:
         changes = self._pipeline.process_names(rx)
-        if not changes and rx.announcement.entries:
-            self.counts["names_ignored"] += 1
-            log.warning(
-                "ignored a name announcement from %s, which is not an enabled repeater in the table",
-                rx.announcement.repeater_id.hex(),
-            )
-            return
         for c in changes:
             if c.old is None:
                 log.info("learned the name of beacon %s: %r", names.prefix_label(c.beacon_prefix), c.new)

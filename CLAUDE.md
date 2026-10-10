@@ -9,9 +9,9 @@ repeaters hear them and publish batched reports on a private `GRP_DATA` channel;
 reports through a MeshCore **companion node over USB**, enforces replay protection, stores everything, and serves a map.
 Scale is about 30 beacons and 10 repeaters.
 
-**Status: B1 and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and verified on hardware. B2
-(store and pipeline) and the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1 and R2: positions and names
-from repeater adverts) are code complete and tested without hardware (fake companion). B3 onwards is not started.** The plans are the source of truth:
+**Status: B1, B2 (store and pipeline) and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and
+verified on hardware, as is the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1-R3: positions and names
+from repeater adverts, plus discovery and auto-add). B3 onwards is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -91,7 +91,10 @@ manual-add mode so every advert is a full one) and applied by `Store.record_repe
 position are kept in `repeater_adverts` whether or not the repeater is trusted; for a trusted repeater position and name are
 overwritten, last write wins (`repeater locate` is the same, until the next advert); an advert without a position never
 erases one. 0, 0 means **unlocated**: `Store.is_located` / `located_repeaters()` is the one place that decides, and the
-estimator must use it. `repeater add --all` considers only repeaters that have *reported*.
+estimator must use it. `repeater add --all` and the unknown-repeater list cover repeaters that reported **or advertised** (`Store.unknown_repeaters`).
+**Auto-add** (`Store.autoadd/set_autoadd`, settings table, `beaconctl autoadd`, off by default, read per report so a running ingest sees changes):
+repeaters are trusted by a report or an advert from an unknown one; beacons only by a report from a *trusted, enabled* repeater (that report
+becomes the baseline). `Verdict.auto_added` / `AdvertEffect.added` say what was added. Names are accepted from any repeater.
 
 Pipeline rules worth remembering (full text in the base plan): unknown repeater/beacon and disabled entries are stored but
 change nothing (the repeater is checked first, so repeaters are onboarded before beacons); an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason

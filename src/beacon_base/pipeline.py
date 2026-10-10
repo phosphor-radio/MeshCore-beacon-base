@@ -3,10 +3,11 @@
 ``Pipeline.process`` handles one received report in one database transaction, so a crash leaves either the whole report
 applied or none of it, and re-running it on an unchanged database gives the same result. For each entry:
 
-1. **Repeater known.** An unknown repeater prefix is stored as ``unknown_repeater`` and nothing else changes, so a rogue or
-   misconfigured repeater can neither move a high-water mark nor get beacons listed. Repeaters are the infrastructure and
-   are onboarded first.
-2. **Allowlist.** An unknown beacon prefix, from a known repeater, is stored as ``unknown_beacon`` and nothing else changes.
+1. **Repeater known.** An unknown repeater prefix is stored as ``unknown_repeater`` and nothing else changes, so a repeater
+   that is not trusted can neither move a high-water mark nor get a beacon trusted. (It is still listed, with the beacons
+   it reported, so the operator can add them.) With auto-add for repeaters on, it is trusted here and processing goes on.
+2. **Allowlist.** An unknown beacon prefix, from a trusted repeater, is stored as ``unknown_beacon`` and nothing else
+   changes; with auto-add for beacons on it is trusted here and processing goes on (this report becomes its baseline).
 3. **High-water mark.** No mark yet: accept and take the counter as the baseline. A lower counter is rejected as
    ``replay``. An equal counter is the current transmission and joins its group. A higher counter is a new transmission:
    accept and advance the mark.
@@ -26,7 +27,9 @@ from typing import Protocol
 
 from . import clock, names, store, wire
 from .ingest import ReceivedNames, ReceivedReport
-from .store import ACCEPTED, DISABLED, DUPLICATE, REPLAY, UNKNOWN_BEACON, UNKNOWN_REPEATER, Store
+from .store import (
+    ACCEPTED, AUTOADD_BEACONS, AUTOADD_REPEATERS, DISABLED, DUPLICATE, REPLAY, UNKNOWN_BEACON, UNKNOWN_REPEATER, Store,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +68,7 @@ class Verdict:
     beacon_name: str | None = None
     repeater_name: str | None = None
     transmission_id: int | None = None
+    auto_added: str = ""  # "repeater", "beacon" or "repeater+beacon": trusted by auto-add while processing this entry
 
 
 class Pipeline:
@@ -82,7 +86,8 @@ class Pipeline:
         with self._store.transaction() as db:
             trusted = clock.is_trusted(db, self._boot, self._assume_synced)
             raw_id = self._insert_raw(db, rx, "ok", "")
-            return [self._observe(db, rx, raw_id, trusted, rx.report.repeater_id, o) for o in rx.report.observations]
+            auto = (self._store._flag(db, AUTOADD_REPEATERS), self._store._flag(db, AUTOADD_BEACONS))
+            return [self._observe(db, rx, raw_id, trusted, rx.report.repeater_id, o, auto) for o in rx.report.observations]
 
     def record_bad_report(self, rx: RawFrameLike, detail: str, outcome: str = "bad_report") -> None:
         """Keep the audit trail for a frame that is on the report channel but does not decode."""
@@ -90,13 +95,9 @@ class Pipeline:
             self._insert_raw(db, rx, outcome, detail)
 
     def process_names(self, rx: ReceivedNames) -> list[NameChange]:
-        """Store the names a repeater announced. Only repeaters in the table (and enabled) are believed, so a stranger cannot
-        fill the table; a name that cleans down to nothing is skipped. The latest announcement wins."""
-        repeater = self._store.conn.execute(
-            "SELECT enabled FROM repeaters WHERE prefix = ?", (rx.announcement.repeater_id,)
-        ).fetchone()
-        if repeater is None or not repeater["enabled"]:
-            return []
+        """Store the names a repeater announced, from any repeater (trusted or not) so an unlisted beacon can be recognised before
+        it is added. A name that cleans down to nothing is skipped and the latest announcement wins. Names are display only and
+        announcements are encrypted with the channel key, so only a holder of it can send one."""
         changes = []
         with self._store.transaction():
             for entry in rx.announcement.entries:
@@ -118,9 +119,21 @@ class Pipeline:
         return cur.lastrowid
 
     def _observe(
-        self, db: sqlite3.Connection, rx: RawFrameLike, raw_id: int, trusted: bool, repeater_prefix: bytes, o: wire.Observation
+        self,
+        db: sqlite3.Connection,
+        rx: RawFrameLike,
+        raw_id: int,
+        trusted: bool,
+        repeater_prefix: bytes,
+        o: wire.Observation,
+        auto: tuple[bool, bool] = (False, False),
     ) -> Verdict:
         now = rx.rx_wall
+        auto_repeaters, auto_beacons = auto
+        auto_added = []
+        if auto_repeaters and db.execute("SELECT 1 FROM repeaters WHERE prefix = ?", (repeater_prefix,)).fetchone() is None:
+            self._store._insert_repeater(db, repeater_prefix, None, None, None, None, None, now)
+            auto_added.append("repeater")
         beacon = db.execute(Store._BEACON_SELECT + " WHERE b.prefix = ?", (o.beacon_id,)).fetchone()
         repeater = db.execute("SELECT * FROM repeaters WHERE prefix = ?", (repeater_prefix,)).fetchone()
         epoch = beacon["epoch"] if beacon is not None else 0
@@ -142,6 +155,7 @@ class Pipeline:
                 beacon["name"] if beacon is not None else None,
                 repeater["name"] if repeater is not None else None,
                 transmission_id,
+                "+".join(auto_added),
             )
 
         # Repeaters are checked first: they are the infrastructure, set up before the beacons, and a stranger must not be able
@@ -150,6 +164,10 @@ class Pipeline:
             return record(UNKNOWN_REPEATER)  # the high-water mark is deliberately not touched
         if not repeater["enabled"]:
             return record(DISABLED, "repeater")
+        if beacon is None and auto_beacons:  # only a trusted, enabled repeater can get a beacon trusted
+            db.execute("INSERT INTO beacons (prefix, created_at) VALUES (?, ?)", (o.beacon_id, now))
+            beacon = db.execute(Store._BEACON_SELECT + " WHERE b.prefix = ?", (o.beacon_id,)).fetchone()
+            auto_added.append("beacon")
         if beacon is None:
             return record(UNKNOWN_BEACON)
         if not beacon["enabled"]:

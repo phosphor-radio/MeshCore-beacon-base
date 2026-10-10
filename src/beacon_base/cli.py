@@ -303,6 +303,11 @@ def _add_admin_commands(sub) -> None:
         func=admin.cmd_time_confirm
     )
 
+    p = sub.add_parser("autoadd", help="show or set automatic trust for newly seen repeaters and beacons")
+    p.add_argument("what", nargs="?", choices=["beacons", "repeaters", "all"])
+    p.add_argument("state", nargs="?", choices=["on", "off"])
+    p.set_defaults(func=admin.cmd_autoadd)
+
     sub.add_parser("check", help="sanity-check the setup, including repeater report windows").set_defaults(func=admin.cmd_check)
 
 

@@ -333,9 +333,21 @@ def test_an_advert_with_a_position_is_kept_before_the_repeater_is_trusted(store)
 
 
 @pytest.mark.parametrize("lat, lon", [(0.0, 0.0), (None, None), (95.0, 0.0), (0.0, 200.0)])
-def test_an_advert_without_a_valid_position_from_an_unknown_repeater_is_ignored(store, lat, lon):
-    assert advert(store, lat, lon) is None
-    assert store.repeater_advert(RPFX) is None
+def test_an_advert_without_a_valid_position_is_still_recorded_so_the_repeater_can_be_listed(store, lat, lon):
+    effect = advert(store, lat, lon)
+    assert effect is not None and effect.position is None and not effect.trusted and not effect.added
+    row = store.repeater_advert(RPFX)
+    assert (row["lat"], row["lon"], row["name"], bytes(row["pubkey"])) == (None, None, "North Ridge", RKEY)
+    assert store.repeaters() == []
+
+
+def test_a_later_advert_with_a_position_fills_it_in_and_one_without_never_erases_it(store):
+    advert(store, 0.0, 0.0)
+    assert store.repeater_advert(RPFX)["lat"] is None
+    advert(store, 40.0, -75.0)
+    advert(store, 0.0, 0.0, name="Renamed")  # a repeater that lost its position still advertises 0, 0
+    row = store.repeater_advert(RPFX)
+    assert (row["lat"], row["lon"], row["name"]) == (40.0, -75.0, "Renamed")
 
 
 def test_adding_a_repeater_takes_the_heard_position_name_and_key(store):
@@ -393,7 +405,7 @@ def test_an_advert_without_a_position_never_erases_a_known_one_but_still_updates
     assert effect is not None and effect.position is None and effect.name == "Fresh name"
     r = store.repeater(RPFX.hex())
     assert (r["lat"], r["lon"], r["name"], r["location_source"]) == (10.0, 20.0, "Fresh name", "manual")
-    assert store.repeater_advert(RPFX) is None  # nothing with a position to keep
+    assert store.repeater_advert(RPFX)["lat"] is None  # nothing with a position to keep
 
 
 def test_the_same_position_again_takes_over_a_manual_one(store):
@@ -445,25 +457,100 @@ def test_add_heard_repeaters_adds_reporters_with_what_their_adverts_said(store):
     by_prefix = {bytes(r["prefix"]): r for r in added}
     assert by_prefix[located[:8]]["lat"] == 40.0 and bytes(by_prefix[located[:8]]["pubkey"]) == located
     assert by_prefix[located[:8]]["name"] == "Ridge" and by_prefix[located[:8]]["location_source"] == "advert"
-    assert by_prefix[silent[:8]]["lat"] == 0.0 and by_prefix[never[:8]]["lat"] == 0.0 and by_prefix[never[:8]]["name"] is None
+    assert by_prefix[silent[:8]]["lat"] == 0.0 and by_prefix[silent[:8]]["name"] == "Quiet"  # advertised, but not located
+    assert by_prefix[never[:8]]["lat"] == 0.0 and by_prefix[never[:8]]["name"] is None
     assert store.add_heard_repeaters(since=0) == []
 
 
-def test_add_heard_repeaters_ignores_repeaters_only_heard_advertising(store):
-    advert(store, 40.0, -75.0)  # advertised but never reported
+def test_add_heard_repeaters_also_adds_repeaters_only_heard_advertising(store):
+    advert(store, 40.0, -75.0, "Ridge")
+    advert(store, 0.0, 0.0, "Unplaced", key=bytes(range(1, 33)))
+    added = store.add_heard_repeaters(since=0)
+    by_name = {r["name"]: r for r in added}
+    assert (by_name["Ridge"]["lat"], by_name["Ridge"]["location_source"]) == (40.0, "advert")
+    assert (by_name["Unplaced"]["lat"], by_name["Unplaced"]["location_source"]) == (0.0, "none")
     assert store.add_heard_repeaters(since=0) == []
 
 
-def test_unknown_repeaters_carry_the_advert_name_and_position(store):
+def test_unknown_repeaters_lists_reporters_and_advert_only_repeaters(store):
     from beacon_base.pipeline import Pipeline
     from helpers import BEACON_KEY, obs, rx
 
     store.add_beacon(BEACON_KEY.hex())
-    advert(store, 40.0, -75.0, "Ridge")
-    other = bytes(range(150, 182))
+    reporter, quiet, placed = bytes(range(150, 182)), bytes(range(1, 33)), RKEY
+    advert(store, 40.0, -75.0, "Ridge")  # placed: advertised with a position, also reports
+    advert(store, 0.0, 0.0, "Quiet", key=quiet, now=500.0, heard=500.0)  # advertised, no position, never reported
     p = Pipeline(store, boot="b")
-    p.process(rx(RKEY, obs(1), t=1000.0))
-    p.process(rx(other, obs(1), t=1001.0))
-    rows = {bytes(r["repeater_prefix"]): r for r in store.unknown_repeaters(0)}
-    assert (rows[RPFX]["name"], rows[RPFX]["lat"], rows[RPFX]["lon"]) == ("Ridge", 40.0, -75.0)
-    assert rows[other[:8]]["name"] is None and rows[other[:8]]["lat"] is None
+    p.process(rx(placed, obs(1), t=1000.0))
+    p.process(rx(reporter, obs(1), t=1001.0))
+    p.process(rx(reporter, obs(2), t=1301.0))
+    rows = {r["prefix"]: r for r in store.unknown_repeaters(0)}
+    assert set(rows) == {placed[:8], quiet[:8], reporter[:8]}
+    assert (rows[placed[:8]]["name"], rows[placed[:8]]["lat"], rows[placed[:8]]["n"]) == ("Ridge", 40.0, 1)
+    assert (rows[quiet[:8]]["name"], rows[quiet[:8]]["lat"], rows[quiet[:8]]["n"], rows[quiet[:8]]["advertised"]) == ("Quiet", None, 0, True)
+    assert (rows[reporter[:8]]["name"], rows[reporter[:8]]["n"], rows[reporter[:8]]["advertised"]) == (None, 2, False)
+    assert [r["prefix"] for r in store.unknown_repeaters(0)][0] == reporter[:8]  # newest first
+    # trusted repeaters leave the list
+    store.add_repeater(quiet[:8].hex())
+    assert quiet[:8] not in {r["prefix"] for r in store.unknown_repeaters(0)}
+
+
+def test_the_unknown_repeater_window_uses_the_last_advert_or_when_it_was_first_seen(store):
+    advert(store, 40.0, -75.0, key=bytes(range(1, 33)), now=100.0, heard=100.0)  # old
+    advert(store, 41.0, -76.0, key=bytes(range(40, 72)), now=5000.0, heard=5000.0)
+    store.record_repeater_advert(bytes(range(90, 122)), "Listed", 42.0, -77.0, 1, None, now=5000.0)  # from the contact list
+    since = 1000.0
+    assert {r["name"] for r in store.unknown_repeaters(since)} == {"North Ridge", "Listed"}
+
+
+def test_unknown_beacons_include_those_reported_only_by_repeaters_that_are_not_trusted(store):
+    from beacon_base.pipeline import Pipeline
+    from helpers import obs, rx
+
+    store.add_repeater(bytes(range(0xA0, 0xC0)).hex())
+    stranger = bytes(range(0xE0, 0xE8))
+    both, untrusted_only = bytes(range(0x10, 0x18)), bytes(range(0x20, 0x28))
+    p = Pipeline(store, boot="b")
+    p.process(rx(bytes(range(0xA0, 0xC0)), obs(1, beacon=both), t=1000.0))   # trusted repeater
+    p.process(rx(stranger + bytes(24), obs(1, beacon=both), obs(5, beacon=untrusted_only), t=1001.0))  # untrusted repeater
+    rows = {bytes(r["beacon_prefix"]): r for r in store.unknown_beacons(0)}
+    assert set(rows) == {both, untrusted_only}
+    assert (rows[both]["n"], rows[both]["n_trusted"], rows[both]["n_repeaters"]) == (2, 1, 2)
+    assert (rows[untrusted_only]["n"], rows[untrusted_only]["n_trusted"]) == (1, 0)
+    added = store.add_heard_beacons(since=0)
+    assert {bytes(b["prefix"]) for b in added} == {both, untrusted_only}
+
+
+# --- auto-add settings ------------------------------------------------------------------------------------------------------
+
+
+def test_auto_add_is_off_by_default_and_can_be_switched_independently(store):
+    assert not store.autoadd("beacons") and not store.autoadd("repeaters")
+    store.set_autoadd("repeaters", True)
+    assert store.autoadd("repeaters") and not store.autoadd("beacons")
+    store.set_autoadd("repeaters", False)
+    store.set_autoadd("beacons", True)
+    assert store.autoadd("beacons") and not store.autoadd("repeaters")
+    with pytest.raises(StoreError, match="beacons.*repeaters"):
+        store.autoadd("both")
+
+
+def test_auto_add_for_repeaters_trusts_an_advertising_repeater_with_what_it_advertised(store):
+    store.set_autoadd("repeaters", True)
+    effect = advert(store, 40.0, -75.0, "Ridge")
+    assert effect.added and effect.trusted
+    r = store.repeater(RPFX.hex())
+    assert (r["name"], r["lat"], r["location_source"], bytes(r["pubkey"])) == ("Ridge", 40.0, "advert", RKEY)
+
+
+def test_auto_add_for_repeaters_also_trusts_one_with_no_position(store):
+    store.set_autoadd("repeaters", True)
+    assert advert(store, 0.0, 0.0, "Unplaced").added
+    r = store.repeater(RPFX.hex())
+    assert (r["name"], r["lat"], r["location_source"]) == ("Unplaced", 0.0, "none")
+    assert not advert(store, 0.0, 0.0, "Unplaced").added  # only the first time
+
+
+def test_without_auto_add_an_advert_does_not_trust_the_repeater(store):
+    assert not advert(store, 40.0, -75.0).added
+    assert store.repeaters() == []

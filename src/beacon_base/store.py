@@ -69,11 +69,15 @@ MIGRATIONS: list[tuple[str, ...]] = [
             prefix BLOB PRIMARY KEY CHECK (length(prefix) = 8),  -- heard before or after the repeater is trusted
             pubkey BLOB NOT NULL CHECK (length(pubkey) = 32),
             name TEXT,
-            lat REAL NOT NULL,                -- only adverts with a valid position are kept
-            lon REAL NOT NULL,
+            lat REAL,                         -- NULL until an advert carries a valid position (0, 0 and out of range are not)
+            lon REAL,
             advert_timestamp INTEGER,
             first_seen REAL NOT NULL,
-            last_heard REAL NOT NULL
+            last_heard REAL                   -- NULL: only known from the companion's contact list, never heard live
+        )""",
+        """CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )""",
         """CREATE TABLE raw_frames (
             id INTEGER PRIMARY KEY,
@@ -151,6 +155,7 @@ class AdvertEffect:
     name: str | None = None
     old_name: str | None = None
     old_position: tuple[float, float] | None = None
+    added: bool = False  # the repeater was not trusted and auto-add trusted it
 
 
 @dataclass(frozen=True)
@@ -160,6 +165,16 @@ class ResetInfo:
     old_hwm: int | None
     last_reject_counter: int | None
     rejects_since_accept: int
+
+
+AUTOADD_BEACONS = "autoadd.beacons"
+AUTOADD_REPEATERS = "autoadd.repeaters"
+
+
+def _autoadd_key(kind: str) -> str:
+    if kind not in ("beacons", "repeaters"):
+        raise StoreError(f"auto-add applies to 'beacons' or 'repeaters', not {kind!r}")
+    return AUTOADD_BEACONS if kind == "beacons" else AUTOADD_REPEATERS
 
 
 def _hex(b: bytes) -> str:
@@ -342,15 +357,15 @@ class Store:
             return [self._reset(db, b) for b in self.beacons()]
 
     def add_heard_beacons(self, since: float, now: float | None = None) -> list[sqlite3.Row]:
-        """Add every beacon prefix that repeaters have reported since `since` but that is not on the allowlist, in one
-        transaction."""
+        """Add every beacon prefix that has been reported since `since` (by any repeater, trusted or not) but is not on the
+        allowlist, in one transaction."""
         stamp = time.time() if now is None else now
         with self.transaction() as db:
             heard = db.execute(
                 """SELECT DISTINCT beacon_prefix FROM observations
-                   WHERE status = ? AND rx_time >= ? AND beacon_prefix NOT IN (SELECT prefix FROM beacons)
+                   WHERE status IN (?, ?) AND rx_time >= ? AND beacon_prefix NOT IN (SELECT prefix FROM beacons)
                    ORDER BY beacon_prefix""",
-                (UNKNOWN_BEACON, since),
+                (UNKNOWN_BEACON, UNKNOWN_REPEATER, since),
             ).fetchall()
             for row in heard:
                 db.execute("INSERT INTO beacons (prefix, created_at) VALUES (?, ?)", (bytes(row["beacon_prefix"]), stamp))
@@ -409,7 +424,7 @@ class Store:
         source = "none"
         if lat is not None:
             source = "manual" if (lat, lon) != (0.0, 0.0) else "none"
-        elif heard is not None:
+        elif heard is not None and self.is_located(heard["lat"], heard["lon"]):
             lat, lon, source = heard["lat"], heard["lon"], "advert"
         else:
             lat = lon = 0.0
@@ -426,18 +441,13 @@ class Store:
         )
 
     def add_heard_repeaters(self, since: float, now: float | None = None) -> list[sqlite3.Row]:
-        """Trust every repeater that has sent reports since `since` but is not in the table, each with the position and name
-        from its advert when one was heard (else unlocated at 0, 0), in one transaction."""
+        """Trust every repeater that has sent reports or been heard advertising since `since` but is not in the table, each
+        with the position and name from its advert when one was heard (else unlocated at 0, 0), in one transaction."""
         with self.transaction() as db:
-            heard = db.execute(
-                """SELECT DISTINCT repeater_prefix FROM observations
-                   WHERE status = ? AND rx_time >= ? AND repeater_prefix NOT IN (SELECT prefix FROM repeaters)
-                   ORDER BY repeater_prefix""",
-                (UNKNOWN_REPEATER, since),
-            ).fetchall()
-            for row in heard:
-                self._insert_repeater(db, bytes(row["repeater_prefix"]), None, None, None, None, None, now)
-            return [self.repeater(bytes(r["repeater_prefix"]).hex()) for r in heard]
+            prefixes = sorted(bytes(r["prefix"]) for r in self._unknown_repeater_rows(db, since))
+            for prefix in prefixes:
+                self._insert_repeater(db, prefix, None, None, None, None, None, now)
+            return [self.repeater(p.hex()) for p in prefixes]
 
     def locate_repeater(self, ref: str, lat: float, lon: float, now: float | None = None) -> sqlite3.Row:
         """Set a repeater's position by hand (testing, before it has advertised, or when it cannot be set on the repeater).
@@ -472,10 +482,13 @@ class Store:
         advert_timestamp: int | None,
         heard_at: float | None,
         now: float | None = None,
-    ) -> "AdvertEffect | None":
-        """Take a repeater's advert. Adverts with a valid position are kept whether or not the repeater is trusted yet;
-        for a trusted repeater the position and name also replace what the table has (the latest write wins) and an
-        advert without a position still updates its name. Returns what changed, or None if nothing was kept."""
+        auto_add: bool | None = None,
+    ) -> AdvertEffect:
+        """Take a repeater's advert. Every repeater advert is kept, trusted or not, so it can be listed and added; the
+        position is only stored when valid (not 0, 0, which an unlocated repeater advertises). For a trusted repeater the
+        position and name also replace what the table has, the latest write wins, and an advert without a position still
+        updates the name but never erases a position. With auto-add for repeaters on (read from the settings unless given),
+        an untrusted repeater is trusted by its advert."""
         if len(pubkey) != PUBKEY_LEN:
             raise StoreError("advert public key must be 32 bytes")
         prefix = pubkey[: wire.ID_LEN]
@@ -483,38 +496,39 @@ class Store:
         located = self.is_located(lat, lon)
         clean = names_mod.clean_name(name, names_mod.MAX_NAME_BYTES) if name else None
         with self.transaction() as db:
+            db.execute(
+                """INSERT INTO repeater_adverts (prefix, pubkey, name, lat, lon, advert_timestamp, first_seen, last_heard)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (prefix) DO UPDATE SET pubkey = excluded.pubkey, name = COALESCE(excluded.name, name),
+                     lat = CASE WHEN excluded.lat IS NOT NULL THEN excluded.lat ELSE lat END,
+                     lon = CASE WHEN excluded.lat IS NOT NULL THEN excluded.lon ELSE lon END,
+                     advert_timestamp = COALESCE(excluded.advert_timestamp, advert_timestamp),
+                     last_heard = COALESCE(excluded.last_heard, last_heard)""",
+                (prefix, pubkey, clean, lat if located else None, lon if located else None, advert_timestamp, stamp, heard_at),
+            )
             row = db.execute("SELECT * FROM repeaters WHERE prefix = ?", (prefix,)).fetchone()
-            if not located and row is None:
-                return None
-            if located:
-                db.execute(
-                    """INSERT INTO repeater_adverts (prefix, pubkey, name, lat, lon, advert_timestamp, first_seen, last_heard)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT (prefix) DO UPDATE SET pubkey = excluded.pubkey, name = COALESCE(excluded.name, name),
-                         lat = excluded.lat, lon = excluded.lon,
-                         advert_timestamp = COALESCE(excluded.advert_timestamp, advert_timestamp),
-                         last_heard = excluded.last_heard""",
-                    (prefix, pubkey, clean, lat, lon, advert_timestamp, stamp, heard_at if heard_at is not None else stamp),
-                )
             effect = AdvertEffect(prefix, trusted=row is not None)
-            if row is not None:
-                effect.old_name, effect.old_position = row["name"], (row["lat"], row["lon"])
-                updates, args = ["pubkey = ?"], [pubkey]
-                if clean is not None and clean != row["name"]:
-                    updates.append("name = ?")
-                    args.append(clean)
-                    effect.name = clean
-                if located and (lat, lon) != (row["lat"], row["lon"]):
-                    updates += ["lat = ?", "lon = ?", "location_source = 'advert'", "location_updated_at = ?"]
-                    args += [lat, lon, stamp]
-                    effect.position = (lat, lon)
-                elif located and row["location_source"] != "advert":
-                    updates += ["location_source = 'advert'", "location_updated_at = ?"]  # same place, now owned by the advert
-                    args.append(stamp)
-                db.execute(f"UPDATE repeaters SET {', '.join(updates)} WHERE prefix = ?", (*args, prefix))
-            else:
-                effect.position = (lat, lon)
+            if row is None:
+                if auto_add if auto_add is not None else self._flag(db, AUTOADD_REPEATERS):
+                    self._insert_repeater(db, prefix, pubkey, None, None, None, None, stamp)
+                    effect.trusted = effect.added = True
+                effect.position = (lat, lon) if located else None
                 effect.name = clean
+                return effect
+            effect.old_name, effect.old_position = row["name"], (row["lat"], row["lon"])
+            updates, args = ["pubkey = ?"], [pubkey]
+            if clean is not None and clean != row["name"]:
+                updates.append("name = ?")
+                args.append(clean)
+                effect.name = clean
+            if located and (lat, lon) != (row["lat"], row["lon"]):
+                updates += ["lat = ?", "lon = ?", "location_source = 'advert'", "location_updated_at = ?"]
+                args += [lat, lon, stamp]
+                effect.position = (lat, lon)
+            elif located and row["location_source"] != "advert":
+                updates += ["location_source = 'advert'", "location_updated_at = ?"]  # same place, now owned by the advert
+                args.append(stamp)
+            db.execute(f"UPDATE repeaters SET {', '.join(updates)} WHERE prefix = ?", (*args, prefix))
         return effect
 
     def repeater_advert(self, prefix: bytes) -> sqlite3.Row | None:
@@ -570,6 +584,24 @@ class Store:
         }
         return beacons, repeaters
 
+    # --- settings ---------------------------------------------------------------------------------------------------
+
+    def _flag(self, db: sqlite3.Connection, key: str) -> bool:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row is not None and row["value"] == "1"
+
+    def autoadd(self, kind: str) -> bool:
+        """Whether unknown `beacons` or `repeaters` are trusted automatically as they are seen. Off by default."""
+        return self._flag(self.conn, _autoadd_key(kind))
+
+    def set_autoadd(self, kind: str, enabled: bool) -> None:
+        key = _autoadd_key(kind)
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, "1" if enabled else "0"),
+            )
+
     # --- observations --------------------------------------------------------------------------------------------------
 
     def rejects(self, beacon: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
@@ -595,25 +627,58 @@ class Store:
         ).fetchall()
 
     def unknown_beacons(self, since: float) -> list[sqlite3.Row]:
-        """Beacon prefixes that were reported but are not on the allowlist, one row per prefix."""
+        """Beacon prefixes that were reported but are not on the allowlist, one row per prefix. Reports from repeaters that
+        are not trusted yet count too, so a beacon can be added as soon as it is seen; `n_trusted` is how many of the
+        reports came from trusted repeaters."""
         return self.conn.execute(
             """SELECT o.beacon_prefix, count(*) AS n, max(o.rx_time) AS last_seen, max(o.counter) AS last_counter,
-                      count(DISTINCT o.repeater_prefix) AS n_repeaters, bn.name AS name
+                      count(DISTINCT o.repeater_prefix) AS n_repeaters, sum(o.status = ?) AS n_trusted, bn.name AS name
                FROM observations o LEFT JOIN beacon_names bn ON bn.prefix = o.beacon_prefix
-               WHERE o.status = ? AND o.rx_time >= ? AND o.beacon_prefix NOT IN (SELECT prefix FROM beacons)
+               WHERE o.status IN (?, ?) AND o.rx_time >= ? AND o.beacon_prefix NOT IN (SELECT prefix FROM beacons)
                GROUP BY o.beacon_prefix ORDER BY last_seen DESC""",
-            (UNKNOWN_BEACON, since),
+            (UNKNOWN_BEACON, UNKNOWN_BEACON, UNKNOWN_REPEATER, since),
         ).fetchall()
 
-    def unknown_repeaters(self, since: float) -> list[sqlite3.Row]:
-        """Repeater prefixes reporting known beacons but not in the repeater table."""
-        return self.conn.execute(
-            """SELECT o.repeater_prefix, count(*) AS n, max(o.rx_time) AS last_seen, a.name AS name, a.lat AS lat, a.lon AS lon
-               FROM observations o LEFT JOIN repeater_adverts a ON a.prefix = o.repeater_prefix
-               WHERE o.status = ? AND o.rx_time >= ? AND o.repeater_prefix NOT IN (SELECT prefix FROM repeaters)
-               GROUP BY o.repeater_prefix ORDER BY last_seen DESC""",
-            (UNKNOWN_REPEATER, since),
-        ).fetchall()
+    def _unknown_repeater_rows(self, db: sqlite3.Connection, since: float) -> list[dict]:
+        reports = {
+            bytes(r["repeater_prefix"]): r
+            for r in db.execute(
+                """SELECT repeater_prefix, count(*) AS n, max(rx_time) AS last_seen FROM observations
+                   WHERE status = ? AND rx_time >= ? AND repeater_prefix NOT IN (SELECT prefix FROM repeaters)
+                   GROUP BY repeater_prefix""",
+                (UNKNOWN_REPEATER, since),
+            )
+        }
+        adverts = {
+            bytes(r["prefix"]): r
+            for r in db.execute(
+                """SELECT * FROM repeater_adverts WHERE COALESCE(last_heard, first_seen) >= ?
+                   AND prefix NOT IN (SELECT prefix FROM repeaters)""",
+                (since,),
+            )
+        }
+        rows = []
+        for prefix in reports.keys() | adverts.keys():
+            r, a = reports.get(prefix), adverts.get(prefix)
+            seen = [t for t in (r["last_seen"] if r else None, (a["last_heard"] or a["first_seen"]) if a else None) if t]
+            rows.append(
+                {
+                    "prefix": prefix,
+                    "n": r["n"] if r else 0,  # reports sent on our channel
+                    "last_seen": max(seen),
+                    "name": a["name"] if a else None,
+                    "lat": a["lat"] if a else None,
+                    "lon": a["lon"] if a else None,
+                    "advertised": a is not None,
+                }
+            )
+        rows.sort(key=lambda x: -x["last_seen"])
+        return rows
+
+    def unknown_repeaters(self, since: float) -> list[dict]:
+        """Repeaters that have sent reports on the channel or been heard advertising but are not in the repeater table, newest
+        first. `n` counts their reports (0 for one only heard advertising); name and position are from its advert."""
+        return self._unknown_repeater_rows(self.conn, since)
 
     def latest_transmission(self, prefix: bytes) -> sqlite3.Row | None:
         return self.conn.execute(

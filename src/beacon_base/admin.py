@@ -305,6 +305,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         _, repeaters = store.names()
         unknown_b = store.unknown_beacons(now - args.hours * 3600)
         unknown_r = store.unknown_repeaters(now - args.hours * 3600)
+        auto_b, auto_r = store.autoadd("beacons"), store.autoadd("repeaters")
         rows = []
         for h in assessed:
             b = h.beacon
@@ -336,24 +337,29 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
             )
     if not trusted:
         print(f"! clock {clock_line}\n")
+    if auto_b or auto_r:
+        on = " and ".join(k for k, v in (("repeaters", auto_r), ("beacons", auto_b)) if v)
+        print(f"! auto-add is ON for {on}: new ones are trusted as they are seen. Lock with: beaconctl autoadd {'all' if auto_b and auto_r else ('beacons' if auto_b else 'repeaters')} off\n")
     print(table(rows, ["STATE", "NAME", "PREFIX", "HWM", "HEARD", "BATT", "DETAIL"]) if rows else "no beacons; add one with 'beaconctl beacon add'")
-    if unknown_b:
-        print(f"\nbeacons heard but not on the allowlist (last {args.hours:g}h):")
-        for u in unknown_b:
-            prefix = bytes(u["beacon_prefix"])
-            print(
-                f"  {prefix.hex()}  {repr(u['name']) if u['name'] else '(no name announced)'}  {u['n']} reports, "
-                f"{u['n_repeaters']} repeater(s), last {fmt_age(u['last_seen'], now)}, counter {u['last_counter']}"
-                f"   add: beaconctl beacon add {prefix.hex()}"
-            )
     if unknown_r:
-        print(f"\nrepeaters heard but not in the repeater table, their reports are ignored (last {args.hours:g}h):")
+        print(f"\nrepeaters seen but not in the repeater table, their reports are ignored (last {args.hours:g}h):")
         for u in unknown_r:
-            prefix = bytes(u["repeater_prefix"]).hex()
+            prefix = bytes(u["prefix"]).hex()
             where = f"at {u['lat']:.6f}, {u['lon']:.6f}" if u["lat"] is not None else "no location advertised"
+            seen = f"{u['n']} reports" if u["n"] else ("advert only" if u["advertised"] else "")
             print(
-                f"  {prefix}  {repr(u['name']) if u['name'] else '(no name advertised)'}  {where}  {u['n']} observations, "
+                f"  {prefix}  {repr(u['name']) if u['name'] else '(no name advertised)'}  {where}  {seen}, "
                 f"last {fmt_age(u['last_seen'], now)}   add: beaconctl repeater add {prefix}"
+            )
+    if unknown_b:
+        print(f"\nbeacons seen but not on the allowlist (last {args.hours:g}h):")
+        for u in unknown_b:
+            prefix = bytes(u["beacon_prefix"]).hex()
+            via = "" if u["n_trusted"] else ", only via repeaters that are not trusted yet"
+            print(
+                f"  {prefix}  {repr(u['name']) if u['name'] else '(no name announced)'}  {u['n']} reports, "
+                f"{u['n_repeaters']} repeater(s), last {fmt_age(u['last_seen'], now)}, counter {u['last_counter']}{via}"
+                f"   add: beaconctl beacon add {prefix}"
             )
     return 0
 
@@ -382,6 +388,26 @@ def cmd_rejects(args: argparse.Namespace, cfg: Config) -> int:
             print(f"  {fmt_time(f['rx_time'])}  {f['detail'].split(':', 1)[0]}  {bytes(f['payload']).hex()[:60]}")
     if any(r[0].endswith("?") for r in out):
         print("\n? = the clock was not set when this was heard; the time is provisional")
+    return 0
+
+
+# --- auto-add ------------------------------------------------------------------------------------------------------------
+
+
+def cmd_autoadd(args: argparse.Namespace, cfg: Config) -> int:
+    """Show or change whether unknown beacons and repeaters are trusted automatically (a setting in the database, so the
+    running ingest service picks it up at once)."""
+    with _open(cfg) as store:
+        if args.what:
+            if args.state is None:
+                raise StoreError("say on or off: beaconctl autoadd {beacons,repeaters,all} {on,off}")
+            for kind in ("repeaters", "beacons") if args.what == "all" else (args.what,):
+                store.set_autoadd(kind, args.state == "on")
+        state = {k: store.autoadd(k) for k in ("repeaters", "beacons")}
+    for kind, on in state.items():
+        print(f"auto-add {kind}: {'ON' if on else 'off'}")
+    if any(state.values()):
+        print("new ones are trusted as they are seen; lock the setup with 'beaconctl autoadd all off' once everything is discovered")
     return 0
 
 
@@ -462,6 +488,12 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
     with _open(cfg) as store:
         repeaters = store.repeaters()
         beacons = store.beacons()
+        auto = [k for k in ("repeaters", "beacons") if store.autoadd(k)]
+    if auto:
+        problems.append(
+            f"auto-add is on for {' and '.join(auto)}, so anything on the channel is trusted; lock the setup once everything "
+            "is discovered with 'beaconctl autoadd all off'"
+        )
     if cfg.channel_key is None:
         problems.append("no report channel key; run 'beaconctl channel generate' (or 'channel set')")
     if not beacons:

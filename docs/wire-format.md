@@ -67,8 +67,8 @@ Header, 10 bytes (as for reports): version `1`, repeater key prefix (8), entry c
 - A beacon's name is at most 18 bytes, so an entry is at most 27 bytes and a message holds 5 of them (7 with the 13-byte
   default names, `beacon-` plus the first three key bytes in hex).
 - Names are untrusted display text. The base cleans them (`names.sanitize_name`: invalid UTF-8 replaced, control, format
-  and separator characters turned into spaces, whitespace collapsed, at most 32 bytes) and ignores announcements from
-  repeaters that are not in its repeater table.
+  and separator characters turned into spaces, whitespace collapsed, at most 32 bytes). Announcements are taken from any
+  repeater, trusted or not, so an unlisted beacon can be recognised before it is added.
 
 ## Decoder rules
 

@@ -3,12 +3,13 @@
 Base station software for the MeshCore beacon tracking system. It collects beacon sightings reported by fixed repeaters,
 rejects replayed or unknown beacons, and (later) estimates and maps where each beacon is.
 
-> **Status: phase B2 plus beacon names and repeater positions.** `beacon-ingest` decodes reports and beacon name announcements from a companion,
+> **Status: phase B2 (done) plus beacon names and repeater onboarding (done).** `beacon-ingest` decodes reports and beacon name announcements from a companion,
 > applies the allowlist, high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and
-> repeaters by key prefix and shows a lockout and its one-step fix. B1 and the beacon names (repeater
-> firmware `28bb4985` in the firmware repository) are verified on hardware; B2 is tested against a fake companion.
+> repeaters by key prefix and shows a lockout and its one-step fix. B1, B2, the beacon names (repeater
+> firmware `28bb4985` in the firmware repository) and the repeater onboarding (positions from adverts, discovery and
+> auto-add) are verified on hardware.
 > No web UI yet (B4) and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
-> [docs/plan/beacon-names.md](docs/plan/beacon-names.md).
+> [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works
 
@@ -95,14 +96,15 @@ beaconctl status                             # one line per beacon, rejected and
 |---|---|
 | `channel generate [--force]` / `channel set <hex\|-> [--force]` / `channel show` | Create, store or print the report channel key. Replacing an existing key needs `--force`, since every repeater would need updating. |
 | `beacon add <prefix>` | Allowlist a beacon by the 8-byte key prefix its reports carry (16 hex characters, shown by `status`). A full 64-character key, for example from the beacon's serial `pubkey` command, is accepted and reduced to its prefix. A prefix already on the list is refused. |
-| `beacon add --all [--hours H]` | Add every beacon the repeaters have reported (default last 24 h) that is not on the allowlist. It adds whatever the repeaters report, so check `status` first if other people's beacons may be in range. |
+| `beacon add --all [--hours H]` | Add every beacon that has been reported (default last 24 h) and is not on the allowlist, including ones seen only through repeaters that are not trusted yet. It adds whatever was reported, so check `status` first if other people's beacons may be in range. |
 | `beacon list` / `beacon status <prefix>` | The allowlist, and one beacon in detail. |
 | `beacon enable\|disable\|remove\|reset <prefix>` or `--all` / `-a` | One beacon, or every beacon on the allowlist. `remove` keeps history; `reset` clears the high-water mark so the next report becomes the new baseline (do it while the beacon is transmitting). |
 | `repeater add <key-or-prefix> [<lat> <lon>] [--name N] [--window S]` | Trust a repeater. Without `<lat> <lon>` its position comes from its advert; if none was heard it is added unlocated at 0, 0. The advertised name replaces `--name`. |
-| `repeater add --all [--hours H]` | Trust every repeater that has sent reports (default last 24 h) but is not in the table. Repeaters that were only heard advertising are never added. |
+| `repeater add --all [--hours H]` | Trust every repeater that has sent reports **or been heard advertising** (default last 24 h) and is not in the table. |
 | `repeater locate <prefix-or-name> <lat> <lon>` | Set a position by hand (testing, before the repeater has advertised, or when it can't be set on the repeater). The next advert with a position replaces it. |
-| `repeater list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table, which also shows where each position came from. Commands take the key prefix (six or more hex digits) or the name. Reports and name announcements from repeaters not in the table are ignored. |
-| `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), plus beacons and repeaters heard but not on the lists. |
+| `repeater list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table, which also shows where each position came from. Commands take the key prefix (six or more hex digits) or the name. Reports from repeaters not in the table are stored but not counted. |
+| `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), then every repeater and beacon that has been seen but is not trusted yet, ready to add. |
+| `autoadd [beacons\|repeaters\|all [on\|off]]` | Show or set automatic trust for newly seen repeaters and beacons (both off by default). A setting in the database, so a running `beacon-ingest` uses it at once. `status` warns and `check` fails while it is on. |
 | `rejects [--beacon X] [--limit N]` | Recent observations that were not accepted, with the reason. |
 | `time` / `time set "YYYY-MM-DD HH:MM:SS"` / `time confirm` | Show or fix the clock state. The Pi has no internet, so its clock is set by hand; times stay provisional until then. |
 | `check` | Fails on missing setup, repeaters with no location and repeater report windows that are too long for the beacon interval. |
@@ -123,8 +125,28 @@ is flagged in `repeater list` and fails `beaconctl check`, and the position esti
 - Repeaters send a flood advert every 47 hours by default. After setting a position, run `advert` in the repeater's CLI or
   the base waits for the next one. The advert has to reach the base companion (within 8 hops and in radio range); otherwise
   use `repeater locate`.
-- Repeaters are onboarded **before** beacons: reports from a repeater that is not trusted are stored but change nothing, and
-  beacons and their names are only taken from trusted repeaters.
+- Repeaters are onboarded **before** beacons: a report from a repeater that is not trusted is stored but changes no
+  beacon's counters. It is not lost to the operator though: the repeater, and the beacons in its report, show up in `status`
+  straight away (a beacon is marked "only via repeaters that are not trusted yet") and can be added at once.
+
+### Discovering the mesh, then locking it
+
+Everything seen on the channel is listed in `status`, trusted or not: repeaters that sent a report or were heard
+advertising (with their advertised name and position), and beacons that were reported (with their announced name).
+`repeater add --all` and `beacon add --all` trust the lot. For a mesh that is being set up, switch on automatic trust
+instead and lock it when everything has been found:
+
+```bash
+beaconctl autoadd all on        # or just repeaters, or just beacons
+beaconctl status                # watch the mesh appear; ingest logs "auto-added ..." for each
+beaconctl autoadd all off       # locked: new arrivals are listed again but no longer trusted
+```
+
+With auto-add for **repeaters** on, an unknown repeater is trusted when it sends a report or an advert (whether or not the
+advert carries a position). With auto-add for **beacons** on, an unknown beacon is trusted when a *trusted* repeater reports
+it, and that report becomes its baseline; a repeater that is not trusted can never get a beacon trusted. Turning auto-add
+on adds nothing already seen (use `add --all` for that), and turning it off removes nothing. Every repeater on the channel is
+trusted while it is on, including ones that never report (ordinary mesh repeaters), so lock it once the mesh is found.
 
 ### Beacons, prefixes and names
 
@@ -173,7 +195,7 @@ beaconctl status
 |---|---|
 | B0 | Done. Firmware repo emits golden test vectors for the report format. |
 | B1 | Done and verified on hardware: wire decoder, serial framing, companion startup, `beaconctl listen`. |
-| B2 | Code complete, not yet run against real beacons: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
+| B2 | Done and verified on hardware: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
 | B3 | Hardening and packaging: heartbeat table, retention, systemd units, udev rule, install script. |
 | B4 | Web API and minimal offline map (MBTiles). |
 

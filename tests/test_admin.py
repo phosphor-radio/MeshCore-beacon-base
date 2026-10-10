@@ -165,7 +165,7 @@ def test_status_lists_unlisted_beacons_with_their_name_and_unknown_repeaters(cfg
     assert f"{stranger.hex()}  'Shed'" in out and f"add: beaconctl beacon add {stranger.hex()}" in out
     assert f"{nameless.hex()}  (no name announced)" in out
     assert "not in the repeater table" in out and rogue[:8].hex() in out
-    assert f"no location advertised  1 observations" in out and f"add: beaconctl repeater add {rogue[:8].hex()}" in out
+    assert "no location advertised  1 reports" in out and f"add: beaconctl repeater add {rogue[:8].hex()}" in out
 
 
 def test_status_on_an_empty_database(cfg_file, capsys):
@@ -539,12 +539,14 @@ def test_repeater_add_all_adds_reporters_with_what_was_heard(cfg_file, tmp_path,
     assert code == 0 and "nothing to add" in out
 
 
-def test_repeater_add_all_ignores_repeaters_that_only_advertised(cfg_file, tmp_path, capsys):
-    heard_advert(tmp_path)  # in range of the base companion, but never reported on our channel
+def test_repeater_add_all_also_adds_repeaters_that_only_advertised(cfg_file, tmp_path, capsys):
+    heard_advert(tmp_path)  # in range of the base companion, never reported
+    heard_advert(tmp_path, key=bytes(range(1, 33)), name="Unplaced", lat=0.0, lon=0.0)
     code, out, _ = run(cfg_file, "repeater", "add", "--all", capsys=capsys)
-    assert code == 0 and "nothing to add" in out
+    assert code == 0 and "North Ridge" in out and "Unplaced" in out and "added 2 repeater(s)" in out
+    assert "1 of them have no location" in out
     _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
-    assert "no repeaters" in out
+    assert "North Ridge" in out and "Unplaced" in out
 
 
 def test_repeater_add_all_conflicts(cfg_file, capsys):
@@ -576,3 +578,92 @@ def test_check_fails_for_unlocated_repeaters(cfg_file, tmp_path, capsys):
     capsys.readouterr()
     code, out, _ = run(cfg_file, "check", capsys=capsys)
     assert code == 0 and out.startswith("ok:")
+
+
+# --- seeing everything that has been seen, and auto-add ---------------------------------------------------------------
+
+
+def test_status_lists_beacons_reported_by_repeaters_that_are_not_trusted_yet(cfg_file, tmp_path, capsys):
+    announce(tmp_path, BEACON_PREFIX, "Roof")
+    feed(tmp_path, rx(REPEATER_A_KEY, obs(3), t=time.time() - 5))  # first report from a repeater nobody has trusted
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert f"{REPEATER_A_KEY[:8].hex()}" in out and "add: beaconctl repeater add" in out
+    line = [l for l in out.splitlines() if l.strip().startswith(B1)][0]
+    assert "'Roof'" in line and "only via repeaters that are not trusted yet" in line and f"beaconctl beacon add {B1}" in line
+    assert run(cfg_file, "beacon", "add", B1) == 0  # and it can be added at once
+
+
+def test_status_lists_repeaters_that_only_advertised(cfg_file, tmp_path, capsys):
+    heard_advert(tmp_path)
+    heard_advert(tmp_path, key=bytes(range(1, 33)), name="Unplaced", lat=0.0, lon=0.0)
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert f"{RP}  'North Ridge'  at 40.500000, -75.250000  advert only" in out
+    assert "'Unplaced'  no location advertised  advert only" in out
+    assert f"add: beaconctl repeater add {RP}" in out
+
+
+def test_autoadd_shows_and_sets_both_modes(cfg_file, capsys):
+    code, out, _ = run(cfg_file, "autoadd", capsys=capsys)
+    assert code == 0 and "auto-add repeaters: off" in out and "auto-add beacons: off" in out and "lock the setup" not in out
+    code, out, _ = run(cfg_file, "autoadd", "repeaters", "on", capsys=capsys)
+    assert "auto-add repeaters: ON" in out and "auto-add beacons: off" in out and "lock the setup" in out
+    run(cfg_file, "autoadd", "beacons", "on")
+    _, out, _ = run(cfg_file, "autoadd", capsys=capsys)
+    assert "repeaters: ON" in out and "beacons: ON" in out
+    run(cfg_file, "autoadd", "all", "off")
+    _, out, _ = run(cfg_file, "autoadd", capsys=capsys)
+    assert "repeaters: off" in out and "beacons: off" in out
+    run(cfg_file, "autoadd", "all", "on")
+    _, out, _ = run(cfg_file, "autoadd", capsys=capsys)
+    assert "repeaters: ON" in out and "beacons: ON" in out
+
+
+def test_autoadd_needs_a_state_and_a_known_kind(cfg_file, capsys):
+    code, _, err = run(cfg_file, "autoadd", "beacons", capsys=capsys)
+    assert code == 2 and "on or off" in err
+    with pytest.raises(SystemExit):
+        main(["-c", cfg_file, "autoadd", "everything", "on"])
+
+
+def test_status_warns_while_auto_add_is_on(cfg_file, capsys):
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "auto-add" not in out
+    run(cfg_file, "autoadd", "beacons", "on")
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "auto-add is ON for beacons" in out and "beaconctl autoadd beacons off" in out
+    run(cfg_file, "autoadd", "repeaters", "on")
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert "auto-add is ON for repeaters and beacons" in out and "beaconctl autoadd all off" in out
+
+
+def test_check_fails_while_auto_add_is_on(cfg_file, tmp_path, capsys):
+    _secrets(tmp_path)
+    run(cfg_file, "beacon", "add", B1)
+    run(cfg_file, "repeater", "add", "11" * 8, "1", "1", "--window", "60")
+    capsys.readouterr()
+    assert run(cfg_file, "check") == 0
+    run(cfg_file, "autoadd", "repeaters", "on")
+    capsys.readouterr()
+    code, out, _ = run(cfg_file, "check", capsys=capsys)
+    assert code == 1 and "auto-add is on for repeaters" in out and "beaconctl autoadd all off" in out
+
+
+def test_discovery_then_lock_end_to_end(cfg_file, tmp_path, capsys):
+    run(cfg_file, "autoadd", "all", "on")
+    far = bytes(range(0x30, 0x50))
+    with Store.open(tmp_path / "beacon.db") as store:
+        p = Pipeline(store, assume_synced=True)
+        p.process(rx(REPEATER_A_KEY, obs(1), t=time.time() - 20))
+        p.process(rx(REPEATER_B_KEY, obs(1), obs(5, beacon=BEACON2_PREFIX), t=time.time() - 10))
+    _, out, _ = run(cfg_file, "beacon", "list", capsys=capsys)
+    assert B1 in out and B2 in out
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    assert REPEATER_A_KEY[:8].hex() in out and REPEATER_B_KEY[:8].hex() in out
+    run(cfg_file, "autoadd", "all", "off")
+    with Store.open(tmp_path / "beacon.db") as store:
+        Pipeline(store, assume_synced=True).process(rx(far, obs(1, beacon=bytes(range(0xC0, 0xC8))), t=time.time()))
+    capsys.readouterr()
+    _, out, _ = run(cfg_file, "status", capsys=capsys)
+    assert far[:8].hex() in out and "auto-add" not in out  # a newcomer after locking is listed, not trusted
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    assert far[:8].hex() not in out

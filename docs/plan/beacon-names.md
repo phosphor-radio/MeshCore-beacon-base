@@ -124,8 +124,9 @@ Decision 1, the default name follows the key:
 ### Base behavior
 
 - New data type handled in the ingest session next to reports: decode, then upsert `(prefix, name)`.
-- Accept names only from repeaters in the repeater table, as for reports (a stranger cannot fill the table). Unknown or
-  disabled repeaters are counted and ignored.
+- Accept names from any repeater, trusted or not (changed later by the discovery work in
+  [repeater-onboarding.md](repeater-onboarding.md): an unlisted beacon should be recognisable before it is added). They are
+  encrypted with the channel key like reports, so only a holder of it can send one.
 - Any announced prefix gets a name row, allowlisted or not. Latest announcement wins; a change is logged
   (`beacon f5b165 renamed 'a' -> 'b'`).
 - Names are untrusted display text. Before storing: valid UTF-8 (replace otherwise), control characters and escape sequences

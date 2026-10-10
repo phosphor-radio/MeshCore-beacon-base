@@ -209,15 +209,14 @@ def test_announced_names_are_stored_for_any_prefix_and_the_latest_wins(env):
     assert handler.counts["names_learned"] == 2 and handler.counts["names_changed"] == 1
 
 
-def test_names_from_an_unknown_or_disabled_repeater_are_ignored(env):
+def test_names_from_a_repeater_that_is_not_trusted_are_kept_so_the_beacon_can_be_recognised(env):
     fake, store, handler, _ = env
     rogue = bytes(range(0x30, 0x50))
     store.set_repeater_enabled("rb", False)
-    announce(fake, rogue, (BEACON_PREFIX, "Evil"))
-    announce(fake, REPEATER_B_KEY, (BEACON_PREFIX, "Also evil"))
-    announce(fake, REPEATER_A_KEY, (BEACON_PREFIX, "Good"))
-    wait_for(lambda: names_in(store) == {BEACON_PREFIX: "Good"})
-    assert handler.counts["names_ignored"] == 2
+    announce(fake, rogue, (BEACON_PREFIX, "From a stranger"))
+    wait_for(lambda: names_in(store) == {BEACON_PREFIX: "From a stranger"})
+    announce(fake, REPEATER_B_KEY, (BEACON_PREFIX, "From a disabled one"))
+    wait_for(lambda: names_in(store) == {BEACON_PREFIX: "From a disabled one"})
 
 
 def test_announced_names_are_cleaned(env):
@@ -305,14 +304,38 @@ def test_an_advert_heard_before_the_repeater_is_trusted_is_used_when_it_is_added
     assert (r["lat"], r["lon"], r["name"], r["location_source"]) == (39.0, -74.0, "Hilltop", "advert")
 
 
-def test_an_advert_without_a_position_from_an_untrusted_repeater_is_not_kept(env):
+def test_an_advert_without_a_position_is_kept_for_listing_and_never_erases_a_position(env):
     fake, store, handler, _ = env
     wait_for(lambda: fake.manual_add)
-    fake.advert(bytes(range(0x30, 0x50)), "Nowhere", lat=0.0, lon=0.0)
-    fake.advert(REPEATER_B_KEY, "Named at last", lat=0.0, lon=0.0)  # trusted: its name is still taken
+    unplaced = bytes(range(0x30, 0x50))
+    fake.advert(unplaced, "Nowhere", lat=0.0, lon=0.0)
+    fake.advert(REPEATER_B_KEY, "Named at last", lat=0.0, lon=0.0)  # trusted: its name is taken
     wait_for(lambda: store.repeater(REPEATER_B_KEY[:8].hex())["name"] == "Named at last")
-    assert adverts_in(store) == {}
+    wait_for(lambda: unplaced[:8] in adverts_in(store))
+    row = adverts_in(store)[unplaced[:8]]
+    assert (row["name"], row["lat"], row["lon"]) == ("Nowhere", None, None)
+    assert [r["prefix"] for r in store.unknown_repeaters(0)] == [unplaced[:8]]  # listed, so it can be added
     assert store.repeater(REPEATER_B_KEY[:8].hex())["lat"] == 1  # the position it had is not erased
+
+
+def test_auto_add_trusts_repeaters_from_their_adverts_and_reports_and_beacons_from_reports(env):
+    fake, store, handler, _ = env
+    wait_for(lambda: fake.manual_add)
+    store.set_autoadd("repeaters", True)
+    store.set_autoadd("beacons", True)
+    ridge, quiet = bytes(range(0x30, 0x50)), bytes(range(0x50, 0x70))
+    new_beacon = bytes(range(0x90, 0x98))
+    fake.advert(quiet, "Quiet", lat=0.0, lon=0.0)  # advert only, no position
+    fake.enqueue_report(wire.encode_report(ridge, [wire.Observation(new_beacon, 5, -90, -8, 3900)]))
+    wait_for(lambda: len(store.repeaters()) == 4 and count(store) == 1)
+    assert {bytes(r["prefix"]) for r in store.repeaters()} >= {ridge[:8], quiet[:8]}
+    assert store.beacon(new_beacon.hex())["hwm"] == 5
+    assert handler.counts["auto_added"] == 2  # the advert (quiet), and the report (ridge and the beacon together)
+    store.set_autoadd("repeaters", False)
+    store.set_autoadd("beacons", False)  # locked
+    fake.enqueue_report(wire.encode_report(bytes(range(0x70, 0x90)), [wire.Observation(bytes(range(0xA0, 0xA8)), 1, -90, -8, 3900)]))
+    wait_for(lambda: count(store) == 2)
+    assert len(store.repeaters()) == 4 and len(store.beacons()) == 2
 
 
 def test_onboarding_a_repeater_from_its_reports_and_its_advert(env, tmp_path, capsys):

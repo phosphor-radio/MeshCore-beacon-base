@@ -351,12 +351,12 @@ def test_names_from_a_known_repeater_are_stored_cleaned_and_reported_as_changes(
     assert (row["first_seen"], row["updated_at"], bytes(row["repeater_prefix"])) == (1000.0, 3000.0, B[:8])
 
 
-def test_names_from_unknown_or_disabled_repeaters_are_ignored(env):
+def test_names_are_taken_from_any_repeater_so_unlisted_beacons_can_be_recognised(env):
     store, p = env
-    assert p.process_names(names_rx(bytes(range(0x30, 0x50)), (BEACON_PREFIX, "Evil"))) == []
+    assert [c.new for c in p.process_names(names_rx(bytes(range(0x30, 0x50)), (BEACON_PREFIX, "From a stranger")))] == ["From a stranger"]
     store.set_repeater_enabled("rb", False)
-    assert p.process_names(names_rx(B, (BEACON_PREFIX, "Also evil"))) == []
-    assert store.conn.execute("SELECT count(*) FROM beacon_names").fetchone()[0] == 0
+    assert [c.new for c in p.process_names(names_rx(B, (BEACON_PREFIX, "From a disabled repeater"), t=2000.0))] == ["From a disabled repeater"]
+    assert store.beacon_name(BEACON_PREFIX) == "From a disabled repeater"
 
 
 def test_a_name_never_changes_a_beacons_counters(env):
@@ -371,9 +371,12 @@ def test_repeaters_are_checked_before_beacons(env):
     store, p = env
     rogue = bytes(range(0x30, 0x50))
     stranger = bytes(range(0xE0, 0xE8))
-    # unknown repeater, unknown beacon: the repeater is what is wrong, and no beacon gets listed through it
+    # unknown repeater, unknown beacon: the repeater is what is wrong, nothing is trusted or counted ...
     assert statuses(p.process(rx(rogue, obs(1, beacon=stranger)))) == [("unknown_repeater", "")]
-    assert store.unknown_beacons(0) == [] and len(store.unknown_repeaters(0)) == 1
+    assert store.conn.execute("SELECT count(*) FROM transmissions").fetchone()[0] == 0
+    # ... but both are listed, so the operator can add them straight away
+    assert [bytes(r["beacon_prefix"]) for r in store.unknown_beacons(0)] == [stranger]
+    assert [r["prefix"] for r in store.unknown_repeaters(0)] == [rogue[:8]]
     # known repeater, unknown beacon
     assert statuses(p.process(rx(A, obs(1, beacon=stranger), t=1100.0))) == [("unknown_beacon", "")]
     # disabled repeater and disabled beacon: the repeater is reported
@@ -382,11 +385,109 @@ def test_repeaters_are_checked_before_beacons(env):
     assert statuses(p.process(rx(A, obs(1), t=1200.0))) == [("disabled", "repeater")]
 
 
-def test_repeaters_can_be_onboarded_before_any_beacon_is_on_the_allowlist(tmp_path):
+def test_a_first_report_lists_both_the_repeater_and_the_beacon_at_once(tmp_path):
     with Store.open(tmp_path / "t.db") as store:
         p = Pipeline(store, boot="b")
         p.process(rx(A, obs(1), t=1000.0))
-        assert [bytes(r["repeater_prefix"]) for r in store.unknown_repeaters(0)] == [A[:8]]
+        assert [r["prefix"] for r in store.unknown_repeaters(0)] == [A[:8]]
+        (row,) = store.unknown_beacons(0)  # no waiting for the next beacon cycle
+        assert bytes(row["beacon_prefix"]) == BEACON_PREFIX and row["n_trusted"] == 0
         store.add_heard_repeaters(since=0)
         p.process(rx(A, obs(2), t=1300.0))
-        assert [bytes(r["beacon_prefix"]) for r in store.unknown_beacons(0)] == [BEACON_PREFIX]
+        (row,) = store.unknown_beacons(0)
+        assert row["n"] == 2 and row["n_trusted"] == 1
+
+
+# --- auto-add -------------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bare(tmp_path):
+    """No repeaters and no beacons trusted."""
+    store = Store.open(tmp_path / "t.db")
+    yield store, Pipeline(store, boot="boot-1")
+    store.close()
+
+
+def test_nothing_is_trusted_automatically_by_default(bare):
+    store, p = bare
+    (v,) = p.process(rx(A, obs(1)))
+    assert (v.status, v.auto_added) == ("unknown_repeater", "")
+    assert store.repeaters() == [] and store.beacons() == []
+
+
+def test_auto_add_for_repeaters_trusts_the_reporter_and_goes_on_to_judge_the_report(bare):
+    store, p = bare
+    store.set_autoadd("repeaters", True)
+    (v,) = p.process(rx(A, obs(1)))
+    assert (v.status, v.reason, v.auto_added) == ("unknown_beacon", "", "repeater")
+    assert [bytes(r["prefix"]) for r in store.repeaters()] == [A[:8]] and store.beacons() == []
+    (v,) = p.process(rx(A, obs(2), t=1300.0))
+    assert v.auto_added == ""  # it is trusted now
+
+
+def test_auto_added_repeaters_take_their_position_and_name_from_their_advert(bare):
+    store, p = bare
+    store.set_autoadd("repeaters", True)
+    store.record_repeater_advert(A, "Ridge", 40.0, -75.0, 1, 100.0, now=100.0, auto_add=False)
+    p.process(rx(A, obs(1)))
+    r = store.repeater(A[:8].hex())
+    assert (r["name"], r["lat"], r["location_source"], bytes(r["pubkey"])) == ("Ridge", 40.0, "advert", A)
+
+
+def test_auto_add_for_beacons_needs_a_trusted_repeater(bare):
+    store, p = bare
+    store.set_autoadd("beacons", True)
+    (v,) = p.process(rx(A, obs(1)))  # the repeater is not trusted
+    assert (v.status, v.auto_added) == ("unknown_repeater", "") and store.beacons() == []
+    assert [bytes(r["beacon_prefix"]) for r in store.unknown_beacons(0)] == [BEACON_PREFIX]  # still listed
+    store.add_repeater(A[:8].hex())
+    (v,) = p.process(rx(A, obs(2), t=1300.0))
+    assert (v.status, v.auto_added) == ("accepted", "beacon")  # this report is the baseline
+    b = store.beacon(B1)
+    assert b["hwm"] == 2 and b["enabled"] == 1
+    (v,) = p.process(rx(A, obs(1), t=1600.0))
+    assert (v.status, v.reason) == ("replay", "below_hwm")  # and it is protected from now on
+
+
+def test_a_disabled_repeater_is_not_a_way_to_trust_a_beacon(bare):
+    store, p = bare
+    store.set_autoadd("beacons", True)
+    store.add_repeater(A[:8].hex())
+    store.set_repeater_enabled(A[:8].hex(), False)
+    (v,) = p.process(rx(A, obs(1)))
+    assert (v.status, v.reason, v.auto_added) == ("disabled", "repeater", "") and store.beacons() == []
+
+
+def test_with_both_on_one_report_trusts_the_repeater_and_the_beacon_and_is_accepted(bare):
+    store, p = bare
+    store.set_autoadd("repeaters", True)
+    store.set_autoadd("beacons", True)
+    (v,) = p.process(rx(A, obs(7)))
+    assert (v.status, v.auto_added) == ("accepted", "repeater+beacon")
+    assert store.beacon(B1)["hwm"] == 7 and len(store.repeaters()) == 1
+    assert store.conn.execute("SELECT count(*) FROM transmissions").fetchone()[0] == 1
+
+
+def test_locking_stops_new_arrivals_without_touching_what_was_added(bare):
+    store, p = bare
+    store.set_autoadd("repeaters", True)
+    store.set_autoadd("beacons", True)
+    p.process(rx(A, obs(1)))
+    store.set_autoadd("repeaters", False)
+    store.set_autoadd("beacons", False)
+    (v,) = p.process(rx(B, obs(1, beacon=BEACON2_PREFIX), t=1300.0))
+    assert v.status == "unknown_repeater" and len(store.repeaters()) == 1
+    (v,) = p.process(rx(A, obs(1, beacon=BEACON2_PREFIX), t=1600.0))
+    assert v.status == "unknown_beacon" and len(store.beacons()) == 1
+    assert statuses(p.process(rx(A, obs(2), t=1900.0))) == [("accepted", "")]
+
+
+def test_a_report_with_several_new_beacons_trusts_each_once(bare):
+    store, p = bare
+    store.set_autoadd("repeaters", True)
+    store.set_autoadd("beacons", True)
+    v = p.process(rx(A, obs(1), obs(1, beacon=BEACON2_PREFIX), obs(2)))
+    assert [x.auto_added for x in v] == ["repeater+beacon", "beacon", ""]
+    assert [x.status for x in v] == ["accepted", "accepted", "accepted"]
+    assert len(store.beacons()) == 2 and len(store.repeaters()) == 1
