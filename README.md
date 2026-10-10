@@ -5,8 +5,8 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 
 > **Status: phase B2 plus beacon names.** `beacon-ingest` decodes reports and beacon name announcements from a companion,
 > applies the allowlist, high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and
-> repeaters by key prefix and shows a lockout and its one-step fix. B1 is verified on hardware; B2 and the names are tested
-> against a fake companion only (the repeater firmware that sends names is in the firmware repository, commit `28bb4985`).
+> repeaters by key prefix and shows a lockout and its one-step fix. B1 and the beacon names (repeater
+> firmware `28bb4985` in the firmware repository) are verified on hardware; B2 is tested against a fake companion.
 > No web UI yet (B4) and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md).
 

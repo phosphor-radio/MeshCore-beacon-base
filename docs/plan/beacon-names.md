@@ -1,8 +1,8 @@
 # Beacon Names Plan
 
-Status: **N0 done** (firmware commit `28bb4985` on the `beacon` branch), **N1 and N2 done** in this repository and tested
-without hardware (fake companion, golden vectors `tests/fixtures/beacon_names_v1.json`). **N3, the hardware check, is
-outstanding.** Done before B3.
+Status: **complete.** N0 done (firmware commit `28bb4985` on the `beacon` branch), N1 and N2 done in this repository
+(golden vectors `tests/fixtures/beacon_names_v1.json`), and **N3, the hardware check, passed** on real beacons and
+repeaters. Done before B3.
 
 Repeaters forward each beacon's advertised name to the base, so beacons are named once, on the beacon, and the base shows
 that name. The base then keys everything on the 8-byte prefix and stops asking the operator for names.

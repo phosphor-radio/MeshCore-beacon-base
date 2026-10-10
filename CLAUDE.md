@@ -9,9 +9,8 @@ repeaters hear them and publish batched reports on a private `GRP_DATA` channel;
 reports through a MeshCore **companion node over USB**, enforces replay protection, stores everything, and serves a map.
 Scale is about 30 beacons and 10 repeaters.
 
-**Status: B1 is done and verified on hardware. B2 (store and pipeline) and the beacon names work (plan
-`docs/plan/beacon-names.md`, N1 and N2) are code complete and tested without hardware; running them against real beacons
-and repeaters is outstanding (N3). B3 onwards is not started.** The plans are the source of truth:
+**Status: B1 and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and verified on hardware. B2
+(store and pipeline) is code complete and tested without hardware (fake companion). B3 onwards is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
