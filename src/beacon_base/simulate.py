@@ -18,6 +18,9 @@ class Simulator:
         self._counters = [self._rng.randrange(1, 5000) for _ in self.beacon_ids]
         self._batt = [self._rng.randrange(3500, 4150) for _ in self.beacon_ids]
 
+    def beacon_name(self, index: int) -> str:
+        return f"sim-beacon-{index + 1}"
+
     def tick(self) -> int:
         """Every beacon sends once; each repeater reports the beacons it heard. Returns the number of reports queued."""
         heard: dict[int, list[wire.Observation]] = {i: [] for i in range(len(self.repeater_keys))}

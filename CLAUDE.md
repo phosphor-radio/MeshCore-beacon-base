@@ -9,8 +9,8 @@ repeaters hear them and publish batched reports on a private `GRP_DATA` channel;
 reports through a MeshCore **companion node over USB**, enforces replay protection, stores everything, and serves a map.
 Scale is about 30 beacons and 10 repeaters.
 
-**Status: phase B1 (ingest MVP) is code complete**, with the hardware check outstanding; B2 onwards is not started.
-The plans are the source of truth:
+**Status: B1 is done and verified on hardware. B2 (store and pipeline) is code complete and tested without hardware;
+running it against real beacons and repeaters is outstanding. B3 onwards is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -63,18 +63,33 @@ src/beacon_base/   wire.py       report decoder/encoder, mirrors the firmware fo
                    companion.py  companion protocol: command builders, response parsers (pure, no I/O)
                    link.py       serial framing, FrameDecoder resync, CompanionLink request/response
                    ingest.py     CompanionSession: reconnect loop, channel provisioning, queue drain; Handler hooks
+                   store.py      SQLite schema + numbered migrations, Store with the operator queries
+                   pipeline.py   replay/dedupe pipeline: allowlist, high-water mark, grouping (one transaction per report)
+                   health.py     per-beacon state: rejected / silent / ok / disabled
+                   clock.py      boot id, monotonic offset, clock events and fixing provisional times
+                   service.py    beacon-ingest: PipelineHandler (pipeline + clock-step detection) and entry point
+                   admin.py      beaconctl commands that use the database (beacon, repeater, status, rejects, time, check)
                    config.py     TOML config + secrets.toml (mode 0600)
-                   cli.py        beaconctl
+                   cli.py        beaconctl parser, listen, simulate, channel commands
+                   runtime.py    logging and signal setup shared by entry points
                    fake_companion.py, simulate.py   fake companion on a pty and synthetic traffic
-                   (+ store.py pipeline.py clock.py estimate.py api.py)
+                   (+ estimate.py api.py)
 web/               (+) static map UI (Leaflet)
-tests/             unit, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
+tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
 deploy/            config.example.toml        (+ systemd units, udev rule, install script)
 ```
 
-`CompanionSession` takes a `Handler`; the B2 replay/dedupe pipeline plugs in there (`on_report` receives a
-`ReceivedReport` with `rx_wall`, `rx_mono`, `late`, the companion SNR and the raw payload). `on_synced` fires once the
-offline queue has been drained after connecting.
+`CompanionSession` takes a `Handler`; `service.PipelineHandler` plugs the pipeline in (`on_report` receives a
+`ReceivedReport` with `rx_wall`, `rx_mono`, `late`, the companion SNR and the raw payload; `on_drop` carries the raw frame
+of a report that failed to decode). `on_synced` fires once the offline queue has been drained after connecting.
+
+Pipeline rules worth remembering (full text in the base plan): unknown beacon/repeater and disabled entries are stored but
+change nothing; an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason
+`late` if that transmission was already seen (not a lockout, not counted in `rejects_since_accept`) or `below_hwm`
+(counts, and makes the beacon `rejected`); reset clears the mark and bumps `epoch`, and dedupe/grouping are per epoch.
+Beacons are identified by the 8-byte prefix only (no full beacon key is stored; the reports are the source of truth).
+Once a database is deployed, schema changes must be a new numbered migration in `store.MIGRATIONS`; before the first
+deployment migration 1 may still be edited, and the development database deleted.
 
 ## Constraints to keep in mind
 
@@ -98,12 +113,15 @@ offline queue has been drained after connecting.
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'     # editable install; needs pyserial, pytest
-pytest                       # ~70 tests, ~5 s, no hardware needed (fake companion on a pty)
-beaconctl simulate           # fake companion + synthetic reports; prints the pty path to pass to `listen --port`
-beaconctl listen             # real or simulated companion: print decoded reports
+pytest                       # ~150 tests, ~10 s, no hardware needed (fake companion on a pty)
+beaconctl simulate --provision   # fake companion + synthetic reports (+ matching beacons/repeaters); prints the pty path
+beacon-ingest --port <path>      # store reports; then 'beaconctl status', 'rejects', 'beacon status <name>'
+beaconctl listen                 # bring-up: print decoded reports without storing (only one of listen/ingest owns the port)
 ```
 
-Config is `~/.config/beacon-base/config.toml` (or `-c`, or `$BEACON_BASE_CONFIG`); see `deploy/config.example.toml`.
+Config is `~/.config/beacon-base/config.toml` (or `-c`, or `$BEACON_BASE_CONFIG`); see `deploy/config.example.toml`. The
+SQLite database defaults to `beacon.db` next to it. Set `[clock] assume_synced = true` on the dev machine, otherwise
+observation times stay provisional until `beaconctl time set|confirm`.
 `beaconctl channel generate` writes the channel key to `secrets.toml` next to it. Never commit either file; `.gitignore`
 covers `config.toml`/`secrets.toml` at the repo root only, so keep real ones outside the repo.
 

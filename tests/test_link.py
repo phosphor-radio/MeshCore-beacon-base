@@ -115,3 +115,27 @@ def test_request_times_out():
     link = CompanionLink(ScriptedTransport([]), command_timeout=0.3)
     with pytest.raises(LinkError):
         link.request(b"\x16\x03", [13])
+
+
+def test_serial_transport_turns_termios_errors_into_link_errors(monkeypatch):
+    """A port that vanishes mid-write raises termios.error from flush(), which is not an OSError."""
+    import termios
+
+    from beacon_base.link import SerialTransport
+
+    class Gone:
+        def write(self, data):
+            return len(data)
+
+        def flush(self):
+            raise termios.error(5, "Input/output error")
+
+        def close(self):
+            raise termios.error(5, "Input/output error")
+
+    t = SerialTransport.__new__(SerialTransport)
+    t._port = Gone()
+    t._errors = (OSError, termios.error)
+    with pytest.raises(LinkError):
+        t.write(b"x")
+    t.close()  # closing a dead port must not raise

@@ -45,12 +45,39 @@ class CompanionConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    path: str = "beacon.db"  # relative paths are resolved against the config file's directory
+
+
+@dataclass(frozen=True)
+class BeaconConfig:
+    interval_s: float = 300.0  # expected beacon transmit interval (jitter is +/-10%)
+    silent_intervals: float = 3.0  # a beacon not heard for this many intervals is "silent"
+    jitter: float = 0.1
+
+
+@dataclass(frozen=True)
+class ClockConfig:
+    assume_synced: bool = False  # trust the system clock without 'beaconctl time set' (NTP, RTC), e.g. on a dev machine
+
+
+@dataclass(frozen=True)
 class Config:
     companion: CompanionConfig = field(default_factory=CompanionConfig)
     radio: RadioConfig = field(default_factory=RadioConfig)
     channel_key: bytes | None = None
     config_path: Path | None = None
     secrets_path: Path | None = None
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    beacon: BeaconConfig = field(default_factory=BeaconConfig)
+    clock: ClockConfig = field(default_factory=ClockConfig)
+
+    @property
+    def db_path(self) -> Path:
+        path = Path(self.database.path).expanduser()
+        if path.is_absolute() or self.config_path is None:
+            return path
+        return self.config_path.parent / path
 
 
 def resolve_config_path(explicit: str | os.PathLike[str] | None) -> tuple[Path, bool]:
@@ -109,18 +136,23 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     elif required:
         raise ConfigError(f"config file not found: {path}")
 
-    unknown = set(data) - {"companion", "radio", "secrets_file"}
+    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "secrets_file"}
     if unknown:
         raise ConfigError(f"{path}: unknown section(s): {', '.join(sorted(unknown))}")
 
     companion = _section(data, "companion", CompanionConfig, path)
     radio = _section(data, "radio", RadioConfig, path)
+    database = _section(data, "database", DatabaseConfig, path)
+    beacon = _section(data, "beacon", BeaconConfig, path)
+    clock = _section(data, "clock", ClockConfig, path)
     if not 0 <= companion.channel_index <= 255:
         raise ConfigError("companion.channel_index must be 0-255")
     if not 0 < len(companion.channel_name.encode("utf-8")) < 32:
         raise ConfigError("companion.channel_name must be 1-31 bytes")
     if companion.poll_interval <= 0 or companion.command_timeout <= 0:
         raise ConfigError("companion.poll_interval and companion.command_timeout must be positive")
+    if beacon.interval_s <= 0 or beacon.silent_intervals <= 0 or not 0 <= beacon.jitter < 1:
+        raise ConfigError("beacon.interval_s and beacon.silent_intervals must be positive and beacon.jitter in [0, 1)")
 
     spath = secrets_path_for(path, data)
     key = None
@@ -129,7 +161,16 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         raw_key = secrets.get("channel", {}).get("key")
         if raw_key is not None:
             key = parse_channel_key(str(raw_key))
-    return Config(companion=companion, radio=radio, channel_key=key, config_path=path, secrets_path=spath)
+    return Config(
+        companion=companion,
+        radio=radio,
+        channel_key=key,
+        config_path=path,
+        secrets_path=spath,
+        database=database,
+        beacon=beacon,
+        clock=clock,
+    )
 
 
 def _toml_value(v: object) -> str:

@@ -106,9 +106,12 @@ class SerialTransport:
     """pyserial transport. Raises LinkError for any port failure so callers handle one exception type."""
 
     def __init__(self, path: str, baud: int = 115200):
+        import termios
+
         import serial
 
-        self._serial_exc = serial.SerialException
+        # termios.error is not an OSError; a port that vanishes mid-write raises it from flush()
+        self._errors = (OSError, serial.SerialException, termios.error)
         port = serial.Serial()
         port.port = path
         port.baudrate = baud
@@ -121,7 +124,7 @@ class SerialTransport:
         port.exclusive = True  # only one process may talk to the companion
         try:
             port.open()
-        except (OSError, self._serial_exc) as e:
+        except self._errors as e:
             raise LinkError(f"cannot open {path}: {e}") from e
         self._port = port
 
@@ -134,20 +137,20 @@ class SerialTransport:
                 if waiting:
                     data += self._port.read(waiting)
             return data
-        except (OSError, self._serial_exc) as e:
+        except self._errors as e:
             raise LinkError(f"serial read failed: {e}") from e
 
     def write(self, data: bytes) -> None:
         try:
             self._port.write(data)
             self._port.flush()
-        except (OSError, self._serial_exc) as e:
+        except self._errors as e:
             raise LinkError(f"serial write failed: {e}") from e
 
     def close(self) -> None:
         try:
             self._port.close()
-        except (OSError, self._serial_exc):
+        except self._errors:
             pass
 
 

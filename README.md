@@ -3,9 +3,10 @@
 Base station software for the MeshCore beacon tracking system. It collects beacon sightings reported by fixed repeaters,
 rejects replayed or unknown beacons, and (later) estimates and maps where each beacon is.
 
-> **Status: phase B1 (ingest MVP).** `beaconctl listen` decodes beacon reports from a companion and prints them; there is
-> no database, allowlist or replay protection yet (B2) and no web UI (B4). Tested against a fake companion; the check
-> against real hardware is outstanding. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md).
+> **Status: phase B2 (store and pipeline).** `beacon-ingest` decodes reports from a companion, applies the allowlist,
+> high-water mark and dedupe, and stores everything in SQLite; `beaconctl` provisions beacons and repeaters and shows a
+> lockout and its one-step fix. B1 is verified on hardware; B2 is tested against a fake companion only. No web UI yet (B4)
+> and no packaging (B3). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md).
 
 ## How the system works
 
@@ -31,8 +32,7 @@ also run on an ordinary Ubuntu machine for development.
 
 ## What is in this repo
 
-Planned: three cooperating processes sharing one SQLite database (WAL mode) as their only interface. Only the first
-exists so far, as the `beacon_base.ingest` session library driven by `beaconctl listen`:
+Three cooperating processes sharing one SQLite database (WAL mode) as their only interface. The web UI does not exist yet:
 
 | Process | Job |
 |---|---|
@@ -78,35 +78,62 @@ mkdir -p ~/.config/beacon-base
 cp deploy/config.example.toml ~/.config/beacon-base/config.toml    # then set companion.port
 beaconctl channel generate                   # new 16-byte report channel key, saved to secrets.toml (mode 0600)
                                              # paste the printed key into each repeater: beacon.channel <hex>
-beaconctl listen                             # provision the companion's channel and print decoded reports
+beaconctl status                             # lists beacons the repeaters report that are not on the allowlist yet
+beaconctl beacon add beacon-001 <prefix>     # add one by the 16-character key prefix status shows
+beaconctl repeater add north-ridge <key-or-prefix> 40.1234 -75.5678 --window 20
+beaconctl check                              # sanity-check the setup
+beacon-ingest                                # own the companion port and store reports (systemd service later)
+beaconctl status                             # one line per beacon, rejected and silent first
 ```
 
-`beaconctl` options: `-c <config>` (or `$BEACON_BASE_CONFIG`), `-v` for debug logging.
+`beaconctl` options: `-c <config>` (or `$BEACON_BASE_CONFIG`), `-v` for debug logging. The database defaults to
+`beacon.db` next to the config file.
 
 | Command | What it does |
 |---|---|
-| `channel generate [--force]` | Create the report channel key. Refuses to replace an existing key without `--force`, since every repeater would need updating. |
-| `channel set <hex\|->` `[--force]` | Store a predetermined key (32 hex characters), for example one the repeaters already use. `-` reads it from stdin to keep it out of shell history. Needs `--force` to replace a different existing key. |
-| `channel show` | Print the key again, for provisioning another repeater. |
-| `listen [--port P] [--json] [--count N]` | Connect to the companion, set up the channel, drain its queue and print one line per observation. Entries drained right after connecting are marked `late`. |
-| `simulate [--interval S] [--beacons N] [--repeaters N]` | Run a fake companion on a pseudo-terminal with synthetic reports. Run `beaconctl listen --port <printed path>` in another terminal. |
+| `channel generate [--force]` / `channel set <hex\|-> [--force]` / `channel show` | Create, store or print the report channel key. Replacing an existing key needs `--force`, since every repeater would need updating. |
+| `beacon add <name> <prefix>` | Allowlist a beacon by the 8-byte key prefix its reports carry (16 hex characters, shown by `status`). A full 64-character key, for example from the beacon's serial `pubkey` command, is accepted and reduced to its prefix. A prefix or name that is already used is refused. |
+| `beacon list` / `status <name>` / `remove` / `enable` / `disable` | The allowlist. |
+| `beacon reset <name>` | Clear the high-water mark; the next report becomes the new baseline. Do it while the beacon is transmitting. |
+| `repeater add <name> <key> <lat> <lon> [--window S]` / `list` / `remove` / `enable` / `disable` / `window <name> <S>` | The repeater table. Reports from repeaters not in it are stored but ignored. |
+| `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), plus beacons and repeaters heard but not on the lists. |
+| `rejects [--beacon X] [--limit N]` | Recent observations that were not accepted, with the reason. |
+| `time` / `time set "YYYY-MM-DD HH:MM:SS"` / `time confirm` | Show or fix the clock state. The Pi has no internet, so its clock is set by hand; times stay provisional until then. |
+| `check` | Warn about missing setup and repeater report windows that are too long for the beacon interval. |
+| `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
+| `ingest [--port P]` | Same as `beacon-ingest`. |
+| `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
+
+### Adding beacons
+
+Repeater reports identify a beacon by an 8-byte prefix of its public key, and that prefix is all the base keeps or needs:
+the allowlist, high-water mark and dedupe all work on it. So the onboarding workflow is: configure the beacons, let them
+transmit, run `beaconctl status`, and add each one it lists under "heard but not on the allowlist" with
+`beaconctl beacon add <name> <prefix>`. To pre-register a beacon before it transmits, use the prefix (or the full key) from
+its serial `pubkey` command.
+
+### When a beacon is locked out
+
+A beacon is locked out when its counter is at or below the stored high-water mark, for example after a forged report with
+a huge counter or after its flash was erased. `beaconctl status` shows it first, as `rejected`, with the counters, the
+repeaters that sent them and the fix:
+
+```
+STATE     NAME        PREFIX            HWM      HEARD   BATT   DETAIL
+rejected  beacon-001  a0a1a2a3a4a5a6a7  1000000  12s ago 3.98V  3 replays rejected since 14:00:03 (counters 300-302, hwm 1000000) via north-ridge; fix: beaconctl beacon reset beacon-001
+```
+
+`beaconctl beacon reset beacon-001` clears it in one step. A report that arrives after a newer one from the same beacon was
+accepted (a repeater with a long `beacon.window`) is rejected as `late` but is not a lockout; keep every repeater's
+window below the beacon interval (`beaconctl check` warns).
 
 ### Working without hardware
 
 ```bash
 beaconctl channel generate
-beaconctl simulate --interval 2          # prints the fake companion's path
-beaconctl listen --port /tmp/fake-companion-XXXX/ttyFAKE
-```
-
-## Still to come
-
-```bash
-beaconctl beacon add <name> <pubkey-hex>    # allowlist a beacon (key from the beacon's serial `pubkey` command)
-beaconctl repeater add <name> <key> <lat> <lon>
-beaconctl status                            # one line per beacon; rejected and silent first
-beaconctl beacon reset <name>               # clear a beacon's high-water mark
-beaconctl time                              # show/set the Pi clock (no internet in the field)
+beaconctl simulate --provision --interval 2     # adds simulated beacons/repeaters, prints the fake companion's path
+beacon-ingest --port /tmp/fake-companion-XXXX/ttyFAKE
+beaconctl status
 ```
 
 ## Roadmap
@@ -114,9 +141,9 @@ beaconctl time                              # show/set the Pi clock (no internet
 | Phase | Scope |
 |---|---|
 | B0 | Done. Firmware repo emits golden test vectors for the report format. |
-| B1 | Code complete: wire decoder, serial framing, companion startup, `beaconctl listen`. Hardware check outstanding. |
-| B2 | SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states. |
-| B3 | Hardening and packaging: reconnect, heartbeat, clock handling, systemd units, udev rule, install script. |
+| B1 | Done and verified on hardware: wire decoder, serial framing, companion startup, `beaconctl listen`. |
+| B2 | Code complete, not yet run against real beacons: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
+| B3 | Hardening and packaging: heartbeat table, retention, systemd units, udev rule, install script. |
 | B4 | Web API and minimal offline map (MBTiles). |
 
 Later: location estimation, offline tile-cache builder, repeater timestamps, airtime measurement.

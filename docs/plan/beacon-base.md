@@ -4,9 +4,10 @@ Covers the second half of milestone 3 (base ingest) and all of milestone 4 (allo
 in [beacon-project.md](beacon-project.md), and sets up the architecture for the map UI and location estimation
 (milestone 6) so they slot in without rework.
 
-Status: B0 done (firmware commit `55fe473a`). B1 is code complete and tested against a fake companion; the hardware check
-(a real repeater report decoded from the XIAO S3 WIO companion) is outstanding. B2 onwards not started. Decisions from the
-2026-10-08 review are recorded in "Decisions" below.
+Status: B0 done (firmware commit `55fe473a`). B1 done and verified on hardware (`beaconctl listen` against the XIAO S3 WIO
+companion). B2 is code complete and tested without hardware (fake companion); a run against real beacons and repeaters is
+outstanding. B3 onwards not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
+made while implementing B2 are marked "(B2)".
 
 ## Decisions
 
@@ -19,6 +20,7 @@ Status: B0 done (firmware commit `55fe473a`). B1 is code complete and tested aga
 | 5 | **Late-report cutoff is in:** strict high-water mark plus the rule that the repeater report window stays below the beacon interval. |
 | 6 | **Time is stamped on the base**, from the Pi's clock, set manually after boot. Repeater-side timestamps are parked (see "Time"). |
 | 7 | Test base companion: **XIAO ESP32-S3 + Wio-SX1262** running `Xiao_S3_WIO_companion_radio_usb` (USB, no Bluetooth). |
+| 8 | **Beacons are identified by their 8-byte key prefix only.** Reports carry nothing else, every pipeline decision uses only the prefix, and a full key would have no use at the base (a signature check would need the *repeater's* key, which the repeater table keeps). `beacon add` takes the prefix. The reports are the source of truth, so the base does not collect adverts from the companion. |
 
 ## Goals and constraints
 
@@ -102,11 +104,15 @@ Uses the existing USB serial interface; **no firmware change is needed for the b
 
 ## Data model (SQLite)
 
-Names are indicative; migrations are numbered from the start so schema changes are painless on a deployed Pi.
+Names are indicative; migrations are numbered from the start so schema changes are painless on a deployed Pi. (B2) Migration
+1 holds `beacons`, `repeaters`, `raw_frames`, `observations`, `transmissions` and `clock_events`; `service_status` and
+`positions` arrive as later migrations with the phases that write them. Added in B2: `beacons.epoch` and `last_heard_at`
+(any report of the beacon, accepted or not, for the `silent` state), `observations.epoch`, and `repeaters.window_s` (the
+repeater's `beacon.window`, for `beaconctl check`). The database file defaults to `beacon.db` next to the config.
 
-- `beacons`: `pubkey` (32 bytes, primary key), `prefix` (first 8 bytes, unique), `name`, `enabled`, `hwm` (highest
+- `beacons`: `prefix` (the 8-byte key prefix, primary key), `name`, `enabled`, `hwm` (highest
   accepted counter, NULL means "next report becomes the baseline"), `hwm_at`, `notes`. **This table is the allowlist.**
-  Adding a beacon whose 8-byte prefix collides with an existing one is refused. Also denormalised for fast display:
+  Adding a beacon whose prefix or name is already used is refused. No full beacon key is stored (decision 8). Also denormalised for fast display:
   `last_accept_at`, `last_reject_at`, `last_reject_counter`, `rejects_since_accept`.
 - `repeaters`: `prefix` (8 bytes, primary key), `pubkey` (optional), `name`, `lat`, `lon`, `enabled`. Authoritative
   repeater locations. Optionally importable from the companion's contact list (`CMD_GET_CONTACTS` returns lat/lon for
@@ -141,14 +147,20 @@ report so it is idempotent and crash-safe. For each entry in a decoded report:
    (a rogue or misconfigured repeater must not be able to move it). It is shown in the UI as an action item.
 4. **High-water mark.**
    - `hwm` is NULL: accept, set `hwm = counter` (baseline).
-   - `counter < hwm`: reject as `replay`.
+   - `counter < hwm`: reject as `replay`. (B2) The reason is `late` if that `(beacon, counter)` transmission was already seen
+     in this epoch (a repeater's report arriving after a newer transmission was accepted, see "Late-report cutoff"), else
+     `below_hwm`. Only `below_hwm` counts towards the beacon's `rejected` state: a late report is not a lockout.
    - `counter == hwm`: same transmission as the current one, so it joins the group (not a replay).
    - `counter > hwm`: new transmission, accept and advance `hwm`.
-5. **Dedupe.** Unique `(repeater, beacon, counter)`; a repeat is stored as `duplicate`. This also covers a replayed
+5. **Dedupe.** Unique `(repeater, beacon, epoch, counter)`; a repeat is stored as `duplicate`. This also covers a replayed
    repeater report.
 6. **Group.** Attach to the `(beacon, counter)` transmission and re-run the estimator for it.
-7. **Reset.** `beaconctl reset <beacon>` (and later a UI button) sets `hwm = NULL`. Per the plan, do it while the beacon
-   is known to be transmitting.
+7. **Reset.** `beaconctl beacon reset <beacon>` (and later a UI button) sets `hwm = NULL`. Per the plan, do it while the
+   beacon is known to be transmitting. (B2) It also bumps the beacon's `epoch`. Dedupe and grouping are scoped to the epoch,
+   otherwise a beacon whose counter restarts low after a reset (the flash-erased case) would have its new reports taken for
+   duplicates of the old ones.
+8. **Disabled.** (B2) A beacon or repeater switched off with `enabled = 0` is stored as `disabled` (reason `beacon` or
+   `repeater`) and changes nothing. Unlike `unknown_*` it is not an action item.
 
 ### Late-report cutoff
 
@@ -195,6 +207,12 @@ Beacons have no clock and reports carry no time (decision 7 of the main plan), s
     correct times, and `time_trusted` becomes true;
   - until the operator has set the clock (or ingest has seen a step this boot), observations are `time_trusted = 0`,
     and the UI shows a "clock not set" banner. `beaconctl time` shows the current state.
+- (B2) Implemented as: `beaconctl time` shows the state; `beaconctl time set "YYYY-MM-DD HH:MM:SS"` runs
+  `sudo timedatectl set-time`, records a `clock_events` row and corrects the boot's provisional times; `beaconctl time
+  confirm` does the same for a clock that is already right (set another way, or an RTC). Ingest also detects a step
+  (offset change over 5 s) on its own, unless `beaconctl time` already recorded it. `clock.assume_synced = true` trusts the
+  system clock, for the development machine. Times denormalised onto `transmissions` and `beacons` are recomputed from the
+  observations after a correction. A boot with no clock event stays provisional, and `status` and `rejects` mark it.
 - **Parked:** timestamping at the repeaters (the observation time at the repeater is the ideal timestamp). It needs the
   time set on every repeater at setup and a report v2 field; not needed for the solution to work. Also parked: a BLE
   GATT time service on the Pi so a phone can set the clock.
@@ -204,7 +222,9 @@ Beacons have no clock and reports carry no time (decision 7 of the main plan), s
 - `beaconctl channel generate` creates a random 16-byte key, stores it in `secrets.toml` next to the base config (mode
   0600, never in git; kept separate so the hand-edited config can be shared) and prints the hex to paste into each
   repeater's `beacon.channel`. It refuses to replace an existing key without `--force`. `beaconctl channel show` prints it again.
-- `beaconctl beacon add <name> <pubkey-hex>`; the key comes from the beacon's serial `pubkey` command.
+- `beaconctl beacon add <name> <prefix>`; the 16-character prefix is listed by `beaconctl status` once a repeater has reported
+  the beacon, or comes from the beacon's serial `pubkey` command (a full key is accepted and reduced to its prefix).
+  Onboarding is: configure the beacons, let them transmit, then add them from the unlisted list in `status`.
 - `beaconctl repeater add <name> <pubkey-or-prefix> <lat> <lon>`; the key comes from the repeater's CLI.
 - `beaconctl beacon reset <name>`, `... list`, `... status` (last heard, counter, battery, which repeaters hear it).
 - `beaconctl time` shows and sets the clock state (see "Time"), `beaconctl status` and `beaconctl rejects` as above.
@@ -246,7 +266,7 @@ when the replay scenarios above pass, a lockout is visible in `beaconctl status`
 state survives a restart.
 
 **B3. Service hardening and packaging.**
-Reconnect and resync, heartbeat table, clock-step handling, retention job, systemd units, a udev rule giving the companion a stable name,
+Heartbeat table, retention job (reconnect and resync exist from B1; clock-step handling moved into B2), systemd units, a udev rule giving the companion a stable name,
 install script for a Pi and for the dev machine, logging to journald, a short operator README. Done when the service
 survives unplugging the companion and reboots of the Pi unattended.
 

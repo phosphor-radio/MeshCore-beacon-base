@@ -1,0 +1,116 @@
+"""beacon-ingest: the service that owns the companion's serial port and feeds the pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import logging
+import sys
+import threading
+from collections import Counter
+
+from . import clock
+from .config import Config, ConfigError, load_config
+from .ingest import CompanionSession, ConnectionInfo, Handler, RawFrame, ReceivedReport
+from .link import CompanionError
+from .pipeline import Pipeline
+from .runtime import setup_logging, stop_on_signals
+from .store import Store, StoreError
+
+log = logging.getLogger("beacon-ingest")
+
+
+class PipelineHandler(Handler):
+    """Runs every decoded report through the replay/dedupe pipeline and watches for the system clock being set."""
+
+    def __init__(self, store: Store, pipeline: Pipeline):
+        self._store = store
+        self._pipeline = pipeline
+        self._offset = clock.offset()  # wall minus monotonic clock; a jump means someone set the clock
+        self.counts: Counter[str] = Counter()
+
+    def on_connected(self, info: ConnectionInfo) -> None:
+        log.info("connected to companion %r", info.self_info.name)
+
+    def on_synced(self) -> None:
+        log.info("companion queue drained, now live")
+
+    def on_disconnected(self, error: str | None) -> None:
+        log.warning("companion disconnected%s", f": {error}" if error else "")
+
+    def on_report(self, rx: ReceivedReport) -> None:
+        self._check_clock_step(rx)
+        verdicts = self._pipeline.process(rx)
+        beacons, repeaters = self._store.names()
+        summary: Counter[str] = Counter()
+        for v in verdicts:
+            summary[v.status] += 1
+            self.counts[v.status] += 1
+            who = f"{v.beacon_name or v.beacon_prefix.hex()} counter {v.counter} via {v.repeater_name or v.repeater_prefix.hex()}"
+            if v.status == "accepted":
+                log.debug("accepted %s", who)
+            elif v.status == "duplicate":
+                log.debug("duplicate %s", who)
+            elif v.reason == "late":
+                log.info("late report (a newer transmission was already accepted): %s", who)
+            else:
+                log.warning("%s%s: %s", v.status, f" ({v.reason})" if v.reason else "", who)
+        repeater = repeaters.get(bytes(rx.report.repeater_id)) or rx.report.repeater_id.hex()
+        log.info(
+            "report from %s%s: %s",
+            repeater,
+            " (late)" if rx.late else "",
+            ", ".join(f"{n} {status}" for status, n in sorted(summary.items())) or "no entries",
+        )
+
+    def on_drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:
+        if raw is not None:
+            self._pipeline.record_bad_report(raw, detail)
+            log.warning("dropped a malformed report: %s", detail.split(":", 1)[0])
+        else:
+            log.debug("ignored frame (%s): %s", reason, detail)
+
+    def _check_clock_step(self, rx: ReceivedReport) -> None:
+        offset = rx.rx_wall - rx.rx_mono
+        if abs(offset - self._offset) <= clock.STEP_THRESHOLD:
+            return
+        with self._store.transaction() as db:
+            last = clock.last_event(db, self._pipeline.boot)
+            if last is not None and abs(last["offset_after"] - offset) <= clock.STEP_THRESHOLD:
+                n = None  # 'beaconctl time' already recorded and applied this change
+            else:
+                n = clock.apply_clock_event(db, self._pipeline.boot, "step", self._offset, offset, rx.rx_wall)
+        if n is not None:
+            log.warning("system clock was set (%+.0f s); corrected the time of %d earlier observations", offset - self._offset, n)
+        self._offset = offset
+
+
+def run(cfg: Config, stop: threading.Event) -> None:
+    if cfg.channel_key is None:
+        raise ConfigError("no report channel key; run 'beaconctl channel generate' first")
+    with Store.open(cfg.db_path) as store:
+        log.info("database %s (schema %d)", cfg.db_path, store.schema_version())
+        pipeline = Pipeline(store, assume_synced=cfg.clock.assume_synced)
+        CompanionSession(cfg, PipelineHandler(store, pipeline)).run(stop)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="beacon-ingest", description="Ingest beacon reports from a companion into the database")
+    p.add_argument("-c", "--config", help="config file (default: $BEACON_BASE_CONFIG or ~/.config/beacon-base/config.toml)")
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    p.add_argument("--port", help="companion serial port (overrides companion.port)")
+    args = p.parse_args(argv)
+    setup_logging(args.verbose)
+    try:
+        cfg = load_config(args.config)
+        if args.port:
+            cfg = dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, port=args.port))
+        run(cfg, stop_on_signals())
+    except (ConfigError, CompanionError, StoreError) as e:
+        print(f"beacon-ingest: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

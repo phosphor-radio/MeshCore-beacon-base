@@ -19,6 +19,7 @@ dev = [
 
 [project.scripts]
 beaconctl = "beacon_base.cli:main"
+beacon-ingest = "beacon_base.service:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

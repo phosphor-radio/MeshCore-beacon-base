@@ -26,3 +26,18 @@ freq_khz = 905775
 bw_hz = 62500
 sf = 8
 cr = 6      # 6 means coding rate 4/6
+
+[database]
+# SQLite file shared by ingest, the CLI and (later) the web UI. Relative paths are relative to this file's directory.
+path = "beacon.db"
+
+[beacon]
+# Expected beacon transmit interval (seconds, +/-10% jitter). Used to decide when a beacon is "silent" and to check that
+# repeater report windows stay below the shortest interval (see 'beaconctl check').
+interval_s = 300
+silent_intervals = 3
+
+[clock]
+# The Pi has no internet in the field, so its clock is set by hand ('beaconctl time set'). Set this to true on a machine
+# whose clock is already right (NTP, RTC), such as the development machine, to trust observation times without that.
+assume_synced = false

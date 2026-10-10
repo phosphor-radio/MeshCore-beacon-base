@@ -27,6 +27,7 @@ class Collector(Handler):
     def __init__(self):
         self.reports = []
         self.drops = []
+        self.raw_drops = []
         self.connects = 0
         self.synced = 0
         self.disconnects = []
@@ -46,8 +47,10 @@ class Collector(Handler):
     def on_report(self, rx):
         self._note(lambda: self.reports.append(rx))
 
-    def on_drop(self, reason, detail):
+    def on_drop(self, reason, detail, raw=None):
         self._note(lambda: self.drops.append((reason, detail)))
+        if raw is not None:
+            self._note(lambda: self.raw_drops.append(raw))
 
     def on_disconnected(self, error):
         self._note(lambda: self.disconnects.append(error))
@@ -175,6 +178,8 @@ def test_unrelated_traffic_is_counted_and_dropped(fake):
     )
     assert run.session.stats["reports"] == 1
     assert run.session.stats["dropped_bad_report"] == 2
+    assert len(run.handler.raw_drops) == 2  # malformed reports come with their raw frame for the audit trail
+    assert run.handler.raw_drops[0].payload.startswith(b"\x02")
 
 
 def test_garbage_between_frames_is_survived(fake):

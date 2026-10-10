@@ -241,8 +241,8 @@ Estimates, to be validated by measurement.
   - beacon counter, 4 bytes (could be truncated to the low bits, since the base knows the high-water mark)
   - RSSI and SNR, 1 byte each
   - battery, 2 bytes
-- Plus a small header (repeater identification, batch info). The base maps the prefix to a full key through its
-  allowlist.
+- Plus a small header (repeater identification, batch info). The base's allowlist is keyed by the prefix;
+  it never needs the full key.
 - Capacity is about 165 data bytes per packet, so roughly 9-10 entries per packet.
 - The reserved 8-16 beacon bytes are not forwarded by default (every repeater would repeat the same bytes). Whether to
   forward them is an open question.

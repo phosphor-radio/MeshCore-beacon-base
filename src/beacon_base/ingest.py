@@ -16,8 +16,8 @@ from typing import Callable
 
 from . import companion, wire
 from .companion import DeviceInfo, SelfInfo
-from .config import CompanionConfig, Config, ConfigError, RadioConfig
-from .link import CompanionError, CompanionLink, CommandError, LinkError, SerialTransport, Transport
+from .config import Config, ConfigError, RadioConfig
+from .link import CompanionError, CompanionLink, CommandError, SerialTransport, Transport
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,18 @@ FREQ_TOLERANCE_KHZ = 1  # the companion reports its float frequency truncated to
 class ConnectionInfo:
     self_info: SelfInfo
     device_info: DeviceInfo
+
+
+@dataclass(frozen=True)
+class RawFrame:
+    """A frame on the report channel that did not decode, kept for the audit trail."""
+
+    payload: bytes
+    companion_snr_x4: int
+    path_len: int
+    rx_wall: float
+    rx_mono: float
+    late: bool
 
 
 @dataclass(frozen=True)
@@ -54,8 +66,9 @@ class Handler:
 
     def on_report(self, rx: ReceivedReport) -> None: ...
 
-    def on_drop(self, reason: str, detail: str) -> None:
-        """A frame that is not a usable beacon report. reason is one of Session.DROP_REASONS."""
+    def on_drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:
+        """A frame that is not a usable beacon report. reason is one of CompanionSession.DROP_REASONS. raw is set for
+        ``bad_report``, a frame on the report channel that failed to decode."""
 
     def on_disconnected(self, error: str | None) -> None: ...
 
@@ -235,10 +248,12 @@ class CompanionSession:
         if data.data_type != wire.REPORT_DATA_TYPE:
             self._drop("other_data_type", f"data_type {data.data_type:#06x}")
             return
+        rx_wall, rx_mono = time.time(), time.monotonic()
         try:
             report = wire.decode_report(data.payload)
         except wire.WireError as e:
-            self._drop("bad_report", f"{e}: {data.payload.hex()}")
+            raw = RawFrame(data.payload, data.snr_x4, data.path_len, rx_wall, rx_mono, self._first_drain)
+            self._drop("bad_report", f"{e}: {data.payload.hex()}", raw)
             return
         self.stats["reports"] += 1
         self._handler.on_report(
@@ -246,14 +261,14 @@ class CompanionSession:
                 report=report,
                 companion_snr_x4=data.snr_x4,
                 path_len=data.path_len,
-                rx_wall=time.time(),
-                rx_mono=time.monotonic(),
+                rx_wall=rx_wall,
+                rx_mono=rx_mono,
                 late=self._first_drain,
                 payload=data.payload,
             )
         )
 
-    def _drop(self, reason: str, detail: str) -> None:
+    def _drop(self, reason: str, detail: str, raw: RawFrame | None = None) -> None:
         self.stats[f"dropped_{reason}"] += 1
         log.debug("dropped frame (%s): %s", reason, detail)
-        self._handler.on_drop(reason, detail)
+        self._handler.on_drop(reason, detail, raw)
