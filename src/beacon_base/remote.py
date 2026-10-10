@@ -11,18 +11,22 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any
 
 KINDS = (
     "name", "location", "advert.interval", "flood.advert.interval",
     "beacon.stats", "beacon.window", "beacon.channel", "beacon.names", "beacon.name_refresh",
-    "all",
+    "all", "clock", "advert", "reboot",
 )
 # read-only over the mesh: the channel key must not cross the air, and the counters are not settable
-READ_ONLY = frozenset({"beacon.stats", "beacon.channel", "all"})
-SETTABLE = frozenset(KINDS) - READ_ONLY
-OPS = ("get", "set")
+READ_ONLY = frozenset({"beacon.stats", "beacon.channel", "all", "clock"})
+RUNNABLE = frozenset({"clock", "advert", "reboot"})  # actions: sync the repeater's clock to the base's, send a flood advert, reboot
+RUN_ONLY = RUNNABLE - {"clock"}  # clock can also be read
+SETTABLE = frozenset(KINDS) - READ_ONLY - RUN_ONLY
+OPS = ("get", "set", "run")
+CLOCK_TOLERANCE_S = 90  # the repeater reports its clock in whole minutes, and a command takes seconds to arrive
 
 NAME_BAD_CHARS = frozenset("[]\\:,?*")  # the firmware refuses a name containing any of these
 NAME_MAX_BYTES = 31
@@ -52,6 +56,7 @@ ERROR_TEXT = {
     "interrupted": "ingest stopped or lost the companion while the job was running",
     "contact_failed": "the companion would not take the repeater as a contact",
     "companion_refused": "the companion would not send it",
+    "clock_ahead": "the repeater's clock is ahead of the base's and cannot be set back",
 }
 
 
@@ -91,7 +96,8 @@ class JobOutcome:
 @dataclass(frozen=True)
 class Step:
     command: str  # the CLI text, without the tag
-    role: str  # 'set' (must answer OK), 'get', 'verify' (read back after a set), 'extra' (advert.interval after a set)
+    role: str  # 'set' (must answer OK), 'get', 'verify' (read back after a set), 'extra' (advert.interval after a set),
+    # 'clock' (a clock set: a refusal is not a failure, the read after it says where the clock stands), 'noreply' (reboot: sent, no answer)
 
 
 # --- validation -----------------------------------------------------------------------------------------------------------
@@ -152,7 +158,18 @@ def validate(kind: str, op: str, params: dict | None) -> dict:
         raise RemoteError(f"unknown item {kind!r}")
     if op not in OPS:
         raise RemoteError(f"unknown operation {op!r}")
+    if op == "run":
+        if kind not in RUNNABLE:
+            raise RemoteError(f"{kind} is not an action; the actions are {', '.join(sorted(RUNNABLE))}")
+        verify = params.pop("verify", True) if kind == "clock" else True
+        if not isinstance(verify, bool):
+            raise RemoteError("verify must be true or false")
+        if params:
+            raise RemoteError(f"unexpected values for {kind}: {', '.join(sorted(params))}")
+        return {"verify": verify} if kind == "clock" else {}
     if op == "get":
+        if kind in RUN_ONLY:
+            raise RemoteError(f"{kind} is an action, not something to read")
         if params:
             raise RemoteError("a get takes no values")
         return {}
@@ -211,6 +228,7 @@ def validate_password(password: str | None) -> str | None:
 # --- the commands ---------------------------------------------------------------------------------------------------------
 
 _GETS = {
+    "clock": ("clock",),
     "name": ("get name",),
     "location": ("get lat", "get lon"),
     "advert.interval": ("get advert.interval",),
@@ -243,6 +261,12 @@ def _set_commands(kind: str, p: dict) -> tuple[str, ...]:
 def plan(kind: str, op: str, params: dict) -> list[Step]:
     """The commands to send for a validated job, in order."""
     params = validate(kind, op, params)
+    if op == "run":
+        if kind == "advert":
+            return [Step("advert", "set")]
+        if kind == "reboot":
+            return [Step("reboot", "noreply")]
+        return [Step("time {now}", "clock")] + ([Step("clock", "verify")] if params["verify"] else [])
     if op == "get":
         items = _ALL if kind == "all" else (kind,)
         return [Step(c, "get") for item in items for c in _GETS[item]]
@@ -310,7 +334,22 @@ def channel_hash(key: bytes) -> int:
     return sha256(key[:16]).digest()[0]
 
 
-def _item_value(item: str, replies: list[tuple[str, str]], base_channel_hash: int | None) -> Any:
+_CLOCK = re.compile(r"(\d{1,2}):(\d{2}) - (\d{1,2})/(\d{1,2})/(\d{4}) UTC")
+
+
+def parse_clock(text: str) -> int | None:
+    """Epoch seconds from a repeater's ``clock`` reply (``HH:MM - D/M/YYYY UTC``, whole minutes), or None."""
+    m = _CLOCK.fullmatch(text.strip())
+    if not m:
+        return None
+    hour, minute, day, month, year = (int(g) for g in m.groups())
+    try:
+        return int(datetime(year, month, day, hour, minute, tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+def _item_value(item: str, replies: list[tuple[str, str]], base_channel_hash: int | None, base_time: float | None = None) -> Any:
     """The value of one item from its (classified) replies; raises RemoteError for an unsupported or unreadable one."""
     kinds = {k for k, _ in replies}
     if UNSUPPORTED in kinds:
@@ -319,6 +358,11 @@ def _item_value(item: str, replies: list[tuple[str, str]], base_channel_hash: in
         raise RemoteError(next(t for k, t in replies if k in (ERROR, OK)), "rejected")
     if item == "beacon.stats":
         return parse_stats(replies[0][1])
+    if item == "clock":
+        epoch = parse_clock(replies[0][1])
+        if epoch is None:
+            raise RemoteError(f"could not read a time from {replies[0][1]!r}", "rejected")
+        return {"epoch": epoch, "text": replies[0][1], "offset_s": None if base_time is None else int(base_time - epoch)}
     texts = [t for _, t in replies]
     if item == "name":
         return texts[0]
@@ -361,7 +405,10 @@ def _same(kind: str, sent: Any, got: Any) -> bool:
     return sent == got
 
 
-def interpret(kind: str, op: str, params: dict, replies: list[str], base_channel_hash: int | None = None) -> JobOutcome:
+def interpret(
+    kind: str, op: str, params: dict, replies: list[str], base_channel_hash: int | None = None, base_time: float | None = None,
+    commands: list[str] | None = None,
+) -> JobOutcome:
     """Read the replies to plan(kind, op, params) (fewer if a 'set' was refused and the rest was not sent) into an outcome.
 
     result: ``values`` maps each item to what the repeater reports; for a set also ``sent`` (what was written, the value to record
@@ -369,9 +416,12 @@ def interpret(kind: str, op: str, params: dict, replies: list[str], base_channel
     params = validate(kind, op, params)
     steps = plan(kind, op, params)
     classified = [classify(r) for r in replies]
-    result: dict[str, Any] = {"replies": [{"command": s.command, "reply": r} for s, r in zip(steps, replies)]}
+    shown = commands if commands is not None else [s.command for s in steps]
+    result: dict[str, Any] = {"replies": [{"command": c, "reply": r} for c, r in zip(shown, replies)]}
     if op == "get":
-        return _interpret_get(kind, steps, classified, result, base_channel_hash)
+        return _interpret_get(kind, steps, classified, result, base_channel_hash, base_time)
+    if op == "run":
+        return _interpret_run(kind, params, classified, result, base_time)
 
     sets = [(s, c) for s, c in zip(steps, classified) if s.role == "set"]
     for s, (k, text) in sets:
@@ -414,7 +464,48 @@ def interpret(kind: str, op: str, params: dict, replies: list[str], base_channel
     return JobOutcome(True, None, "set and confirmed", result)
 
 
-def _interpret_get(kind: str, steps: list[Step], classified: list[tuple[str, str]], result: dict, base_hash: int | None) -> JobOutcome:
+def _interpret_run(kind: str, params: dict, classified: list[tuple[str, str]], result: dict, base_time: float | None) -> JobOutcome:
+    """The outcome of an action: a flood advert, a reboot (which never answers) or a clock sync."""
+    if kind == "reboot":
+        result.update(sent=True, confirmed=False)
+        return JobOutcome(True, None, "the reboot command was sent; the repeater does not answer it", result)
+    if not classified:
+        return JobOutcome(False, "no_reply", ERROR_TEXT["no_reply"], result)
+    k, text = classified[0]
+    if kind == "advert":
+        if k == OK:
+            result["sent"] = True
+            return JobOutcome(True, None, "flood advert sent", result)
+        return JobOutcome(False, "unsupported" if k == UNSUPPORTED else "rejected", text, result)
+
+    refused = "cannot go backwards" in text
+    if k == UNSUPPORTED:
+        return JobOutcome(False, "unsupported", ERROR_TEXT["unsupported"], result)
+    if k != OK and not refused:
+        return JobOutcome(False, "rejected", text, result)
+    result["set"] = k == OK
+    if not params["verify"]:
+        if k == OK:
+            return JobOutcome(True, None, "clock set (not read back)", result)
+        return JobOutcome(False, "clock_ahead", "the repeater refused to set its clock backwards: it is at or ahead of the base's", result)
+    if len(classified) < 2:
+        return JobOutcome(False, "no_reply", "the clock command was answered but the read-back was not", result)
+    try:
+        got = _item_value("clock", [classified[1]], None, base_time)
+    except RemoteError as e:
+        return JobOutcome(False, e.code, f"read-back: {e}", result)
+    result["values"] = {"clock": got}
+    offset = got["offset_s"]
+    if offset is None or abs(offset) <= CLOCK_TOLERANCE_S:
+        return JobOutcome(True, None, "clock set and confirmed" if k == OK else "already in step with the base", result)
+    if k == OK:
+        return JobOutcome(False, "mismatch", f"the clock was set but reads {abs(offset)} s {'behind' if offset > 0 else 'ahead of'} the base's", result)
+    if offset < 0:
+        return JobOutcome(False, "clock_ahead", f"{ERROR_TEXT['clock_ahead']} ({-offset} s ahead)", result)
+    return JobOutcome(False, "mismatch", f"the repeater refused the time and reads {offset} s behind the base's", result)
+
+
+def _interpret_get(kind: str, steps: list[Step], classified: list[tuple[str, str]], result: dict, base_hash: int | None, base_time: float | None = None) -> JobOutcome:
     items = _ALL if kind == "all" else (kind,)
     values: dict[str, Any] = {}
     errors: dict[str, str] = {}
@@ -427,7 +518,7 @@ def _interpret_get(kind: str, steps: list[Step], classified: list[tuple[str, str
             errors[item] = "no_reply"
             continue
         try:
-            values[item] = _item_value(item, chunk, base_hash)
+            values[item] = _item_value(item, chunk, base_hash, base_time)
         except RemoteError as e:
             errors[item] = e.code
     result["values"] = values

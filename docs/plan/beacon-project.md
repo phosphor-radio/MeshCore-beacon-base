@@ -21,15 +21,15 @@ Scale: about **30 beacons** and **10 repeaters**.
 
 ## Status
 
-Last updated: 2026-10-08. Statuses: Not started, In progress, Code complete (builds, not verified on hardware), Done
+Last updated: 2026-10-10. Statuses: Not started, In progress, Code complete (builds, not verified on hardware), Done
 (verified).
 
 | # | Milestone | Status | Notes |
 |---|---|---|---|
 | 1 | Beacon firmware (`examples/beacon`) | In progress | Flashed and transmitting; advert received by a USB companion. Android app, sleep current and power not yet checked. |
-| 2 | Beacon repeater: filter and RSSI/SNR capture | Code complete | Build env `Xiao_nrf52_beacon_repeater`. Not run on hardware. |
-| 3 | Batched report packet, base ingest | In progress | Repeater side is code complete (format in `src/helpers/BeaconReport.h`, host-tested). Base ingest not started. |
-| 4 | Base: allowlist, high-water mark, dedupe, reset | Not started | |
+| 2 | Beacon repeater: filter and RSSI/SNR capture | Done (verified) | Real beacon repeaters report real beacons to the base (base hardware checks B1, B2, N3 and R3), and can be read and managed over the mesh (remote repeater management). |
+| 3 | Batched report packet, base ingest | Done (verified) | Format in `src/helpers/BeaconReport.h`, host-tested; the base decodes real reports from a companion (base phase B1, verified on hardware). |
+| 4 | Base: allowlist, high-water mark, dedupe, reset | Done (verified) | Base phase B2, verified on hardware with real beacons and repeaters. Also done: beacon names, repeater onboarding and remote repeater management. |
 | 5 | Airtime measurement, batching and hop tuning | Not started | |
 | 6 | Location estimation, walk tests | Not started | |
 

@@ -9,7 +9,7 @@ from beacon_base.remote import RemoteError
 ME = b"m" * 32
 
 
-def run_job(rpt, kind, op, params=None, base_hash=None, ts=[5000]):
+def run_job(rpt, kind, op, params=None, base_hash=None, base_time=None, ts=[5000]):
     """What the executor does, without a link: send each planned command to the repeater as an admin and interpret the replies."""
     if ME not in rpt.acl:
         rpt.login(ME, "password", 1)
@@ -22,7 +22,7 @@ def run_job(rpt, kind, op, params=None, base_hash=None, ts=[5000]):
         replies.append(reply[3:])
         if remote.step_failed(step, reply[3:]):
             break
-    return remote.interpret(kind, op, params, replies, base_hash)
+    return remote.interpret(kind, op, params, replies, base_hash, base_time)
 
 
 @pytest.fixture
@@ -135,18 +135,42 @@ def test_the_planned_commands_are_exactly_these():
     assert len(commands("all", "get")) == 9
 
 
-def test_no_planned_command_can_clear_or_set_the_channel_or_do_anything_else_destructive():
+def test_the_only_commands_that_can_be_planned_are_the_listed_ones():
     steps = []
     for kind in remote.KINDS:
         for op in remote.OPS:
             try:
-                steps += remote.plan(kind, op, _params_for(kind, op))
+                steps += [(kind, op, s) for s in remote.plan(kind, op, _params_for(kind, op))]
             except RemoteError:
-                assert op == "set" and kind in remote.READ_ONLY  # only the read-only items are refused
-    texts = [s.command for s in steps]
+                pass  # an operation the item does not have
+    texts = [s.command for _, _, s in steps]
     assert len(texts) > 30
-    assert not [t for t in texts if t.startswith("beacon.channel ") or "password" in t or t in ("reboot", "erase", "clear stats")]
+    forbidden = ("erase", "clear stats", "clkreboot", "poweroff", "shutdown", "start ota", "tempradio", "setperm", "neighbor.remove")
+    assert not [t for t in texts if t.startswith("beacon.channel ") or "password" in t or t.split(" ")[0] in forbidden or t.startswith("set freq")]
+    assert [(k, o) for k, o, s in steps if s.command == "reboot"] == [("reboot", "run")]  # reboot only as its own action
+    assert [(k, o) for k, o, s in steps if s.command == "advert"] == [("advert", "run")]
     assert all(len(t.encode()) <= 157 for t in texts)  # fits in a command with its tag
+
+
+def test_actions_and_reads_are_kept_apart():
+    for kind in ("advert", "reboot"):
+        with pytest.raises(RemoteError, match="action"):
+            remote.validate(kind, "get", {})
+        with pytest.raises(RemoteError, match="cannot be set"):
+            remote.validate(kind, "set", {})
+    for kind in ("name", "beacon.window", "all", "beacon.stats"):
+        with pytest.raises(RemoteError, match="not an action"):
+            remote.validate(kind, "run", {})
+    with pytest.raises(RemoteError, match="cannot be set"):
+        remote.validate("clock", "set", {})
+    assert remote.validate("clock", "get", {}) == {}
+    assert remote.validate("clock", "run", {}) == {"verify": True} and remote.validate("clock", "run", {"verify": False}) == {"verify": False}
+    assert remote.validate("advert", "run", {}) == {} and remote.validate("reboot", "run", {}) == {}
+    for kind in ("advert", "reboot"):
+        with pytest.raises(RemoteError, match="unexpected"):
+            remote.validate(kind, "run", {"verify": False})
+    with pytest.raises(RemoteError, match="unexpected"):
+        remote.validate("clock", "run", {"minutes": 5})
 
 
 def _params_for(kind, op):
@@ -320,3 +344,105 @@ def test_replies_that_did_not_arrive_are_no_reply():
     assert remote.interpret("name", "set", params, ["OK"]).code == "no_reply"  # the read-back never came
     assert remote.interpret("name", "get", {}, []).code == "no_reply"
     assert remote.interpret("name", "set", params, ["Error, bad chars"]).code == "rejected"
+
+
+# --- the actions ----------------------------------------------------------------------------------------------------------
+
+BASE_NOW = 1_790_000_010  # 14:13:30 UTC on 21/9/2026, 30 s into a minute
+
+
+def test_the_clock_text_is_parsed_to_whole_minutes():
+    assert remote.parse_clock("14:13 - 21/9/2026 UTC") == 1_789_999_980
+    assert remote.parse_clock("00:00 - 1/1/2026 UTC") == 1_767_225_600
+    for bad in ("", "2:40", "25:00 - 29/9/2026 UTC", "02:40 - 31/2/2026 UTC", "OK - clock set"):
+        assert remote.parse_clock(bad) is None
+
+
+def test_the_actions_plan_these_commands():
+    commands = lambda kind, params=None: [(s.command, s.role) for s in remote.plan(kind, "run", params or {})]
+    assert commands("clock") == [("time {now}", "clock"), ("clock", "verify")]
+    assert commands("clock", {"verify": False}) == [("time {now}", "clock")]
+    assert commands("advert") == [("advert", "set")] and commands("reboot") == [("reboot", "noreply")]
+    assert [s.command for s in remote.plan("clock", "get", {})] == ["clock"]
+
+
+def test_get_clock_says_how_far_off_the_base_it_is(rpt):
+    rpt._now = lambda: BASE_NOW
+    out = run_job(rpt, "clock", "get", base_time=BASE_NOW)
+    clock = out.result["values"]["clock"]
+    assert out.ok and clock["text"] == "14:13 - 21/9/2026 UTC" and clock["offset_s"] == 30  # whole minutes: up to 59 s "behind"
+    rpt.clock_skew = -3600
+    assert run_job(rpt, "clock", "get", base_time=BASE_NOW).result["values"]["clock"]["offset_s"] == 3630
+    assert run_job(rpt, "clock", "get").result["values"]["clock"]["offset_s"] is None  # no base time to compare with
+
+
+def _sync(rpt, verify=True, base_time=BASE_NOW, send_at=None):
+    """The executor's two steps for a clock sync, with the time filled in."""
+    params = remote.validate("clock", "run", {"verify": verify})
+    steps = remote.plan("clock", "run", params)
+    if ME not in rpt.acl:
+        rpt.login(ME, "password", 1)
+    replies, shown = [], []
+    for i, step in enumerate(steps):
+        text = step.command.replace("{now}", str(send_at or base_time))
+        shown.append(text)
+        reply = rpt.command(ME, 5000 + i, "7f|" + text)
+        replies.append(reply[3:])
+    return remote.interpret("clock", "run", params, replies, None, base_time, shown)
+
+
+def test_a_clock_behind_the_base_is_set_and_confirmed(monkeypatch):
+    rpt = FakeRepeater(b"r" * 32, now=lambda: BASE_NOW)
+    rpt.clock_skew = -7200
+    out = _sync(rpt)
+    assert out.ok and out.message == "clock set and confirmed" and out.result["set"] is True
+    assert abs(out.result["values"]["clock"]["offset_s"]) <= remote.CLOCK_TOLERANCE_S
+    assert out.result["replies"][0]["command"] == f"time {BASE_NOW}"  # the time that was sent, not the template
+
+
+def test_a_clock_already_in_step_is_left_alone_and_that_is_success():
+    rpt = FakeRepeater(b"r" * 32, now=lambda: BASE_NOW)
+    out = _sync(rpt)  # the repeater already reads the base's time: the set is refused as 'not forward'
+    assert out.ok and out.message == "already in step with the base" and out.result["set"] is False
+
+
+def test_a_clock_ahead_of_the_base_cannot_be_set_back():
+    rpt = FakeRepeater(b"r" * 32, now=lambda: BASE_NOW)
+    rpt.clock_skew = 900
+    out = _sync(rpt)
+    assert not out.ok and out.code == "clock_ahead" and "870 s ahead" in out.message and out.result["set"] is False  # 900 s, less the minute the repeater drops
+
+
+def test_a_sync_without_the_read_back():
+    behind = FakeRepeater(b"r" * 32, now=lambda: BASE_NOW)
+    behind.clock_skew = -100
+    out = _sync(behind, verify=False)
+    assert out.ok and out.message == "clock set (not read back)" and "values" not in out.result
+    ahead = FakeRepeater(b"a" * 32, now=lambda: BASE_NOW)
+    ahead.clock_skew = 100
+    assert _sync(ahead, verify=False).code == "clock_ahead"
+
+
+def test_a_set_that_reads_back_wrong_is_a_mismatch():
+    rpt = FakeRepeater(b"r" * 32, now=lambda: BASE_NOW)
+    rpt.clock_skew = -7200
+    out = _sync(rpt, send_at=BASE_NOW - 3600)  # the time sent had gone stale: it set the clock an hour behind the base
+    assert not out.ok and out.code == "mismatch" and "behind the base" in out.message
+
+
+def test_a_sync_the_repeater_does_not_know_or_does_not_answer():
+    old = FakeRepeater(b"o" * 32)
+    params = remote.validate("clock", "run", {})
+    assert remote.interpret("clock", "run", params, ["Unknown command", "Unknown command"]).code == "unsupported"
+    assert remote.interpret("clock", "run", params, []).code == "no_reply"
+    assert remote.interpret("clock", "run", params, ["OK - clock set: 14:13 - 21/9/2026 UTC"]).code == "no_reply"  # the read-back is missing
+    assert remote.interpret("clock", "run", params, ["Error, bad"]).code == "rejected"
+
+
+def test_advert_and_reboot_outcomes(rpt):
+    out = run_job(rpt, "advert", "run")
+    assert out.ok and out.result["sent"] is True and rpt.adverts_sent == 1
+    assert remote.interpret("advert", "run", {}, ["Unknown command"]).code == "unsupported"
+    assert remote.interpret("advert", "run", {}, []).code == "no_reply"
+    out = remote.interpret("reboot", "run", {}, [""])
+    assert out.ok and out.result["confirmed"] is False and "does not answer" in out.message

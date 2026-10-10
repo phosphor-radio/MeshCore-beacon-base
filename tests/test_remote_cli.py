@@ -34,6 +34,10 @@ REF = RKEY[:8].hex()
         ("beacon.names", "set", ["off"], {"on": False, "verify": True}),
         ("beacon.name_refresh", "set", ["0"], {"hours": 0, "verify": True}),
         ("all", "get", [], {}),
+        ("clock", "get", [], {}),
+        ("clock", "run", [], {"verify": True}),
+        ("advert", "run", [], {}),
+        ("reboot", "run", [], {}),
     ],
 )
 def test_parse_request(item, op, values, expected):
@@ -41,6 +45,7 @@ def test_parse_request(item, op, values, expected):
 
 
 def test_flags_reach_the_parameters():
+    assert remote_cli.parse_request("clock", "run", [], verify=False) == {"verify": False}
     assert remote_cli.parse_request("name", "set", ["x"], verify=False)["verify"] is False
     assert remote_cli.parse_request("location", "set", ["0", "0"], allow_zero=True)["allow_zero"] is True
 
@@ -64,6 +69,11 @@ def test_flags_reach_the_parameters():
         ("beacon.window", "set", ["5", "6"], "takes seconds"),
         ("beacon.names", "set", ["yes"], "on or off"),
         ("beacon.name_refresh", "set", ["off"], "whole number"),
+        ("advert", "get", [], "is an action"),
+        ("reboot", "set", ["now"], "is an action"),
+        ("clock", "set", ["12:00"], "can only be read"),
+        ("advert", "run", ["zerohop"], "takes no value"),
+        ("reboot", "run", ["now"], "takes no value"),
     ],
 )
 def test_bad_requests_are_refused_with_a_reason(item, op, values, message):
@@ -388,3 +398,76 @@ def test_a_job_nobody_picks_up_is_expired_while_the_command_waits(quiet, capsys)
         assert row["state"] == "expired" and row["error_code"] == "expired"
         lines = remote_cli.render(s, None, "ridge", row)
         assert "expired" in lines[0] and "beacon-ingest running" in lines[0]
+
+
+# --- the actions ----------------------------------------------------------------------------------------------------------
+
+
+def test_clock_sync_sets_a_repeater_that_is_behind_then_leaves_it_alone(stack, capsys, tmp_path):
+    stack.repeater.clock_skew = -7200
+    code, out, _ = remote_ctl(stack, capsys, "clock", "sync", "--password-file", password_file(tmp_path))
+    assert code == 0 and "clock set; the repeater now reads" in out and "in step with the base, to the minute" in out
+    assert abs(stack.repeater.repeater_time() - time.time()) <= 3
+    code, out, _ = remote_ctl(stack, capsys, "clock", "sync")
+    assert code == 0 and "left alone: it was already in step and cannot be set back" in out
+
+
+def test_clock_sync_fails_plainly_when_the_repeater_is_ahead(stack, capsys, tmp_path):
+    stack.repeater.clock_skew = 900
+    code, out, err = remote_ctl(stack, capsys, "clock", "sync", "--password-file", password_file(tmp_path))
+    assert code == 1 and out == "" and "failed (clock_ahead)" in err and "cannot be set back" in err
+
+
+def test_clock_sync_without_the_read_back(stack, capsys, tmp_path):
+    stack.repeater.clock_skew = -100
+    code, out, _ = remote_ctl(stack, capsys, "clock", "sync", "--no-verify", "--password-file", password_file(tmp_path))
+    assert code == 0 and "clock set (not read back)" in out
+
+
+def test_get_clock_compares_with_the_base(stack, capsys, tmp_path):
+    code, out, _ = remote_ctl(stack, capsys, "get", "clock", "--password-file", password_file(tmp_path))
+    assert code == 0 and "UTC" in out and "in step with the base" in out
+    stack.repeater.clock_skew = -3600
+    _, out, _ = remote_ctl(stack, capsys, "get", "clock")
+    assert "behind the base" in out
+
+
+def test_advert(stack, capsys, tmp_path):
+    code, out, _ = remote_ctl(stack, capsys, "advert", "--password-file", password_file(tmp_path))
+    assert code == 0 and "flood advert sent" in out and stack.repeater.adverts_sent == 1 and stack.repeater.zero_hop_adverts_sent == 0
+
+
+def test_reboot_needs_confirmation_and_queues_nothing_without_it(stack, capsys):
+    code, _, err = remote_ctl(stack, capsys, "reboot")
+    assert code == 2 and "add --yes" in err and stack.store.jobs() == [] and stack.repeater.reboots == 0
+
+
+def test_reboot_with_yes(stack, capsys, tmp_path):
+    code, out, _ = remote_ctl(stack, capsys, "reboot", "--yes", "--password-file", password_file(tmp_path))
+    assert code == 0 and "reboot command sent" in out and "not confirmed" in out and f"get name" in out and stack.repeater.reboots == 1
+    code, out, _ = remote_ctl(stack, capsys, "get", "name")  # the repeater is back and still has the base as an admin
+    assert code == 0 and "ridge" in out
+
+
+def test_reboot_asks_when_interactive(stack, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    code, _, err = remote_ctl(stack, capsys, "reboot")
+    assert code == 2 and "not rebooted" in err and stack.store.jobs() == []
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "yes")
+    code, out, _ = remote_ctl(stack, capsys, "reboot", "--password-file", password_file(tmp_path))
+    assert code == 0 and stack.repeater.reboots == 1 and "Reboot" in asked[0] and "loses the batch" in asked[0]
+
+
+@pytest.mark.parametrize("argv", [["clock"], ["clock", "now"], ["clock", "sync", "now"], ["advert", "now"], ["reboot", "now"], ["get"], ["set"]])
+def test_the_new_verbs_have_one_shape_each(stack, capsys, argv):
+    code, _, err = remote_ctl(stack, capsys, *argv)
+    assert code == 2 and "usage: beaconctl repeater remote" in err and stack.store.jobs() == []
+
+
+def test_the_job_list_names_the_actions(stack, capsys, tmp_path):
+    remote_ctl(stack, capsys, "advert", "--password-file", password_file(tmp_path))
+    remote_ctl(stack, capsys, "clock", "sync")
+    _, out, _ = ctl(stack, capsys, "repeater", "remote", "jobs")
+    assert "run advert" in out and "run clock" in out

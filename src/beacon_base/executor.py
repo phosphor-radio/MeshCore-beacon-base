@@ -38,6 +38,10 @@ ATTEMPTS = 3  # send; send again on the same route; reset the route, log in agai
 NOT_FOUND = 2  # the companion's ERR_CODE_NOT_FOUND
 
 
+class _JobEnded(Exception):
+    """The job was already failed while a send was being recovered; nothing more to do for it."""
+
+
 class RemoteExecutor:
     def __init__(
         self,
@@ -47,6 +51,7 @@ class RemoteExecutor:
         clock_ready: Callable[[CompanionLink], str | None],
         base_channel_hash: int | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
     ):
         """claim() returns the next job or None; finish(job, outcome) records it; clock_ready(link) returns None when the companion's
         clock may be used for a login, else the error code to fail the job with."""
@@ -56,6 +61,7 @@ class RemoteExecutor:
         self._clock_ready = clock_ready
         self._base_hash = base_channel_hash
         self._now = clock
+        self._wall = wall  # the base's wall clock: the time a clock sync sets, and what a clock read is compared with
         self._next_claim = 0.0
         self._quiet_until = 0.0  # nothing is transmitted before this: the previous exchange is still echoing round the mesh
         self._tag_n = 0
@@ -78,6 +84,7 @@ class RemoteExecutor:
         self._deadline = 0.0
         self._started = 0.0
         self._step_tags: list[str] = []  # tags of the tries at the current step; a reply to any of them answers it
+        self._sent: dict[int, str] = {}  # the command text as last sent for each step ('time {now}' has the time filled in)
         self._flooded = False
         self._round_trips = 0
         self._retries = 0
@@ -192,7 +199,8 @@ class RemoteExecutor:
                 return False
             try:
                 name = job.name or f"repeater {key[:3].hex()}"
-                link.request(companion.add_update_contact(key, companion.ADV_TYPE_REPEATER, name, job.lat, job.lon), [companion.RESP_OK])
+                # no position: the contact would hand the base its own value back as if the repeater had advertised it
+                link.request(companion.add_update_contact(key, companion.ADV_TYPE_REPEATER, name), [companion.RESP_OK])
             except CommandError as e2:
                 self._fail("contact_failed", f"the companion would not take the repeater as a contact: {companion.describe_error(e2.code)}")
                 return False
@@ -220,20 +228,46 @@ class RemoteExecutor:
         assert job is not None and job.pubkey is not None
         try:
             if action == "login":
-                sent = companion.parse_sent(link.request(companion.send_login(job.pubkey, job.password or ""), [companion.RESP_SENT]))
+                sent = companion.parse_sent(self._request(link, job, companion.send_login(job.pubkey, job.password or "")))
                 self._phase = "login"
             else:
                 self._tag_n += 1
                 tag = companion.make_tag(self._tag_n)
-                text = companion.tag_command(tag, self._steps[len(self._replies)].command)
-                sent = companion.parse_sent(link.request(companion.send_cli(job.pubkey, text), [companion.RESP_SENT]))
+                index = len(self._replies)
+                command = self._steps[index].command.replace("{now}", str(int(self._wall())))  # a resend carries the time of the resend
+                self._sent[index] = command
+                text = companion.tag_command(tag, command)
+                sent = companion.parse_sent(self._request(link, job, companion.send_cli(job.pubkey, text)))
                 self._step_tags.append(tag)
                 self._phase = "reply"
+        except _JobEnded:
+            return
         except CommandError as e:
             self._fail("companion_refused", f"the companion would not send the {'login' if action == 'login' else 'command'}: {companion.describe_error(e.code)}")
             return
         self._flooded = self._flooded or sent.flooded
         self._deadline = now + self._timeout(sent)
+        if action == "step" and self._steps[len(self._replies)].role == "noreply":
+            # a reboot: the board resets before it can answer, so the companion having sent it is all there is to wait for. The ACL is
+            # saved to flash only a few seconds after a login, so the next job logs in again rather than trust this one
+            self._replies.append("")
+            self._round_trips += 1
+            self.logged_in.discard(job.pubkey)
+            self._complete()
+
+    def _request(self, link: CompanionLink, job: RemoteJob, frame: bytes) -> bytes:
+        """Send a login or command. If the companion says it does not know the repeater, the contact was removed behind our back (someone
+        cleaned its contact list, or it was reset): add it again and send once more."""
+        try:
+            return link.request(frame, [companion.RESP_SENT])
+        except CommandError as e:
+            if e.code != NOT_FOUND:
+                raise
+        log.info("the companion no longer has repeater %s as a contact; adding it again", job.repeater_prefix.hex())
+        self.contacts.discard(job.pubkey)
+        if not self._ensure_contact(link, job):
+            raise _JobEnded()  # _ensure_contact has failed the job
+        return link.request(frame, [companion.RESP_SENT])
 
     def _on_login(self, result: companion.LoginResult, now: float) -> None:
         job = self.job
@@ -303,6 +337,9 @@ class RemoteExecutor:
 
     # --- the end --------------------------------------------------------------------------------------------------------
 
+    def _shown(self) -> list[str]:
+        return [self._sent.get(i, s.command) for i, s in enumerate(self._steps)]
+
     def _extras(self, result: dict) -> dict:
         result["round_trips"] = self._round_trips
         result["flooded"] = self._flooded
@@ -316,14 +353,14 @@ class RemoteExecutor:
     def _complete(self) -> None:
         job = self.job
         assert job is not None
-        outcome = remote.interpret(job.kind, job.op, job.params, self._replies, self._base_hash)
+        outcome = remote.interpret(job.kind, job.op, job.params, self._replies, self._base_hash, self._wall(), self._shown())
         self._extras(outcome.result)
         self._done(job, outcome)
 
     def _fail(self, code: str, message: str | None = None) -> None:
         job = self.job
         assert job is not None
-        result: dict = {"replies": [{"command": s.command, "reply": r} for s, r in zip(self._steps, self._replies)]}
+        result: dict = {"replies": [{"command": c, "reply": r} for c, r in zip(self._shown(), self._replies)]}
         self._extras(result)
         self._done(job, JobOutcome(False, code, message or remote.ERROR_TEXT.get(code, code), result))
 

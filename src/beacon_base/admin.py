@@ -26,6 +26,13 @@ def fmt_clock(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
+def fmt_advert_clock(ts: int | None) -> str:
+    """The time in a repeater's advert (its own clock, UTC), or '-' when it has none."""
+    if not ts:
+        return "-"
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
 def fmt_age(ts: float | None, now: float) -> str:
     if ts is None:
         return "never"
@@ -287,6 +294,7 @@ def cmd_repeater_list(args: argparse.Namespace, cfg: Config) -> int:
         rows = []
         for r in store.repeaters():
             located = Store.is_located(r["lat"], r["lon"])
+            advert = store.repeater_advert(bytes(r["prefix"]))
             rows.append(
                 [
                     r["name"] or "-",
@@ -295,11 +303,38 @@ def cmd_repeater_list(args: argparse.Namespace, cfg: Config) -> int:
                     f"{r['lon']:.6f}" if located else "-",
                     r["location_source"] if located else "-",
                     fmt_age(r["location_updated_at"], now) if located else "-",
+                    "never" if advert is None or advert["last_heard"] is None else fmt_age(advert["last_heard"], now),
+                    "-" if advert is None else fmt_advert_clock(advert["advert_timestamp"]),
                     "-" if r["window_s"] is None else f"{r['window_s']:g}s",
                     "yes" if r["enabled"] else "no",
                 ]
             )
-    print(table(rows, ["NAME", "PREFIX", "LAT", "LON", "SOURCE", "UPDATED", "WINDOW", "ENABLED"]) if rows else "no repeaters")
+    print(table(rows, ["NAME", "PREFIX", "LAT", "LON", "SOURCE", "UPDATED", "HEARD", "ADVERT CLOCK", "WINDOW", "ENABLED"]) if rows else "no repeaters")
+    return 0
+
+
+def cmd_repeater_adverts(args: argparse.Namespace, cfg: Config) -> int:
+    """What each repeater last advertised, as the companion passed it on, next to what the table uses."""
+    now = time.time()
+    with _open(cfg) as store:
+        rows = []
+        for a in store.repeater_adverts():
+            advertised = f"{a['lat']:.6f}, {a['lon']:.6f}" if a["lat"] is not None else "none"
+            used = "-"
+            if a["trusted"]:
+                used = f"{a['table_lat']:.6f}, {a['table_lon']:.6f}" if Store.is_located(a["table_lat"], a["table_lon"]) else "unlocated"
+            rows.append(
+                [
+                    bytes(a["prefix"]).hex(),
+                    a["name"] or "-",
+                    advertised,
+                    used,
+                    "never" if a["last_heard"] is None else fmt_age(a["last_heard"], now),
+                    fmt_advert_clock(a["advert_timestamp"]),
+                    "yes" if a["trusted"] else "no",
+                ]
+            )
+    print(table(rows, ["PREFIX", "ADVERTISED NAME", "ADVERTISED POSITION", "USED POSITION", "HEARD", "ADVERT CLOCK", "TRUSTED"]) if rows else "no adverts seen")
     return 0
 
 

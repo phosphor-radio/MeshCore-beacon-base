@@ -1,6 +1,6 @@
 # Remote Repeater Management Plan
 
-Status: **reviewed and agreed 2026-10-10. RM1 (protocol and clock), RM2 (heartbeat, jobs, executor) and RM3 (commands) are implemented and tested against a fake repeater; RM4 (hardware) is not done.** Written after reading the firmware (`examples/simple_repeater`,
+Status: **complete (2026-10-10).** RM1 (protocol and clock), RM2 (heartbeat, jobs, executor), RM3 (commands) and RM4 (the hardware work) are done; the hardware work added the clock sync, advert and reboot actions, the pacing and gentler retries, and the advert diagnostics, all recorded below. Not tested on hardware: paths of more than zero hops, because the repeaters under test were in one room (gap 8, flood scope). Written after reading the firmware (`examples/simple_repeater`,
 `examples/companion_radio`, `src/helpers/CommonCLI.cpp`) and this repo, then amended with the firmware session's findings
 (documentation commit `e5761d02`, "Firmware follow-ups"). Done before the rest of B3; it includes the ingest heartbeat from B3
 and nothing else from it. See "Phases".
@@ -26,9 +26,12 @@ Related: [beacon-base.md](beacon-base.md) (architecture, companion link), [repea
 | Report channel | **yes (is it set, its hash)** | **no, never over the mesh** | `beacon.channel` |
 | Name announcements | yes | yes | `beacon.names`, `beacon.names on\|off` |
 | Name refresh interval | yes | yes | `beacon.name_refresh`, `beacon.name_refresh <hours>` |
+| Clock | yes (compared with the base's) | sync to the base's, forward only | `clock`, `time <epoch>` |
+| Flood advert | no | send one now | `advert` |
+| Reboot | no | restart it (not confirmable) | `reboot` |
 
 Not included, on purpose: `beacon.channel <hex>` / `clear` (the channel key must not cross the air, even encrypted;
-provision and rotate it on the serial console), the admin or guest password, `reboot`, `erase`, radio parameters, ACL commands
+provision and rotate it on the serial console), the admin or guest password, `erase`, radio parameters, ACL commands
 (`setperm`), raw passthrough. `beaconctl repeater locate` stays the **base-only** position override and is unchanged.
 
 ## Decisions
@@ -413,7 +416,7 @@ state, and jobs submitted from a test run to completion with reports flowing at 
   companion's clock first when it is trusted but not yet done.
 - Tests: 168 new (568 in all), among them the whole flow through a real session thread, the fake companion and the fake repeater with
   reports arriving during a job, enrolment by password then by the ACL after a repeater reboot, a lost reply and a lost login,
-  an unreachable repeater, a disconnect mid-job and a stale job. **Not seen on hardware.**
+  an unreachable repeater, a disconnect mid-job and a stale job. Built and tested against the fakes; used on the hardware in RM4.
 
 **RM3. Commands.** `beaconctl repeater remote ...`, password sources, write-through, `check` additions
 (channel hash mismatch is a failing finding when a result is on record), README section, `docs/operations.md`, CLAUDE.md.
@@ -442,11 +445,77 @@ Where it differs from, or adds to, the text above:
   hash is compared again at check time, not taken from the job).
 - **Added:** `jobs ID` shows one job in full with its commands and replies, `-n/--limit` and `--all` for the list, `--allow-zero`
   for `set location 0 0`.
-- Tests: 57 for the command and 11 for the write-through and the password (636 in all). **Not seen on hardware.**
+- Tests: 57 for the command and 11 for the write-through and the password (636 in all). Built and tested against the fakes; used on the hardware in RM4.
 
-**RM4. Hardware.** The check above on one repeater, then the rest. Findings go back into this plan.
+**RM4. Hardware.** *Done (2026-10-10).* The commands were used on the hardware against three repeaters and an nRF52 companion, close
+together in one room (zero hops). What it found is recorded in the sections that follow: the failures on later round trips of `get all` and
+`set` led to the pacing and the gentler retries; the wish to manage the repeaters led to the clock sync, advert and reboot actions (and
+migration 2); and "the base is not updating from adverts" turned out to be a misunderstanding of `UPDATED` (it only moves when the position
+changes) plus two latent bugs in the stored-contact handling, with `HEARD`, `ADVERT CLOCK` and `repeater adverts` added to make it visible.
+The individual steps of the firmware session's script below were not logged here.
+
+Open follow-ups, none blocking:
+
+- **More than zero hops** is untested: whether the base's unscoped flood reaches a repeater behind others, and whether the default flood scope
+  is needed (gap 8; hardware script steps 12-13).
+- **Confirming a reboot** needs the uptime in `beacon.stats` that the firmware session agreed to add: read it before and after.
+- **The companion's contact table.** Repeaters stay stored as contacts after a job; if adverts from a repeater whose clock went backwards stop
+  arriving, see "Adverts and the companion's contact list" for the options (refresh stored contacts on the poll, remove them between jobs, or
+  read adverts from the raw receive log).
 
 The heartbeat is built here and counts as done for B3; update the B3 text in the base plan and the README when RM2 lands.
+
+## Clock sync, advert and reboot (added during RM4)
+
+Three actions added on request, as a third job operation `run` next to `get` and `set` (**migration 2**, a rebuild of `remote_jobs` that keeps
+its rows, because the database already held hardware data). What the firmware does decided the design (read from `CommonCLI.cpp`):
+
+- **Clock sync** uses `time <epoch>` with the base's wall time filled in at each send, rather than `clock sync`, which takes the timestamp of
+  the message (the *companion's* clock) and so depends on the companion being in step. Both only move a clock forward: the reply is
+  `OK - clock set: ...` or `(ERR: clock cannot go backwards)`. The repeater's `clock` reads whole minutes (`HH:MM - D/M/YYYY UTC`). So the
+  job always reads the clock after the set (`--no-verify` skips that) and decides from the reading: within 90 s of the base's time is success
+  ("clock set and confirmed", or "already in step" when the set was refused), a repeater ahead of the base fails `clock_ahead`, and a set that
+  reads back wrong is `mismatch`. A refusal is a step that does not stop the job (role `clock`). `get clock` shows the offset. The base's clock
+  must be trusted, like every job.
+- **Advert** sends `advert` (flood): the repeater answers `OK - Advert sent` and sends it 1.5 s later. A zero-hop advert was not asked for.
+- **Reboot** sends `reboot`, and the board resets **before it replies**, so nothing can be awaited: the job is done when the companion reports
+  the command sent, the result says `confirmed: false`, and the base logs in again for the next job (the ACL is saved to flash a few seconds
+  after a login). `beaconctl` asks for confirmation (a reboot loses the report batch and takes the repeater off the air) or `--yes`, and
+  requires `--yes` with no terminal. An open follow-up, once the firmware's uptime in `beacon.stats` exists: confirm a reboot by reading the
+  uptime before and after.
+
+## Adverts and the companion's contact list (found during RM4)
+
+A job leaves the repeater in the companion's contact table, and a stored contact is treated differently from a node the companion does not
+store (`BaseChatMesh::onAdvertRecv`): an advert whose timestamp is not newer than the last stored one is dropped **silently**, with no push,
+and an accepted one reaches the host as a bare key push (no position), which the base answers by reading the contact back. In manual-add
+mode an unstored node's advert always arrives in full with no timestamp check. Reports on the hardware: after clock syncs and `advert`
+requests the repeaters did not appear to update; removing a contact by hand helped once, then not.
+
+What the code review found, and what was done:
+
+- The replay check cannot explain a failure right after a job re-adds a contact (it is added with advert time 0), so the push path was
+  reviewed. Reproduced against the fake (a repeater stored by a job advertises a new name and position): the base follows. The fake
+  cannot show differences in the real firmware.
+- **Latent bug fixed:** a bare advert push whose contact lookup failed was remembered as "not a repeater", after which adverts from that
+  repeater were ignored for the rest of the connection, even once a job stored it again. It is no longer remembered.
+- **Latent bug fixed:** a contact removed from the companion behind the executor's back made the next job fail (`companion_refused`); the
+  executor now notices `not found` on a login or command, adds the contact again and sends once more.
+- **Visibility.** `repeater list` shows `HEARD` (when the companion last passed on an advert) and `ADVERT CLOCK` (the time in that advert, the
+  repeater's own clock), and `repeater adverts` lists what each repeater last advertised next to what the table uses. `UPDATED` only changes
+  when the *position* changes, so an advert that repeats what the base already has changes nothing visible; `HEARD` is the column that says
+  whether adverts arrive. (On the hardware that was the whole misunderstanding: the adverts were arriving. A status line counting them was
+  tried and removed; the counters are still kept in the heartbeat's `stats`.)
+
+Options if adverts still do not arrive, in order of cost:
+
+1. **Refresh stored repeater contacts from the companion** on the safety-net poll (`GET_CONTACTS`, compare each stored repeater's advert time
+   and data with the last seen): does not depend on the push, and shows whether the stored advert time advances at all.
+2. **Keep repeaters out of the companion's contact table between jobs** (remove after a linger, and any left at connect). It restores the old
+   behaviour of full pushes with no timestamp check, but cannot help an advert that arrives while the job's contact is stored (an `advert`
+   job's own advert arrives 1.5 s after the reply), and costs the learned route and flash writes.
+3. **Read adverts from the raw receive log** (`PUSH_CODE_LOG_RX_DATA`): decode and verify the signed advert packets in the base. Independent
+   of the contact table and its replay check, at the price of verifying ed25519 signatures in the base.
 
 ## Pacing and retries (amended during RM4)
 
@@ -497,7 +566,7 @@ only when intermediate repeaters deny un-scoped floods (gap 8).
 
 ## Hardware script (RM4)
 
-Provided by the firmware session; **not yet run.** `R` is a test repeater with its serial console, `C` the companion driven
+Provided by the firmware session as the guide for RM4 (see there for what the hardware work covered and did not). `R` is a test repeater with its serial console, `C` the companion driven
 from the host, `K` R's 32-byte key, `K6` its first 6 bytes, `ADMIN` the build's admin password. Frames are hex after the
 `<` and 2-byte length header. Run it first with raw frames, then repeat the relevant steps with `beaconctl`.
 

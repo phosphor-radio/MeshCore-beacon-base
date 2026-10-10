@@ -276,6 +276,9 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("lon", type=float)
     p.set_defaults(func=admin.cmd_repeater_locate)
     repeater.add_parser("list", help="list repeaters").set_defaults(func=admin.cmd_repeater_list)
+    repeater.add_parser("adverts", help="what each repeater last advertised, next to what the repeater table uses").set_defaults(
+        func=admin.cmd_repeater_adverts
+    )
     p = repeater.add_parser("remove", help="remove a repeater")
     p.add_argument("ref", metavar="prefix-or-name", help=REPEATER_REF_HELP)
     p.set_defaults(func=admin.cmd_repeater_remove)
@@ -297,10 +300,11 @@ def _add_admin_commands(sub) -> None:
         epilog=remote_cli.USAGE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("words", nargs="+", metavar="WORD", help=REPEATER_REF_HELP + ", then get or set, the item and its value; or the word jobs and an optional job number")
+    p.add_argument("words", nargs="+", metavar="WORD", help=REPEATER_REF_HELP + ", then get or set and the item and its value, or clock sync, advert or reboot; or the word jobs and an optional job number")
     p.add_argument("--password-file", metavar="FILE", help="read the admin password from the first line of this file (keep it mode 600)")
     p.add_argument("--ask-password", action="store_true", help="prompt for the admin password before sending")
     p.add_argument("--no-verify", action="store_true", help="for a set: do not read the value back (nothing is then recorded at the base)")
+    p.add_argument("--yes", action="store_true", help="for reboot: do not ask for confirmation")
     p.add_argument("--allow-zero", action="store_true", help="for set location: allow 0, 0, which the base treats as 'no position'")
     p.add_argument("--timeout", type=float, default=30.0, metavar="SECS", help="how long to wait for the job (default 30); a longer one keeps running")
     p.add_argument("--no-wait", action="store_true", help="queue the job and return its number")

@@ -8,9 +8,10 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > repeaters by key prefix and shows a lockout and its one-step fix. B1, B2, the beacon names (repeater
 > firmware `28bb4985` in the firmware repository) and the repeater onboarding (positions from adverts, discovery and
 > auto-add) are verified on hardware.
-> **In progress:** remote repeater management over the mesh ([docs/plan/repeater-remote.md](docs/plan/repeater-remote.md)).
-> The companion protocol, the ingest heartbeat, the job executor inside `beacon-ingest` and the `beaconctl repeater remote` commands
-> are implemented and tested against a fake repeater (RM1-RM3); the hardware check (RM4) is not done yet.
+> **Remote repeater management over the mesh is done** ([docs/plan/repeater-remote.md](docs/plan/repeater-remote.md)): `beaconctl repeater remote`
+> reads and changes a repeater's name, position, advert intervals and `beacon.*` settings, syncs its clock, sends an advert and reboots it, through
+> `beacon-ingest` and the base companion, and `beacon-ingest` keeps a heartbeat that `beaconctl status` shows. It has been used on the hardware with
+> three repeaters in one room; paths of more than zero hops have not been tested.
 > No web UI yet (B4) and no packaging (B3) beyond the heartbeat. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
@@ -109,6 +110,7 @@ beaconctl status                             # one line per beacon, rejected and
 | `repeater add <key-or-prefix> [<lat> <lon>] [--name N] [--window S]` | Trust a repeater. Without `<lat> <lon>` its position comes from its advert; if none was heard it is added unlocated at 0, 0. The advertised name replaces `--name`. |
 | `repeater add --all [--hours H]` | Trust every repeater that has sent reports **or been heard advertising** (default last 24 h) and is not in the table. |
 | `repeater locate <prefix-or-name> <lat> <lon>` | Set a position by hand (testing, before the repeater has advertised, or when it can't be set on the repeater). The next advert with a position replaces it. |
+| `repeater adverts` | What each repeater last advertised (name, position, the clock in the advert, when it was heard), trusted or not, next to the position the table uses. `repeater list` also shows `HEARD` and `ADVERT CLOCK`. `UPDATED` is when the position last *changed*, so an advert that repeats what the base already has does not move it. |
 | `repeater list` / `remove` / `enable` / `disable` / `window <S>` | The repeater table, which also shows where each position came from. Commands take the key prefix (six or more hex digits) or the name. Reports from repeaters not in the table are stored but not counted. |
 | `status [--hours H]` | Per-beacon state (`rejected`, `silent`, `ok`, `disabled`), then every repeater and beacon that has been seen but is not trusted yet, ready to add. |
 | `autoadd [beacons\|repeaters\|all [on\|off]]` | Show or set automatic trust for newly seen repeaters and beacons (both off by default). A setting in the database, so a running `beacon-ingest` uses it at once. `status` warns and `check` fails while it is on. |
@@ -300,12 +302,24 @@ beaconctl repeater remote north set beacon.names off          # on | off
 beaconctl repeater remote north set beacon.name_refresh 4     # hours, 0-8760
 beaconctl repeater remote north get beacon.stats              # counters since boot, and what changed since the last reading
 beaconctl repeater remote north get beacon.channel            # is it set, its hash, and whether it is this base's channel
+beaconctl repeater remote north get clock                     # its clock, compared with the base's
+beaconctl repeater remote north clock sync                    # set its clock to the base's (forward only), then read it back
+beaconctl repeater remote north advert                        # send a flood advert now
+beaconctl repeater remote north reboot --yes                  # restart it (asks first if you leave out --yes)
 beaconctl repeater remote jobs                                # recent jobs; 'jobs 12' shows one in full
 ```
 
 `north` is the repeater's name or its key prefix. Three things are deliberately **not** possible: setting or clearing `beacon.channel`
 (the channel key never crosses the air; use the repeater's serial console), changing a password, and sending any other command.
 
+**The three actions.** `clock sync` sets the repeater's clock to the base's time as it is when the command is sent, then reads the clock
+back. A repeater's clock only moves forward, and it reports whole minutes, so a repeater already within a minute of the base is reported as
+"already in step" (a success), and one that is *ahead* fails as `clock_ahead` (it cannot be set back; its clock stamps its adverts, and
+nodes that have heard a later advert ignore an earlier one). The base's own clock has to be trusted (`beaconctl time set`). `advert` sends
+a flood advert about 1.5 s after the repeater replies; use it after changing a name or position so the rest of the mesh hears it. `reboot`
+restarts the repeater, which stops reporting for a short while and **loses the batch it is holding**; it asks for confirmation unless you
+give `--yes`, and with no terminal it requires `--yes`. The board resets before it can answer, so a reboot is only ever reported as *sent*, never
+confirmed: look for the repeater coming back (`get name`, or the next report). The base logs in again for the next job after a reboot.
 **The admin password.** The first time, the repeater has to be given its admin password (the stock default is `password`; change it).
 After one successful password login the repeater keeps this base's companion key as an admin in its access list, saved in its flash, so
 later commands need no password, even after the repeater reboots. Supply it with `--password-file FILE` (first line, mode 600),
@@ -344,6 +358,7 @@ says so, exits with 3, and the job carries on (`repeater remote jobs N` shows th
 | `no_reply` | Wrong password, out of range, a flood not forwarded, or the companion's clock behind what the repeater has seen from it. Tried three times: again on the same route, then after resetting the route and logging in again. |
 | `unsupported` | The repeater does not know the command: not a beacon build, or firmware older than the names work. |
 | `rejected` / `mismatch` | The repeater refused the value, or accepted it and reads back something else. |
+| `clock_ahead` | `clock sync` only: the repeater's clock is ahead of the base's and cannot be set back. |
 | `interrupted` | Ingest stopped, or lost the companion, while the job was running. The repeater may or may not have acted on it; read it back. |
 
 Things to know in the field. The first change of anything on a fresh repeater turns its zero-hop adverts off (a firmware quirk: any
@@ -361,6 +376,7 @@ dropping the base's unscoped flood; see the plan for the fix (a default flood sc
 | B2 | Done and verified on hardware: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
 | B3 | Hardening and packaging: retention, systemd units, udev rule, install script. (The ingest heartbeat is done, built with the remote management work.) |
 | B4 | Web API and minimal offline map (MBTiles). |
+| Also | Done and used on hardware: beacon names, repeater onboarding (positions and names from adverts, discovery, auto-add) and remote repeater management over the mesh. |
 
 Later: location estimation, offline tile-cache builder, repeater timestamps, airtime measurement.
 

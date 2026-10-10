@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from beacon_base import clock, companion, executor, wire
+from beacon_base import clock, companion, executor, remote, wire
 from beacon_base.config import ClockConfig, CompanionConfig, Config, RadioConfig, RemoteConfig
 from beacon_base.fake_companion import FakeCompanion
 from beacon_base.fake_repeater import FakeRepeater
@@ -225,6 +225,7 @@ def test_the_contact_is_added_to_the_companion_once(env):
     env.run("beacon.names")
     adds = [c for c in env.fake.commands if c[0] == companion.CMD_ADD_UPDATE_CONTACT]
     assert len(adds) == 1 and adds[0][1:33] == RKEY and len(adds[0]) == 148
+    assert adds[0][136:144] == bytes(8)  # no position: the companion must not hand the base's own value back as an advert
     assert env.fake.contacts[RKEY][1] == "ridge"
 
 
@@ -327,3 +328,72 @@ def test_a_login_works_after_a_companion_reboot_only_because_the_clock_was_set(e
     until(lambda: env.session.clock_synced and abs(env.fake.rtc() - time.time()) <= 3)
     row = env.run("name", password="password")
     assert row["state"] == "done"
+
+
+# --- actions --------------------------------------------------------------------------------------------------------------
+
+
+def test_a_clock_sync_sets_a_repeater_that_is_behind_and_confirms_it(env):
+    env.repeater.clock_skew = -7200
+    row = env.run("clock", "run", password="password")
+    r = env.result(row)
+    assert row["state"] == "done" and r["set"] is True and abs(r["values"]["clock"]["offset_s"]) <= remote.CLOCK_TOLERANCE_S
+    assert abs(env.repeater.repeater_time() - time.time()) <= 3
+    assert r["replies"][0]["command"].startswith("time 17")  # the base's time was filled in
+
+
+def test_a_clock_already_in_step_is_a_success_and_one_that_is_ahead_is_not(env):
+    row = env.run("clock", "run", password="password")
+    assert row["state"] == "done" and env.result(row)["set"] is False  # refused as 'not forward' but within a minute of the base
+    env.repeater.clock_skew = 600
+    row = env.run("clock", "run")
+    assert row["state"] == "failed" and row["error_code"] == "clock_ahead" and "ahead" in row["error"]
+
+
+def test_get_clock(env):
+    env.repeater.clock_skew = -3600
+    r = env.result(env.run("clock", password="password"))
+    assert 3500 < r["values"]["clock"]["offset_s"] < 3700
+
+
+def test_a_flood_advert_is_requested(env):
+    row = env.run("advert", "run", password="password")
+    assert row["state"] == "done" and env.repeater.adverts_sent == 1 and env.repeater.zero_hop_adverts_sent == 0
+
+
+def test_a_reboot_is_sent_without_waiting_for_an_answer_and_the_next_job_logs_in_again(env):
+    assert env.run("name", password="password")["state"] == "done"
+    logins = lambda: sum(1 for c in env.fake.commands if c[0] == companion.CMD_SEND_LOGIN)
+    before = logins()
+    started = time.monotonic()
+    row = env.run("reboot", "run")
+    assert row["state"] == "done" and env.repeater.reboots == 1 and env.result(row)["confirmed"] is False
+    assert time.monotonic() - started < 3  # not the reply timeout of a command that cannot be answered
+    row = env.run("name")  # no password: the repeater kept the base as an admin through the reboot
+    assert row["state"] == "done" and logins() == before + 1
+
+
+def test_a_contact_removed_from_the_companion_between_jobs_does_not_break_the_next_one(env):
+    assert env.run("name", password="password")["state"] == "done"
+    del env.fake.contacts[RKEY]  # cleaned by hand, as an operator might
+    env.fake.paths.pop(RKEY, None)
+    row = env.run("beacon.window")
+    assert row["state"] == "done" and RKEY in env.fake.contacts
+    assert sum(1 for c in env.fake.commands if c[0] == companion.CMD_ADD_UPDATE_CONTACT) == 2
+
+
+def test_adverts_from_a_repeater_stored_as_a_contact_reach_the_base_and_are_counted(env):
+    assert env.run("name", password="password")["state"] == "done" and RKEY in env.fake.contacts
+    env.fake.advert(RKEY, "hilltop", lat=12.5, lon=-98.25, counter=int(time.time()))  # a stored contact: the host gets a bare key
+    until(lambda: env.store.repeater(RKEY[:8].hex())["name"] == "hilltop")
+    r = env.store.repeater(RKEY[:8].hex())
+    assert (r["lat"], r["lon"], r["location_source"]) == (12.5, -98.25, "advert")
+    assert env.session.stats["advert_stored"] == 1 and env.session.stats["advert_new"] == 0
+
+
+def test_a_stored_contact_that_was_gone_when_its_advert_arrived_is_not_written_off(env):
+    env.fake.write_frame(bytes([companion.PUSH_ADVERT]) + RKEY)  # the contact was removed a moment ago: nothing to read
+    until(lambda: env.session.stats["advert_lookup_failed"] == 1)
+    assert env.run("name", password="password")["state"] == "done" and RKEY in env.fake.contacts  # a job stores it again
+    env.fake.advert(RKEY, "back", lat=1.5, lon=2.5, counter=int(time.time()))
+    until(lambda: env.store.repeater(RKEY[:8].hex())["name"] == "back")  # and its adverts are heard again

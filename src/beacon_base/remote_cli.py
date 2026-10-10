@@ -28,8 +28,10 @@ EXIT_OK, EXIT_FAILED, EXIT_STILL_RUNNING = 0, 1, 3
 
 USAGE = (
     "usage: beaconctl repeater remote <repeater> get|set <item> [value ...]\n"
+    "       beaconctl repeater remote <repeater> clock sync | advert | reboot [--yes]\n"
     "       beaconctl repeater remote jobs [ID] [--all]\n"
-    "items: " + ", ".join(remote.KINDS) + "\n"
+    "items: " + ", ".join(k for k in remote.KINDS if k not in remote.RUN_ONLY) + "\n"
+    "  clock sync   set the repeater's clock to the base's (forward only)   advert   send a flood advert now   reboot   restart the repeater\n"
     "  set name <text>                  set location <lat> <lon>          set advert.interval <minutes|off>\n"
     "  set flood.advert.interval <hours|off>   set beacon.window <seconds>   set beacon.names on|off   set beacon.name_refresh <hours>\n"
     "  get <item> for any item, 'get all' for everything but the counters; beacon.stats and beacon.channel can only be read"
@@ -59,7 +61,13 @@ def _whole(text: str, what: str, off: bool = False) -> int:
 def parse_request(item: str, op: str, values: list[str], verify: bool = True, allow_zero: bool = False) -> dict:
     """The job parameters for a command line. Everything is checked again by remote.validate when the job is queued."""
     if item not in remote.KINDS:
-        raise StoreError(f"unknown item {item!r}; the items are {', '.join(remote.KINDS)}")
+        raise StoreError(f"unknown item {item!r}; the items are {', '.join(k for k in remote.KINDS if k not in remote.RUN_ONLY)}")
+    if op == "run":
+        if values:
+            raise StoreError(f"'{item}' takes no value")
+        return {"verify": verify} if item == "clock" else {}
+    if item in remote.RUN_ONLY:
+        raise StoreError(f"{item} is an action, not something to {op}: beaconctl repeater remote <repeater> {item}")
     if op == "get":
         if values:
             raise StoreError(f"'get {item}' takes no value; did you mean 'set'?")
@@ -127,6 +135,18 @@ def read_password(args: argparse.Namespace) -> str | None:
 # --- running it -----------------------------------------------------------------------------------------------------------
 
 
+def confirm_reboot(args: argparse.Namespace, label: str) -> None:
+    """A reboot loses the batch the repeater holds and takes it off the air for a while, so it is asked for, or given with --yes."""
+    if args.yes:
+        return
+    if sys.stdin.isatty():
+        answer = input(f"Reboot {label}? It stops reporting for a short while and loses the batch it holds. [y/N] ")
+        if answer.strip().lower() in ("y", "yes"):
+            return
+        raise StoreError("not rebooted")
+    raise StoreError(f"rebooting {label} restarts it and loses the batch it holds; add --yes to confirm")
+
+
 def not_ready(store: Store, repeater) -> tuple[str, str] | None:
     """(code, message) when a job cannot possibly run now, so it is not queued only to expire."""
     row = store.status_row()
@@ -169,14 +189,22 @@ def cmd_repeater_remote(args: argparse.Namespace, cfg: Config) -> int:
     words = list(args.words)
     if words[0] == "jobs":
         return cmd_jobs(args, cfg, words[1:])
-    if len(words) < 3 or words[1] not in ("get", "set"):
+    ref, verb, rest = words[0], (words[1] if len(words) > 1 else ""), words[2:]
+    if verb in ("get", "set") and rest:
+        op, item, values = verb, rest[0], rest[1:]
+    elif verb == "clock" and rest == ["sync"]:
+        op, item, values = "run", "clock", []
+    elif verb in ("advert", "reboot") and not rest:
+        op, item, values = "run", verb, []
+    else:
         raise StoreError(USAGE)
-    ref, op, item, values = words[0], words[1], words[2], words[3:]
     params = parse_request(item, op, values, verify=not args.no_verify, allow_zero=args.allow_zero)
     password = read_password(args)
     with Store.open(cfg.db_path) as store:
         repeater = store.repeater(ref)
         label = names.label(repeater["name"], repeater["prefix"])
+        if item == "reboot":
+            confirm_reboot(args, label)
         problem = not_ready(store, repeater)
         if problem:
             return _report_failure(args, label, problem[0], problem[1])
@@ -250,6 +278,15 @@ def stats_change(now: dict, before: dict, gap: float) -> str:
     return f"since the previous reading {fmt_duration(gap)} earlier: " + ", ".join(f"{labels.get(k, k)} +{now[k] - before[k]}" for k in keys)
 
 
+def _clock_offset_text(offset: int | None) -> str:
+    """How a repeater's clock compares with the base's. The repeater reports whole minutes, so anything within 90 s is in step."""
+    if offset is None:
+        return "not compared with the base"
+    if abs(offset) <= remote.CLOCK_TOLERANCE_S:
+        return "in step with the base, to the minute"
+    return f"{abs(offset)} s {'behind' if offset > 0 else 'ahead of'} the base"
+
+
 def _channel_text(channel: dict, base_hash: int | None) -> str:
     if not channel["set"]:
         return "not set: this repeater sends no reports"
@@ -285,6 +322,8 @@ def _value_lines(store: Store, cfg: Config, row, values: dict, errors: dict) -> 
             text = _channel_text(v, base_hash)
         elif item == "beacon.stats":
             text = _stats_line(v)
+        elif item == "clock":
+            text = f"{v['text']}  ({_clock_offset_text(v['offset_s'])})"
         else:
             text = str(v)
         out.append(f"  {item:<22}{text}")
@@ -308,7 +347,9 @@ def render(store: Store, cfg: Config, label: str, row) -> list[str]:
         return lines
     values, errors = result.get("values", {}), result.get("errors", {})
     lines = []
-    if op == "get":
+    if op == "run":
+        lines += _run_lines(label, item, bytes(row["repeater_prefix"]).hex(), result)
+    elif op == "get":
         lines.append(f"{label}:")
         lines += _value_lines(store, cfg, row, values, errors)
         if errors and item != "all":
@@ -335,6 +376,21 @@ def render(store: Store, cfg: Config, label: str, row) -> list[str]:
     flooded = " (flooded)" if result.get("flooded") else ""
     lines.append(f"  {result.get('round_trips', 0)} round trip(s) in {result.get('seconds', 0):g} s{flooded}")
     return lines
+
+
+def _run_lines(label: str, item: str, prefix: str, result: dict) -> list[str]:
+    if item == "advert":
+        return [f"{label}: flood advert sent (the repeater sends it about 1.5 s after replying; the base learns a changed name or position from it)"]
+    if item == "reboot":
+        return [
+            f"{label}: reboot command sent. The repeater cannot answer it (it restarts first), so this is not confirmed; it takes a short "
+            f"while to come back. Check with: beaconctl repeater remote {prefix} get name"
+        ]
+    clock = result.get("values", {}).get("clock")
+    if clock is None:
+        return [f"{label}: clock set (not read back)"]
+    how = "set" if result.get("set") else "left alone: it was already in step and cannot be set back"
+    return [f"{label}: clock {how}; the repeater now reads {clock['text']} ({_clock_offset_text(clock['offset_s'])})"]
 
 
 def _set_phrase(item: str, sent) -> str:

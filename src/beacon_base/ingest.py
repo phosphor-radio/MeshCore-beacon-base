@@ -300,6 +300,8 @@ class CompanionSession:
             self._handler.on_login(result)
         elif frame[0] in (companion.PUSH_NEW_ADVERT, companion.PUSH_ADVERT) and self._cfg.companion.learn_repeaters:
             # handled in the main loop: it needs commands of its own, which cannot nest inside another request
+            self.stats["advert_new" if frame[0] == companion.PUSH_NEW_ADVERT else "advert_stored"] += 1
+            log.debug("advert push from %s (%s)", frame[1:9].hex(), "not a stored contact" if frame[0] == companion.PUSH_NEW_ADVERT else "a stored contact")
             self._advert_pushes.append(frame)
         else:
             self.stats["push_ignored"] += 1
@@ -506,11 +508,15 @@ class CompanionSession:
                 continue
             known = self._contacts.get(key)
             if known is not None and known.adv_type != companion.ADV_TYPE_REPEATER:
+                self.stats["advert_other_node"] += 1
                 continue  # a node we are not interested in
             try:  # a stored contact advertised again: the push has no position, so read the contact for the new one
                 reply = link.request(companion.get_contact_by_key(key), [companion.RESP_CONTACT])
-            except CommandError:
-                self._contacts[key] = companion.Contact(key, 0, "", 0, None, None)  # remember not to ask again
+            except CommandError as e:
+                # Not remembered: the contact may have been removed a moment ago and stored again by the next job, and a repeater that
+                # was once marked 'not interesting' here would then never be heard from again on this connection.
+                self.stats["advert_lookup_failed"] += 1
+                log.debug("advert push from %s but the companion no longer has the contact: %s", key[:8].hex(), e)
                 continue
             self._note_contact(reply, live=True)
 

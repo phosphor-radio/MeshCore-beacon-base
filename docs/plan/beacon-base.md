@@ -6,7 +6,7 @@ in [beacon-project.md](beacon-project.md), and sets up the architecture for the 
 
 Status: B0 done (firmware commit `55fe473a`). B1 done and verified on hardware (`beaconctl listen` against the XIAO S3 WIO
 companion). B2 is done and was verified on hardware (real beacons and repeaters). The beacon names work ([beacon-names.md](beacon-names.md): firmware commit `28bb4985`, base N1 and N2) is complete and
-passed its hardware check (N3). B3 onwards not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
+passed its hardware check (N3). The repeater onboarding ([repeater-onboarding.md](repeater-onboarding.md)) and the remote repeater management ([repeater-remote.md](repeater-remote.md)) are complete and were used on the hardware; the remote work also built the ingest heartbeat, the one part of B3 done so far. The rest of B3 (retention, systemd units, udev rule, install script) and B4 are not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
 made while implementing B2 are marked "(B2)".
 
 ## Decisions

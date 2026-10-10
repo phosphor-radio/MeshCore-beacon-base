@@ -12,6 +12,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Callable
 
@@ -100,6 +101,10 @@ class FakeRepeater:
         self.drop_next_logins = 0  # lose the next N login replies
         self.commands: list[str] = []  # every command text run, in order, for assertions
         self.saves = 0
+        self.clock_skew = 0  # the repeater's own clock minus the real one, in seconds; 'time <epoch>' only moves it forward
+        self.reboots = 0
+        self.adverts_sent = 0
+        self.zero_hop_adverts_sent = 0
 
     # --- the clock and boot -------------------------------------------------------------------------------------
 
@@ -181,7 +186,8 @@ class FakeRepeater:
 
     # --- the CLI ----------------------------------------------------------------------------------------------
 
-    def handle_command(self, command: str) -> str:
+    def handle_command(self, command: str) -> str | None:
+        """The reply text, or None when the command never answers (a reboot resets the board before it can)."""
         command = command.lstrip(" ")
         prefix = ""
         if len(command) > 4 and command[2] == "|":
@@ -189,14 +195,40 @@ class FakeRepeater:
                 prefix = command[:3]
             command = command[3:]
         self.commands.append(command)
-        return prefix + self._dispatch(command)
+        body = self._dispatch(command)
+        return None if body is None else prefix + body
+
+    def repeater_time(self) -> int:
+        return self.now() + self.clock_skew
+
+    def _clock_text(self) -> str:
+        dt = datetime.fromtimestamp(self.repeater_time(), tz=timezone.utc)
+        return f"{dt.hour:02d}:{dt.minute:02d} - {dt.day}/{dt.month}/{dt.year} UTC"
 
     def _save_prefs(self) -> None:
         self.saves += 1
         if self.advert_interval_units * 2 < MIN_LOCAL_ADVERT_INTERVAL:
             self.advert_interval_units = 0  # a manually configured device stops the 2-minute install default
 
-    def _dispatch(self, command: str) -> str:
+    def _dispatch(self, command: str) -> str | None:
+        if command.startswith("reboot"):
+            self.reboots += 1
+            self.reboot()
+            return None
+        if command == "advert.zerohop":
+            self.zero_hop_adverts_sent += 1
+            return "OK - zerohop advert sent"
+        if command.startswith("advert"):
+            self.adverts_sent += 1
+            return "OK - Advert sent"
+        if command.startswith("clock"):
+            return self._clock_text()
+        if command.startswith("time "):
+            secs = atoi(command[5:])
+            if secs > self.repeater_time():
+                self.clock_skew += secs - self.repeater_time()
+                return "OK - clock set: " + self._clock_text()
+            return "(ERR: clock cannot go backwards)"
         if self.beacon_build and command.startswith("beacon."):
             return self._beacon(command)
         if command.startswith("get "):

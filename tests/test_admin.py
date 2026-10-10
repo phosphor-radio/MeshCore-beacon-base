@@ -668,3 +668,40 @@ def test_discovery_then_lock_end_to_end(cfg_file, tmp_path, capsys):
     assert far[:8].hex() in out and "auto-add" not in out  # a newcomer after locking is listed, not trusted
     _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
     assert far[:8].hex() not in out
+
+
+def test_repeater_list_shows_when_it_was_last_heard_and_the_clock_in_its_advert(cfg_file, tmp_path, capsys):
+    provision(cfg_file, capsys)
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    header = out.splitlines()[0]
+    assert "HEARD" in header and "ADVERT CLOCK" in header
+    assert [l for l in out.splitlines() if "north" in l][0].split()[-4:-2] == ["never", "-"]  # never advertised
+    advert_clock = 1_700_000_000  # 2023-11-14 22:13 UTC, a repeater whose clock restarted at an old date
+    with Store.open(tmp_path / "beacon.db") as store:
+        store.record_repeater_advert(REPEATER_A_KEY, "north", 40.1, -75.2, advert_clock, time.time() - 30)
+    _, out, _ = run(cfg_file, "repeater", "list", capsys=capsys)
+    line = [l for l in out.splitlines() if "north" in l][0]
+    assert "30s ago" in line and "2023-11-14 22:13" in line
+    assert len(out.strip().splitlines()) == 3  # the header and two repeaters: no footnote
+
+
+def test_repeater_adverts_shows_what_was_advertised_next_to_what_the_table_uses(cfg_file, tmp_path, capsys):
+    provision(cfg_file, capsys)
+    _, out, _ = run(cfg_file, "repeater", "adverts", capsys=capsys)
+    assert out.startswith("no adverts seen")
+    with Store.open(tmp_path / "beacon.db") as store:
+        store.record_repeater_advert(REPEATER_A_KEY, "north-adv", 41.5, -76.5, 1_790_000_000, time.time() - 20)  # a trusted repeater
+        store.record_repeater_advert(bytes(range(40, 72)), "stranger", None, None, 1_700_000_000, time.time() - 90)  # not trusted, no position
+        store.record_repeater_advert(REPEATER_B_KEY, "south-adv", 0.0, 0.0, 1_790_000_100, None)  # trusted, unlocated, known from the contact list
+    _, out, _ = run(cfg_file, "repeater", "adverts", capsys=capsys)
+    lines = out.splitlines()
+    assert lines[0].split()[:2] == ["PREFIX", "ADVERTISED"]
+    north = [l for l in lines if "north-adv" in l][0]
+    assert "41.500000, -76.500000" in north and "20s ago" in north and "2026-09-21 14:13" in north and north.split()[-1] == "yes"
+    assert "40.100000, -75.200000" not in north  # the table now uses what the advert said: last write wins
+    stranger = [l for l in lines if "stranger" in l][0]
+    assert "none" in stranger and stranger.split()[-1] == "no" and "2023-11-14" in stranger
+    south = [l for l in lines if "south-adv" in l][0]
+    assert "none" in south and "40.200000, -75.100000" in south and "never" in south  # advertised 0, 0 (ignored); the table keeps its own position
+    assert lines.index(north) < lines.index(stranger)  # most recently heard first, never-heard last
+    assert len(lines) == 4  # the header and three repeaters: no footnote

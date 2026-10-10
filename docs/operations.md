@@ -12,6 +12,12 @@ and a few things true in the field:
   moves the companion's clock forward to the base's once the base's clock is trusted (`beaconctl time set`, or `clock.assume_synced`),
   and a remote job is refused (`clock_untrusted`) until then. If the companion is *ahead* of the base (a wrong time was once pushed
   on it) `beaconctl status` says so; it cannot be set back, so reboot it.
+- **The repeaters' clocks.** A repeater stamps its adverts with its own clock, and nodes that have heard a later advert from it ignore an
+  earlier one, so a repeater that boots with a wrong clock (no RTC) can go unheard. `beaconctl repeater remote <r> get clock` shows how far
+  it is from the base, and `clock sync` sets it forward to the base's (never backward; one that is ahead needs a reboot with its clock
+  reset on its serial console, then a sync).
+- **Rebooting a repeater** from the base loses the report batch it is holding and the reboot cannot be confirmed (it never answers). The
+  repeater keeps the base as an admin through the reboot, so the next command works once it is back.
 - **Each repeater has had one password login.** The stock admin password is `password`; change it on the repeater's serial console.
   After the first login the repeater keeps the base as an admin in its flash. **A replaced companion is a new key**, so every repeater
   needs the password again.

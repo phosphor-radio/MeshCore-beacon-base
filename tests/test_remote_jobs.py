@@ -126,3 +126,49 @@ def test_removing_a_repeater_removes_its_jobs(store):
     store.submit_job("ridge", "name", "get")
     store.remove_repeater("ridge")
     assert store.jobs() == []
+
+
+def test_migration_two_lets_a_database_from_before_it_keep_its_jobs(tmp_path):
+    """A database made by the first schema (jobs with only get and set) upgrades in place, keeping its rows."""
+    import sqlite3
+
+    from beacon_base import store as store_mod
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    for statement in store_mod.MIGRATIONS[0]:
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version = 1")
+    prefix = REPEATER_A_KEY[:8]
+    conn.execute("INSERT INTO repeaters (prefix, name) VALUES (?, 'north')", (prefix,))
+    conn.execute(
+        "INSERT INTO remote_jobs (created_at, expires_at, repeater_prefix, kind, op, params, state, result, error_code) "
+        "VALUES (10, 70, ?, 'name', 'get', '{}', 'done', '{\"values\": {\"name\": \"north\"}}', NULL)", (prefix,),
+    )
+    conn.close()
+    with Store.open(path) as s:
+        assert s.schema_version() == len(store_mod.MIGRATIONS) == 2
+        old = s.job(1)
+        assert (old["kind"], old["op"], old["state"], json.loads(old["result"])) == ("name", "get", "done", {"values": {"name": "north"}})
+        assert s.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        new = s.submit_job("north", "reboot", "run")  # and the new operation is accepted
+        assert new == 2 and s.job(new)["op"] == "run"
+        assert [r["name"] for r in s.conn.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'remote_jobs' AND type = 'index'")] == ["remote_jobs_state"]
+        assert s.conn.execute("SELECT name FROM sqlite_master WHERE name = 'remote_jobs_v1'").fetchone() is None
+
+
+def test_the_job_table_refuses_an_operation_that_is_not_get_set_or_run(store):
+    with pytest.raises(Exception):
+        store.conn.execute(
+            "INSERT INTO remote_jobs (created_at, expires_at, repeater_prefix, kind, op) VALUES (1, 2, ?, 'name', 'delete')",
+            (REPEATER_A_KEY[:8],),
+        )
+
+
+def test_actions_are_queued_and_claimed_like_other_jobs(store):
+    ids = [store.submit_job("ridge", k, "run") for k in ("advert", "reboot", "clock")]
+    kinds = []
+    for _ in ids:
+        job = store.claim_job()
+        kinds.append((job.kind, job.op))
+    assert kinds == [("advert", "run"), ("reboot", "run"), ("clock", "run")]

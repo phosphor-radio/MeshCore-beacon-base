@@ -12,9 +12,10 @@ Scale is about 30 beacons and 10 repeaters.
 **Status: B1, B2 (store and pipeline) and the beacon names work (plan `docs/plan/beacon-names.md`, N0-N3) are done and
 verified on hardware, as is the repeater onboarding work (`docs/plan/repeater-onboarding.md`, R1-R3: positions and names
 from repeater adverts, plus discovery and auto-add). The remote repeater management work
-(`docs/plan/repeater-remote.md`) is under way: RM1 (companion protocol, clock), RM2 (ingest heartbeat, job table, executor) and RM3
-(`beaconctl repeater remote`, write-through, `check`) are implemented and tested against a fake repeater but not on hardware; RM4
-(the hardware script in the plan) is not done. The rest of B3 (retention, systemd, udev, install) and B4 are not started.** The plans are the source of truth:
+(`docs/plan/repeater-remote.md`) is complete: companion protocol and clock, the ingest heartbeat, the job table and executor,
+`beaconctl repeater remote` (get/set, clock sync, advert, reboot), and the hardware work (pacing, retries, advert diagnostics); used on the
+hardware with three repeaters in one room, so multi-hop paths are untested. The rest of B3 (retention, systemd, udev, install) and B4 are not
+started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -103,7 +104,10 @@ from a key the repeater does not know is a guest login); commands go out as `NN|
 sent for the current step answers it). Pacing: nothing is transmitted until `remote.step_gap_s` (3 s) after the last thing received or
 after a timeout, so the echoes of a reply die down. A step is tried three times: again on the same route, then after `CMD_RESET_PATH` and a
 fresh login. Jobs expire after 60 s unqueued; `recover_jobs` fails any left `running` by a crash. `get lat/lon` read back
-lossy, so the base records the value it sent. `Store.finish_job` writes a confirmed name, position (`location_source = 'remote'`) and window
+lossy, so the base records the value it sent. Besides get/set a job can `run` an action (migration 2 added the `run` op): `clock` (sync: `time {now}` with
+the base's wall time filled in at each send, then a `clock` read; forward only, so a refusal is read, not failed), `advert` (flood) and
+`reboot` (role `noreply`: the job finishes when the companion has sent it, since the board resets before answering, and the key leaves
+`logged_in`). `beaconctl ... reboot` asks for confirmation or `--yes`. `Store.finish_job` writes a confirmed name, position (`location_source = 'remote'`) and window
 through to `repeaters` (never a position read back). The admin password only ever travels in the job row and is erased at claim (with
 `secure_delete` and a WAL truncate); `beaconctl` takes it from a file, the environment or a prompt, never argv. `beacon-ingest` also keeps the `service_status` heartbeat row (`heartbeat.py`).
 

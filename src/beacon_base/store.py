@@ -179,6 +179,34 @@ MIGRATIONS: list[tuple[str, ...]] = [
         )""",
         "CREATE INDEX remote_jobs_state ON remote_jobs (state, id)",
     ),
+    # 2: remote jobs may also 'run' an action (sync the repeater's clock, send an advert, reboot). SQLite cannot change a CHECK, so the
+    # table is rebuilt; the rows are kept.
+    (
+        "DROP INDEX remote_jobs_state",
+        "ALTER TABLE remote_jobs RENAME TO remote_jobs_v1",
+        """CREATE TABLE remote_jobs (
+            id INTEGER PRIMARY KEY,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,         -- a job not started by then is expired, so a queued 'set' never fires hours later
+            repeater_prefix BLOB NOT NULL REFERENCES repeaters (prefix) ON DELETE CASCADE,
+            kind TEXT NOT NULL,               -- one of remote.KINDS: a closed set, never command text
+            op TEXT NOT NULL CHECK (op IN ('get', 'set', 'run')),
+            params TEXT NOT NULL DEFAULT '{}',
+            secret TEXT,                      -- the admin password if one was given; erased when the job is picked up
+            state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'done', 'failed', 'expired')),
+            started_at REAL,
+            finished_at REAL,
+            result TEXT,                      -- JSON: the values now on the repeater, the replies, round trips
+            error_code TEXT,
+            error TEXT
+        )""",
+        """INSERT INTO remote_jobs (id, created_at, expires_at, repeater_prefix, kind, op, params, secret, state, started_at, finished_at,
+                                  result, error_code, error)
+           SELECT id, created_at, expires_at, repeater_prefix, kind, op, params, secret, state, started_at, finished_at,
+                  result, error_code, error FROM remote_jobs_v1""",
+        "DROP TABLE remote_jobs_v1",
+        "CREATE INDEX remote_jobs_state ON remote_jobs (state, id)",
+    ),
 ]
 
 
@@ -781,6 +809,14 @@ class Store:
                 args.append(stamp)
             db.execute(f"UPDATE repeaters SET {', '.join(updates)} WHERE prefix = ?", (*args, prefix))
         return effect
+
+    def repeater_adverts(self) -> list[sqlite3.Row]:
+        """Every repeater advert seen, trusted or not, with whether the repeater is in the table, most recently heard first."""
+        return self.conn.execute(
+            """SELECT a.*, r.prefix IS NOT NULL AS trusted, r.name AS table_name, r.lat AS table_lat, r.lon AS table_lon
+               FROM repeater_adverts a LEFT JOIN repeaters r ON r.prefix = a.prefix
+               ORDER BY a.last_heard IS NULL, a.last_heard DESC, a.prefix"""
+        ).fetchall()
 
     def repeater_advert(self, prefix: bytes) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM repeater_adverts WHERE prefix = ?", (bytes(prefix),)).fetchone()

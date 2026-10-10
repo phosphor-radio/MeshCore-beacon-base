@@ -45,14 +45,20 @@ class StubLink:
         self.sent: list[bytes] = []
         self.contact_known = contact_known
         self.errors: dict[int, CommandError] = {}  # command code -> raise this
+        self.errors_once: dict[int, CommandError] = {}  # command code -> raise this the first time, and forget the contact
         self.timeout_ms = 2000
         self.flooded = True
 
     def request(self, payload, expect):
         self.sent.append(bytes(payload))
         op = payload[0]
+        if op in self.errors_once:
+            self.contact_known = False
+            raise self.errors_once.pop(op)
         if op in self.errors:
             raise self.errors[op]
+        if op == companion.CMD_ADD_UPDATE_CONTACT and op not in self.errors:
+            self.contact_known = True
         if op == companion.CMD_GET_CONTACT_BY_KEY:
             if not self.contact_known:
                 raise CommandError(2)
@@ -72,11 +78,14 @@ class StubLink:
 class Harness:
     def __init__(self, clock_ready=None, contact_known=True, cfg=CFG):
         self.clock = Clock()
+        self.wall_t = 1_790_000_010.7  # the base's wall clock
         self.queue: list[RemoteJob] = []
         self.finished: list[tuple[RemoteJob, JobOutcome]] = []
         self.link = StubLink(contact_known)
         self.claims = 0
-        self.ex = RemoteExecutor(cfg, self._claim, lambda j, o: self.finished.append((j, o)), clock_ready or (lambda link: None), 0x42, self.clock)
+        self.ex = RemoteExecutor(
+            cfg, self._claim, lambda j, o: self.finished.append((j, o)), clock_ready or (lambda link: None), 0x42, self.clock, lambda: self.wall_t
+        )
 
     def _claim(self):
         self.claims += 1
@@ -560,3 +569,94 @@ def test_with_no_gap_the_next_command_follows_the_reply_at_once():
     h.login()
     h.reply("OK")
     assert len(h.link.commands()) == 2
+
+
+# --- actions --------------------------------------------------------------------------------------------------------------
+
+
+def test_a_clock_sync_sends_the_base_s_time_as_it_is_at_each_send():
+    h = Harness()
+    h.run_to_login(job("clock", "run"))
+    h.login()
+    assert h.link.commands()[0].endswith("|time 1790000010")  # whole seconds of the base's clock when it was sent
+    h.wall_t += 60.0
+    h.advance(9.0)  # no answer: the command goes out again, with the time of the resend
+    assert h.link.commands()[1].endswith("|time 1790000070") and len(h.link.commands()) == 2
+    h.reply("OK - clock set: 14:14 - 21/9/2026 UTC")
+    h.reply("14:14 - 21/9/2026 UTC")
+    out = h.outcome
+    assert out.ok and out.result["replies"][0]["command"] == "time 1790000070"  # what was sent, not the template
+    assert out.result["values"]["clock"]["offset_s"] == int(h.wall_t - 1_790_000_040)
+
+
+def test_a_clock_sync_refused_as_not_forward_still_reads_the_clock_and_succeeds_when_in_step():
+    h = Harness()
+    h.wall_t = 1_790_000_000.0
+    h.run_to_login(job("clock", "run"))
+    h.login()
+    h.reply("(ERR: clock cannot go backwards)")  # a 'set' step that does not stop the job
+    assert len(h.link.commands()) == 2 and h.link.commands()[1].endswith("|clock")
+    h.reply("14:13 - 21/9/2026 UTC")
+    out = h.outcome
+    assert out.ok and out.message == "already in step with the base"
+
+
+def test_a_reboot_finishes_when_the_companion_has_sent_it_and_waits_for_nothing():
+    h = Harness()
+    h.run_to_login(job("reboot", "run"))
+    h.login()
+    assert h.link.commands()[0].endswith("|reboot")
+    out = h.outcome  # no reply is awaited: the board resets before it can answer
+    assert out.ok and out.result["sent"] is True and out.result["confirmed"] is False and out.result["round_trips"] == 1
+    assert not h.ex.busy and RKEY not in h.ex.logged_in  # the next job logs in again: the ACL is saved a few seconds after a login
+
+
+def test_after_a_reboot_the_next_job_logs_in_again():
+    h = Harness()
+    h.run_to_login(job("reboot", "run", job_id=1))
+    h.login()
+    h.link.sent.clear()
+    h.run_to_login(job("name", "get", job_id=2))
+    assert h.link.ops() == [companion.CMD_SEND_LOGIN]
+
+
+def test_an_advert_is_one_command_and_one_reply():
+    h = Harness()
+    h.run_to_login(job("advert", "run"))
+    h.login()
+    h.reply("OK - Advert sent")
+    out = h.outcome
+    assert out.ok and out.result["sent"] is True and out.result["round_trips"] == 1
+
+
+# --- a contact that is gone ----------------------------------------------------------------------------------------------
+
+
+def test_a_contact_removed_behind_our_back_is_added_again_and_the_send_repeated():
+    h = Harness()
+    h.run_to_login(job("name", "get", job_id=1))
+    h.login()
+    h.reply("> ridge")
+    h.link.sent.clear()
+    h.link.errors_once[companion.CMD_SEND_LOGIN] = CommandError(2)  # someone cleaned the companion's contact list
+    h.run_to_login(job("name", "get", password="password", job_id=2))
+    assert h.link.ops() == [
+        companion.CMD_SEND_LOGIN, companion.CMD_GET_CONTACT_BY_KEY, companion.CMD_ADD_UPDATE_CONTACT, companion.CMD_SEND_LOGIN,
+    ]
+    h.login()
+    h.reply("> ridge")
+    assert len(h.finished) == 2 and h.finished[1][1].ok
+
+
+def test_a_contact_that_cannot_be_added_again_fails_the_job_once():
+    h = Harness()
+    h.run_to_login(job("name", "get", job_id=1))
+    h.link.sent.clear()
+    h.ex.contacts.add(RKEY)
+    h.link.errors_once[companion.CMD_SEND_LOGIN] = CommandError(2)
+    h.link.errors[companion.CMD_ADD_UPDATE_CONTACT] = CommandError(3)
+    h.ex.abort()
+    h.finished.clear()
+    h.ex.contacts.add(RKEY)
+    h.run_to_login(job("name", "get", job_id=2))
+    assert len(h.finished) == 1 and h.finished[0][1].code == "contact_failed" and not h.ex.busy

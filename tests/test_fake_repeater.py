@@ -168,3 +168,32 @@ def test_commands_are_recorded(rpt):
     admin(rpt)
     rpt.command(ME, 2000, "7f|get name")
     assert rpt.commands == ["get name"]
+
+
+# --- clock, advert, reboot ------------------------------------------------------------------------------------------------
+
+
+def test_the_clock_reads_in_whole_minutes_and_only_moves_forward(rpt):
+    admin(rpt)
+    run = lambda ts, c: rpt.command(ME, ts, c)
+    assert run(2000, "clock") == "14:13 - 21/9/2026 UTC"  # 1_790_000_000 s
+    assert run(2001, "time 1790000600").startswith("OK - clock set: 14:23 - 21/9/2026 UTC")
+    assert rpt.repeater_time() == 1_790_000_600
+    assert run(2002, "time 1790000100") == "(ERR: clock cannot go backwards)"
+    assert run(2003, "time 1790000600") == "(ERR: clock cannot go backwards)"  # equal is not forward either
+    assert rpt.repeater_time() == 1_790_000_600
+
+
+def test_advert_commands_count(rpt):
+    admin(rpt)
+    assert rpt.command(ME, 2000, "7f|advert") == "7f|OK - Advert sent"
+    assert rpt.command(ME, 2001, "advert.zerohop") == "OK - zerohop advert sent"
+    assert (rpt.adverts_sent, rpt.zero_hop_adverts_sent) == (1, 1)
+
+
+def test_a_reboot_never_answers_and_keeps_admins_but_not_the_timestamp(rpt):
+    admin(rpt, ts=5000)
+    rpt.login(OTHER, "", 5000)
+    assert rpt.command(ME, 5001, "7f|reboot") is None
+    assert rpt.reboots == 1 and OTHER not in rpt.acl and rpt.acl[ME].last_timestamp == 0
+    assert rpt.command(ME, 7, "get name") == "> ridge"
