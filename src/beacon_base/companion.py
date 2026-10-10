@@ -19,6 +19,7 @@ CMD_GET_CONTACT_BY_KEY = 30
 CMD_GET_CHANNEL = 31
 CMD_SET_CHANNEL = 32
 CMD_SET_OTHER_PARAMS = 38
+CMD_SET_PATH_HASH_MODE = 61
 
 # responses (device to host, replies to a command)
 RESP_OK = 0
@@ -130,6 +131,13 @@ def sync_next_message() -> bytes:
     return bytes([CMD_SYNC_NEXT_MESSAGE])
 
 
+def set_path_hash_mode(mode: int) -> bytes:
+    """CMD_SET_PATH_HASH_MODE: the size of the path hashes the companion puts in the packets it floods (mode + 1 bytes)."""
+    if not 0 <= mode <= 2:
+        raise ValueError("path hash mode must be 0, 1 or 2")
+    return bytes([CMD_SET_PATH_HASH_MODE, 0, mode])
+
+
 def set_radio_params(freq_khz: int, bw_hz: int, sf: int, cr: int) -> bytes:
     return struct.pack("<BIIBB", CMD_SET_RADIO_PARAMS, freq_khz, bw_hz, sf, cr)
 
@@ -186,6 +194,7 @@ class DeviceInfo:
     build: str
     model: str
     version: str
+    path_hash_mode: int | None = None  # 0-2 (hash size 1-3 bytes); None when the firmware is older than v10
 
 
 def parse_device_info(frame: bytes) -> DeviceInfo:
@@ -200,6 +209,7 @@ def parse_device_info(frame: bytes) -> DeviceInfo:
         build=_cstr(bytes(frame[8:20])),
         model=_cstr(bytes(frame[20:60])),
         version=_cstr(bytes(frame[60:80])),
+        path_hash_mode=frame[81] if fw_ver >= 10 and len(frame) >= 82 else None,  # byte 80 is the client-repeat flag (v9+)
     )
 
 

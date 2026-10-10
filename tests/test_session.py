@@ -242,19 +242,74 @@ def test_channel_index_beyond_companion_slots_is_fatal(fake):
     assert "out of range" in str(run.error)
 
 
-def test_radio_mismatch_is_left_alone_by_default(fake):
+def test_the_radio_settings_are_applied_at_startup_by_default(fake):
     fake.radio = (869525, 250000, 11, 5)
     with Running(make_config(fake)) as run:
         run.handler.wait(lambda: run.handler.connects == 1)
-    assert fake.radio == (869525, 250000, 11, 5)
+    assert fake.radio == (905775, 62500, 8, 6)
+    sets = [c for c in fake.commands if c[0] == companion.CMD_SET_RADIO_PARAMS]
+    assert sets == [companion.set_radio_params(905775, 62500, 8, 6)]  # frequency in kHz, bandwidth in Hz, SF, CR
+
+
+def test_a_radio_that_already_matches_is_not_written(fake):
+    with Running(make_config(fake)) as run:  # the fake starts on the mesh settings
+        run.handler.wait(lambda: run.handler.connects == 1)
     assert not [c for c in fake.commands if c[0] == companion.CMD_SET_RADIO_PARAMS]
 
 
-def test_manage_radio_applies_settings(fake):
+def test_managing_the_radio_can_be_switched_off_and_only_warns(fake, caplog):
     fake.radio = (869525, 250000, 11, 5)
-    with Running(make_config(fake, manage_radio=True)) as run:
+    fake.path_hash_mode = 0
+    with Running(make_config(fake, manage_radio=False)) as run:
         run.handler.wait(lambda: run.handler.connects == 1)
-    assert fake.radio == (905775, 62500, 8, 6)
+    assert fake.radio == (869525, 250000, 11, 5) and fake.path_hash_mode == 0
+    assert not [c for c in fake.commands if c[0] in (companion.CMD_SET_RADIO_PARAMS, companion.CMD_SET_PATH_HASH_MODE)]
+    assert "companion radio is" in caplog.text and "path hash mode is 0 but the mesh uses 2" in caplog.text
+
+
+def test_the_path_hash_mode_is_set_to_the_mesh_value(fake):
+    assert fake.path_hash_mode == 0
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+    assert fake.path_hash_mode == 2
+    assert [c for c in fake.commands if c[0] == companion.CMD_SET_PATH_HASH_MODE] == [bytes([61, 0, 2])]
+
+
+def test_the_path_hash_mode_is_only_written_when_it_differs(fake):
+    fake.path_hash_mode = 2
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+        fake.disconnect()
+        run.handler.wait(lambda: len(run.handler.disconnects) == 1)
+        fake.reconnect()
+        run.handler.wait(lambda: run.handler.connects == 2)
+    assert not [c for c in fake.commands if c[0] == companion.CMD_SET_PATH_HASH_MODE]
+
+
+def test_the_configured_path_hash_mode_is_used(fake):
+    cfg = make_config(fake)
+    cfg = dataclasses.replace(cfg, radio=dataclasses.replace(cfg.radio, path_hash_mode=1))
+    with Running(cfg) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+    assert fake.path_hash_mode == 1
+
+
+def test_a_failure_to_set_the_path_hash_mode_does_not_stop_the_session(fake, caplog):
+    fake.path_hash_error = 1  # unsupported command
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.synced == 1)
+        fake.enqueue_report(report(obs(0xA1, 1)))
+        run.handler.wait(lambda: len(run.handler.reports) == 1)
+        assert run.error is None and run.handler.connects == 1
+    assert "could not set the companion's path hash mode to 2" in caplog.text
+
+
+def test_firmware_too_old_to_report_the_path_hash_mode_is_left_alone(fake, caplog):
+    fake.fw_ver = 9
+    with Running(make_config(fake)) as run:
+        run.handler.wait(lambda: run.handler.connects == 1)
+    assert not [c for c in fake.commands if c[0] == companion.CMD_SET_PATH_HASH_MODE]
+    assert "cannot report or set the path hash mode" in caplog.text
 
 
 def test_radio_frequency_off_by_one_khz_counts_as_matching(fake):

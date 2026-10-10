@@ -146,6 +146,22 @@ def test_bare_advert_and_contact_commands():
         companion.get_contact_by_key(key[:8])
 
 
+def test_set_path_hash_mode():
+    assert companion.set_path_hash_mode(2) == bytes([61, 0, 2])  # CMD_SET_PATH_HASH_MODE, sub-command 0, mode
+    for bad in (-1, 3):
+        with pytest.raises(ValueError):
+            companion.set_path_hash_mode(bad)
+
+
+def test_device_info_reports_the_path_hash_mode_from_firmware_v10():
+    body = bytes([13, 10, 50, 40]) + bytes(4) + b"b".ljust(12, b"\0") + b"m".ljust(40, b"\0") + b"v".ljust(20, b"\0")
+    assert companion.parse_device_info(body + bytes([0, 2])).path_hash_mode == 2
+    assert companion.parse_device_info(body + bytes([1, 0])).path_hash_mode == 0
+    assert companion.parse_device_info(body).path_hash_mode is None  # frame too short to carry it
+    old = bytes([13, 9]) + body[2:] + bytes([0, 2])
+    assert companion.parse_device_info(old).path_hash_mode is None  # firmware older than v10
+
+
 def test_set_manual_add_contacts_leaves_the_other_settings_alone():
     # CMD_SET_OTHER_PARAMS has optional telemetry/location bytes after the first; sending only the first keeps them
     assert companion.set_manual_add_contacts(True) == bytes([38, 1])

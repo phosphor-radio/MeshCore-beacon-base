@@ -97,6 +97,19 @@ def test_secrets_file_override(tmp_path):
     assert load_config(p).channel_key == bytes([0x11] * 16)
 
 
+def test_the_radio_settings_default_to_the_mesh_and_are_applied_by_default(tmp_path):
+    cfg = load_config(write(tmp_path / "config.toml", ""))
+    assert cfg.companion.manage_radio is True
+    assert (cfg.radio.freq_khz, cfg.radio.bw_hz, cfg.radio.sf, cfg.radio.cr, cfg.radio.path_hash_mode) == (905775, 62500, 8, 6, 2)
+
+
+def test_path_hash_mode_is_read_and_checked(tmp_path):
+    assert load_config(write(tmp_path / "c.toml", "[radio]\npath_hash_mode = 1\n")).radio.path_hash_mode == 1
+    for bad in ("3", "-1", "true", '"2"', "1.5"):
+        with pytest.raises(ConfigError, match="path_hash_mode"):
+            load_config(write(tmp_path / "bad.toml", f"[radio]\npath_hash_mode = {bad}\n"))
+
+
 def test_example_config_loads():
     from pathlib import Path
 

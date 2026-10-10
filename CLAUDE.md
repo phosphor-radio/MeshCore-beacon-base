@@ -124,7 +124,9 @@ deployment migration 1 may still be edited, and the development database deleted
   or unknown device (an nRF52 on Adafruit TinyUSB only transmits while DTR is high), with one reopen the other way if the first
   `APP_START` gets no reply (`link.choose_dtr`, `CompanionSession._app_start`). Use `/dev/serial/by-id/...` and treat reboots
   as ordinary reconnects. See `docs/operations.md`.
-- Radio settings across all devices: 905.775 MHz, BW 62.5 kHz, SF 8, CR 4/6. The report channel key is 16 bytes.
+- Radio settings across all devices: 905.775 MHz, BW 62.5 kHz, SF 8, CR 4/6, path hash mode 2. The report channel key is 16 bytes.
+  The session writes the radio parameters, path hash mode, channel and manual-add mode to the companion at every connect, each
+  only when it differs (flash wear); `companion.manage_radio` (on by default) covers the radio and path hash mode.
 - Reject and log unknown report versions; never guess at a format.
 - Use numbered schema migrations from the start. Batch commits and keep `synchronous=NORMAL` (SD card wear).
 - Secrets (channel key, web token) live in a mode 0600 config file and never in git.

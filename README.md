@@ -115,6 +115,20 @@ beaconctl status                             # one line per beacon, rejected and
 | `ingest [--port P]` | Same as `beacon-ingest`. |
 | `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
 
+### What the base sets on the companion at startup
+
+Every time `beacon-ingest` or `beaconctl listen` connects it makes the companion match the mesh, writing a setting only when
+it differs (the companion keeps them in flash):
+
+| Setting | From | Notes |
+|---|---|---|
+| Radio: frequency, bandwidth, SF, CR | `[radio]` `freq_khz`, `bw_hz`, `sf`, `cr` (905775 kHz, 62500 Hz, SF 8, CR 6) | Sent without the client-repeat flag, so the companion does not repeat. `companion.manage_radio = false` only warns instead. |
+| Path hash mode | `[radio]` `path_hash_mode` (default `2`, 0-2) | Hash size in the paths of the packets the companion floods; kept the same as the rest of the mesh. Needs companion firmware v10. A failure is logged and ignored. |
+| Report channel | `companion.channel_index` / `channel_name`, the key in `secrets.toml` | Slot 0 holds the built-in Public channel, so the default slot is 1. |
+| Manual-add mode | `companion.manual_add_contacts` (on) | Every advert reaches the base in full; see "Repeater positions and names". |
+
+The serial port's DTR level is chosen separately, below.
+
 ### Companion serial port: DTR
 
 An ESP32-S3 companion (Espressif native USB, vendor `0x303A`) must be opened with **DTR low**, or it can reset. An nRF52

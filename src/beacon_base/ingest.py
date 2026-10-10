@@ -289,6 +289,7 @@ class CompanionSession:
                 f"companion.channel_index {cc.channel_index} is out of range, the companion has {device.max_channels} slots"
             )
         self._ensure_radio(link, self_info)
+        self._ensure_path_hash_mode(link, device)
         self._ensure_channel(link)
         self._ensure_manual_add(link, self_info)
         return ConnectionInfo(self_info, device)
@@ -313,6 +314,28 @@ class CompanionSession:
             link.request(companion.set_radio_params(radio.freq_khz, radio.bw_hz, radio.sf, radio.cr), [companion.RESP_OK])
         else:
             log.warning("companion radio is %s but the mesh uses %s; set companion.manage_radio to fix it", have, want)
+
+    def _ensure_path_hash_mode(self, link: CompanionLink, device: DeviceInfo) -> None:
+        """Match the mesh's path hash size. Written only when it differs, since the companion keeps it in flash. A failure to set
+        it is logged and does not stop the session."""
+        want = self._cfg.radio.path_hash_mode
+        have = device.path_hash_mode
+        if have is None:
+            log.warning(
+                "companion firmware v%d cannot report or set the path hash mode (needs v10); the mesh uses %d", device.fw_ver, want
+            )
+            return
+        if have == want:
+            return
+        if not self._cfg.companion.manage_radio:
+            log.warning("companion path hash mode is %d but the mesh uses %d; set companion.manage_radio to fix it", have, want)
+            return
+        try:
+            link.request(companion.set_path_hash_mode(want), [companion.RESP_OK])
+        except CommandError as e:
+            log.warning("could not set the companion's path hash mode to %d: %s", want, e)
+            return
+        log.info("set the companion's path hash mode to %d (was %d)", want, have)
 
     def _ensure_channel(self, link: CompanionLink) -> None:
         cc = self._cfg.companion

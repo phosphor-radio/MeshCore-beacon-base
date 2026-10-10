@@ -17,8 +17,10 @@ dtr = "auto"
 channel_index = 1
 channel_name = "beacon-reports"
 
-# Apply [radio] to the companion on connect. When false, a mismatch is only logged as a warning.
-manage_radio = false
+# Apply [radio] (radio parameters and path hash mode) to the companion on connect, so any companion can be used without a
+# special firmware image. Each is written only when it differs, since the companion keeps them in flash. When false, a
+# mismatch is only logged as a warning.
+manage_radio = true
 
 # Take each repeater's position and name from the adverts the companion hears (repeaters advertise them; nothing is typed in).
 learn_repeaters = true
@@ -36,6 +38,7 @@ freq_khz = 905775
 bw_hz = 62500
 sf = 8
 cr = 6      # 6 means coding rate 4/6
+path_hash_mode = 2   # 0-2: path hashes of 1-3 bytes in the packets a device floods; kept the same across the mesh
 
 [database]
 # SQLite file shared by ingest, the CLI and (later) the web UI. Relative paths are relative to this file's directory.

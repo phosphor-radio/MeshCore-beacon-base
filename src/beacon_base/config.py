@@ -31,6 +31,7 @@ class RadioConfig:
     bw_hz: int = 62500
     sf: int = 8
     cr: int = 6  # 6 means 4/6
+    path_hash_mode: int = 2  # 0-2: path hashes of 1-3 bytes in the packets a device floods; the mesh uses 2
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,7 @@ class CompanionConfig:
     dtr: str = "auto"
     channel_index: int = 1  # slot 0 holds the built-in Public channel
     channel_name: str = "beacon-reports"
-    manage_radio: bool = False  # apply [radio] to the companion instead of only warning when it differs
+    manage_radio: bool = True  # apply [radio] (radio parameters and path hash mode) to the companion; false only warns when it differs
     poll_interval: float = 30.0  # safety-net queue drain, in case a MSG_WAITING push is missed
     learn_repeaters: bool = True  # take each repeater's position and name from the adverts the companion hears
     manual_add_contacts: bool = True  # run the companion in manual-add mode so every advert reaches us in full (stored in the companion)
@@ -150,6 +151,8 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     database = _section(data, "database", DatabaseConfig, path)
     beacon = _section(data, "beacon", BeaconConfig, path)
     clock = _section(data, "clock", ClockConfig, path)
+    if isinstance(radio.path_hash_mode, bool) or not isinstance(radio.path_hash_mode, int) or not 0 <= radio.path_hash_mode <= 2:
+        raise ConfigError("radio.path_hash_mode must be 0, 1 or 2")
     if companion.dtr not in ("auto", "on", "off"):
         raise ConfigError(f"companion.dtr must be \"auto\", \"on\" or \"off\", not {companion.dtr!r}")
     if not 0 <= companion.channel_index <= 255:

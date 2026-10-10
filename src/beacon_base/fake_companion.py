@@ -46,6 +46,8 @@ class FakeCompanion:
         self.host_dtr: bool | None = None
         self.drop_replies_when_dtr: bool | None = None
         self.silent = False
+        self.path_hash_mode = 0  # the firmware default; reported in DEVICE_INFO from firmware v10
+        self.path_hash_error: int | None = None  # answer CMD_SET_PATH_HASH_MODE with this error code
         self.manual_add = False  # the companion's manual-add mode: it stores nothing and pushes every advert in full
         self.contacts_error: int | None = None  # answer CMD_GET_CONTACTS with this error code
         self.commands: list[bytes] = []  # every command frame received, for assertions
@@ -216,7 +218,7 @@ class FakeCompanion:
         elif op == companion.CMD_DEVICE_QUERY and len(cmd) >= 2:
             frame = bytes([companion.RESP_DEVICE_INFO, self.fw_ver, 50, self.max_channels]) + bytes(4)
             frame += b"08 Oct 2026".ljust(12, b"\0") + b"Fake Companion".ljust(40, b"\0") + b"v1.fake".ljust(20, b"\0")
-            frame += bytes([0, 0])
+            frame += bytes([0, self.path_hash_mode]) if self.fw_ver >= 10 else b""
             self.write_frame(frame)
         elif op == companion.CMD_GET_CHANNEL and len(cmd) >= 2:
             entry = self.channels.get(cmd[1]) if cmd[1] < self.max_channels else None
@@ -235,6 +237,14 @@ class FakeCompanion:
         elif op == companion.CMD_SET_RADIO_PARAMS and len(cmd) >= 11:
             self.radio = struct.unpack_from("<IIBB", cmd, 1)
             self._ok()
+        elif op == companion.CMD_SET_PATH_HASH_MODE and len(cmd) >= 3 and cmd[1] == 0:
+            if self.path_hash_error is not None:
+                self._err(self.path_hash_error)
+            elif cmd[2] >= 3:
+                self._err(6)
+            else:
+                self.path_hash_mode = cmd[2]
+                self._ok()
         elif op == companion.CMD_SET_OTHER_PARAMS and len(cmd) >= 2:
             self.manual_add = bool(cmd[1] & 1)
             self._ok()

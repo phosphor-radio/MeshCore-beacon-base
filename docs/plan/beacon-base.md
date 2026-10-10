@@ -72,9 +72,12 @@ Uses the existing USB serial interface; **no firmware change is needed for the b
      `companion.dtr` (`auto` by USB vendor, with one retry the other way if `APP_START` gets no reply). Treat an unexpected
      reboot as a normal reconnect.
   2. `CMD_APP_START` then `CMD_DEVICE_QUERY` (firmware version, `max_channels`).
-  3. Optionally apply radio parameters with `CMD_SET_RADIO_PARAMS` (905775 kHz, 62500 Hz, SF 8, CR 6) when
-     `manage_radio = true`. This avoids having to build a special companion image. Check that the companion persists
-     them.
+  3. Apply the mesh's radio parameters with `CMD_SET_RADIO_PARAMS` (905775 kHz, 62500 Hz, SF 8, CR 6) and its path hash
+     mode with `CMD_SET_PATH_HASH_MODE` (2, from firmware v10; `radio.path_hash_mode`), each only when it differs from what
+     `APP_START` and `DEVICE_QUERY` report, since the companion keeps both in flash. On by default (`manage_radio`; false
+     only warns). This avoids having to build a special companion image. `CMD_SET_RADIO_PARAMS` is sent without the
+     client-repeat byte, so it also turns the companion's repeating off, which a base companion never wants. A failure to
+     set the path hash mode is logged and does not stop the session.
   4. `CMD_GET_CHANNEL` for the configured slot; `CMD_SET_CHANNEL` if the name or 16-byte secret differ. Only 128-bit
      secrets are supported by the companion, so the report channel key is 16 bytes (32 hex chars).
   5. Drain: send `CMD_SYNC_NEXT_MESSAGE` until `RESP_CODE_NO_MORE_MESSAGES`.
