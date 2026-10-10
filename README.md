@@ -58,6 +58,7 @@ tested at a desk.
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): overall project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): base design, data model, pipeline, phases B0-B4.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
+- [docs/operations.md](docs/operations.md): running on real hardware, starting with the companion's USB serial (DTR) settings.
 
 Links inside the plan docs that point at `../../src/...` or `../companion_protocol.md` refer to files in the firmware
 repo, not this one.
@@ -67,7 +68,9 @@ repo, not this one.
 - Linux (Raspberry Pi OS or Ubuntu).
 - Python 3.11 or newer.
 - A MeshCore companion node on USB. The test setup is a XIAO ESP32-S3 + Wio-SX1262 flashed with the
-  `Xiao_S3_WIO_companion_radio_usb` firmware build; the field companion may be a XIAO nRF52 (`Xiao_nrf52_companion_radio_usb`).
+  `Xiao_S3_WIO_companion_radio_usb` firmware build; the field companion may be a XIAO nRF52 (`Xiao_nrf52_companion_radio_usb`)
+  or an Ikoka stick. The two want different DTR settings on the serial port, which `companion.dtr = "auto"` (the default)
+  chooses by USB vendor; see below.
 - All devices in the mesh use the same radio settings: 905.775 MHz, BW 62.5 kHz, SF 8, CR 4/6.
 
 ## Quick start
@@ -111,6 +114,20 @@ beaconctl status                             # one line per beacon, rejected and
 | `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports and name announcements without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
 | `ingest [--port P]` | Same as `beacon-ingest`. |
 | `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
+
+### Companion serial port: DTR
+
+An ESP32-S3 companion (Espressif native USB, vendor `0x303A`) must be opened with **DTR low**, or it can reset. An nRF52
+companion (XIAO nRF52, Ikoka stick) only transmits while the host holds **DTR high**, so with DTR low it never answers and the
+log fills with `companion link lost: no reply to command 1 within 5s`. RTS is never raised.
+
+| `companion.dtr` | Behavior |
+|---|---|
+| `"auto"` (default) | Espressif keeps DTR low, any other or unknown USB device gets DTR high. If the first `APP_START` gets no reply, the port is reopened once with the opposite setting and the one that works is kept for later reconnects. Logged at INFO. |
+| `"on"` / `"off"` | Force DTR high / low. No fallback. |
+
+`beaconctl listen`, `beaconctl ingest` and `beacon-ingest` take `--dtr auto|on|off` to override it for one run (handy for
+bring-up). Details and troubleshooting: [docs/operations.md](docs/operations.md).
 
 ### Repeater positions and names
 

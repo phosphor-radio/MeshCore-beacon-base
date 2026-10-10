@@ -7,6 +7,7 @@ little-endian length + payload, device to host is ``'>'`` + length + payload. Fr
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Callable, Iterable, Protocol
 
@@ -25,6 +26,10 @@ class CompanionError(Exception):
 
 class LinkError(CompanionError):
     """The port failed or the companion stopped answering."""
+
+
+class NoReply(LinkError):
+    """The companion did not answer a command in time."""
 
 
 class CommandError(CompanionError):
@@ -102,10 +107,47 @@ class Transport(Protocol):
     def close(self) -> None: ...
 
 
+ESPRESSIF_VID = 0x303A  # ESP32-S3 native USB (the XIAO ESP32-S3 companion)
+DTR_MODES = ("auto", "on", "off")
+
+
+def usb_vendor_id(path: str) -> int | None:
+    """The USB vendor id of the device behind a serial port path (a /dev/serial/by-id link is followed), or None if it is not
+    a USB serial device or cannot be found. Isolated so tests can replace it."""
+    try:
+        from serial.tools import list_ports
+
+        real = os.path.realpath(path)
+        for info in list_ports.comports():
+            if os.path.realpath(info.device) == real:
+                return info.vid
+    except Exception as e:  # port listing is best effort; an unknown device just gets the default
+        log.debug("could not look up the USB vendor of %s: %s", path, e)
+    return None
+
+
+def choose_dtr(path: str, mode: str = "auto") -> tuple[bool, str]:
+    """Whether to hold DTR high when opening the companion's port, and why.
+
+    "on" and "off" are taken as given. "auto" keeps DTR low for Espressif's native USB (VID 0x303A), where asserting DTR/RTS
+    can reset the ESP32-S3, and holds it high for every other or unknown device: an nRF52 running Adafruit TinyUSB only sends
+    while the host asserts DTR, so with DTR low every reply is silently dropped. RTS is never raised."""
+    if mode == "on":
+        return True, "companion.dtr = on"
+    if mode == "off":
+        return False, "companion.dtr = off"
+    vid = usb_vendor_id(path)
+    if vid == ESPRESSIF_VID:
+        return False, f"auto: Espressif USB (vendor {vid:#06x}), whose native USB can reset on DTR"
+    if vid is None:
+        return True, "auto: unknown device"
+    return True, f"auto: USB vendor {vid:#06x}"
+
+
 class SerialTransport:
     """pyserial transport. Raises LinkError for any port failure so callers handle one exception type."""
 
-    def __init__(self, path: str, baud: int = 115200):
+    def __init__(self, path: str, baud: int = 115200, dtr: bool = False):
         import termios
 
         import serial
@@ -117,9 +159,10 @@ class SerialTransport:
         port.baudrate = baud
         port.timeout = READ_SLICE
         port.write_timeout = 5.0
-        # The ESP32-S3 uses native USB, where toggling DTR/RTS on open can reset the board. These must be set before
-        # open() so the lines are never asserted.
-        port.dtr = False
+        # The ESP32-S3 uses native USB, where toggling DTR/RTS on open can reset the board, so for it DTR and RTS stay low.
+        # They must be set before open() so the lines are never asserted. An nRF52 (Adafruit TinyUSB) only transmits while
+        # DTR is asserted, so for it DTR is raised (see choose_dtr). RTS is never raised.
+        port.dtr = dtr
         port.rts = False
         port.exclusive = True  # only one process may talk to the companion
         try:
@@ -212,7 +255,7 @@ class CompanionLink:
         while True:
             frame = self.recv_frame(max(deadline - time.monotonic(), 0.0))
             if frame is None:
-                raise LinkError(f"no reply to command {payload[0]} within {wait:.0f}s")
+                raise NoReply(f"no reply to command {payload[0]} within {wait:.0f}s")
             code = frame[0]
             if companion.is_push(code):
                 self.on_push(frame)

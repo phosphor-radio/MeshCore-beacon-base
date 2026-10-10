@@ -12,7 +12,7 @@ from collections import Counter
 from . import clock, names
 from .config import Config, ConfigError, load_config
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, RawFrame, ReceivedNames, ReceivedReport
-from .link import CompanionError
+from .link import DTR_MODES, CompanionError
 from .pipeline import Pipeline
 from .runtime import setup_logging, stop_on_signals
 from .store import Store, StoreError
@@ -133,12 +133,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-c", "--config", help="config file (default: $BEACON_BASE_CONFIG or ~/.config/beacon-base/config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     p.add_argument("--port", help="companion serial port (overrides companion.port)")
+    p.add_argument("--dtr", choices=DTR_MODES, help="DTR when opening the port (overrides companion.dtr; see docs/operations.md)")
     args = p.parse_args(argv)
     setup_logging(args.verbose)
     try:
         cfg = load_config(args.config)
-        if args.port:
-            cfg = dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, port=args.port))
+        changes = {k: v for k, v in (("port", args.port), ("dtr", args.dtr)) if v}
+        if changes:
+            cfg = dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, **changes))
         run(cfg, stop_on_signals())
     except (ConfigError, CompanionError, StoreError) as e:
         print(f"beacon-ingest: {e}", file=sys.stderr)

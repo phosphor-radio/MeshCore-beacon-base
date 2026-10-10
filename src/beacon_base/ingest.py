@@ -17,7 +17,7 @@ from typing import Callable
 from . import companion, wire
 from .companion import DeviceInfo, SelfInfo
 from .config import Config, ConfigError, RadioConfig
-from .link import CompanionError, CompanionLink, CommandError, SerialTransport, Transport
+from .link import CompanionError, CompanionLink, CommandError, NoReply, SerialTransport, Transport, choose_dtr
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +117,10 @@ def _describe_radio(freq_khz: int, bw_hz: int, sf: int, cr: int) -> str:
     return f"{freq_khz / 1000:.3f} MHz BW {bw_hz / 1000:g} kHz SF{sf} CR4/{cr}"
 
 
+class _ReopenWithOtherDtr(Exception):
+    """The first APP_START got no reply; reconnect at once with the opposite DTR setting."""
+
+
 class CompanionSession:
     DROP_REASONS = ("other_message", "other_channel", "other_data_type", "bad_frame", "bad_report", "bad_names")
 
@@ -124,15 +128,21 @@ class CompanionSession:
         self,
         config: Config,
         handler: Handler,
-        transport_factory: Callable[[str], Transport] | None = None,
+        transport_factory: Callable[[str, bool], Transport] | None = None,
     ):
+        """transport_factory(path, dtr) opens the port with DTR held as given; the default opens a real serial port."""
         if config.channel_key is None:
             raise ConfigError("no report channel key; run 'beaconctl channel generate' first")
         if not config.companion.port:
             raise ConfigError("no companion serial port; set companion.port or pass --port")
         self._cfg = config
         self._handler = handler
-        self._transport_factory = transport_factory or (lambda path: SerialTransport(path, config.companion.baud))
+        self._transport_factory = transport_factory or (lambda path, dtr: SerialTransport(path, config.companion.baud, dtr))
+        # DTR handling (companion.dtr = auto): the value that got an APP_START reply is kept for later reconnects, and while
+        # nothing has answered yet a single fallback to the opposite setting is tried per connection attempt.
+        self._dtr_confirmed: bool | None = None
+        self._dtr_fallback: bool | None = None
+        self._dtr_in_use = False
         self.stats: Counter[str] = Counter()
         self._msg_waiting = False
         self._first_drain = True
@@ -150,13 +160,18 @@ class CompanionSession:
             connected_at = None
             error: str | None = None
             link = None
+            reopen = False
             try:
-                link = CompanionLink(self._transport_factory(self._cfg.companion.port), self._cfg.companion.command_timeout)
+                dtr = self._pick_dtr()
+                link = CompanionLink(self._transport_factory(self._cfg.companion.port, dtr), self._cfg.companion.command_timeout)
                 link.on_push = self._on_push
                 connected_at = time.monotonic()
                 self._serve(link, stop)
             except ConfigError:
                 raise
+            except _ReopenWithOtherDtr:
+                reopen = True
+                connected_at = None  # never got as far as on_connected
             except CompanionError as e:
                 error = str(e)
                 log.warning("companion link lost: %s", e)
@@ -167,11 +182,56 @@ class CompanionSession:
                 self._handler.on_disconnected(error)
             if stop.is_set():
                 return
+            if reopen:
+                continue  # straight away, no backoff
             if connected_at is not None and time.monotonic() - connected_at > 10 * RECONNECT_MAX:
                 delay = RECONNECT_MIN  # it ran for a while, so this is a new failure
             log.info("reconnecting in %.0fs", delay)
             stop.wait(delay)
             delay = min(delay * 2, RECONNECT_MAX)
+
+    def _pick_dtr(self) -> bool:
+        """The DTR level to open the port with this time, and why (logged)."""
+        mode = self._cfg.companion.dtr
+        if mode == "auto" and self._dtr_confirmed is not None:
+            dtr, why = self._dtr_confirmed, "auto: the setting that worked earlier"
+        elif mode == "auto" and self._dtr_fallback is not None:
+            dtr, why = self._dtr_fallback, "auto: fallback, the other way from the first attempt"
+        else:
+            dtr, why = choose_dtr(self._cfg.companion.port, mode)
+        self._dtr_in_use = dtr
+        log.info("opening %s with DTR %s (%s)", self._cfg.companion.port, "high" if dtr else "low", why)
+        return dtr
+
+    def _app_start(self, link: CompanionLink) -> bytes:
+        """The first command on a connection. With companion.dtr = auto, no reply to it means the DTR guess may be wrong (an
+        nRF52 stays silent with DTR low), so try once with the opposite setting and remember whichever works."""
+        auto = self._cfg.companion.dtr == "auto"
+        try:
+            reply = link.request(companion.app_start(), [companion.RESP_SELF_INFO])
+        except NoReply:
+            level = "high" if self._dtr_in_use else "low"
+            if auto and self._dtr_confirmed is None and self._dtr_fallback is None:
+                self._dtr_fallback = not self._dtr_in_use
+                log.info(
+                    "no reply to APP_START with DTR %s; reopening with DTR %s (companion.dtr = auto)",
+                    level, "low" if self._dtr_in_use else "high",
+                )
+                raise _ReopenWithOtherDtr() from None
+            if auto:
+                self._dtr_fallback = None  # neither worked: the next connection attempt starts over
+                log.warning("no reply to APP_START with DTR high or low")
+            else:
+                log.warning(
+                    "no reply to APP_START with DTR %s; an nRF52 companion needs companion.dtr = on, an ESP32-S3 off "
+                    "(docs/operations.md)", level,
+                )
+            raise
+        if auto and self._dtr_confirmed is None:
+            if self._dtr_fallback is not None:
+                log.info("the companion answers with DTR %s; keeping it", "high" if self._dtr_in_use else "low")
+            self._dtr_confirmed, self._dtr_fallback = self._dtr_in_use, None
+        return reply
 
     def _on_push(self, frame: bytes) -> None:
         if frame[0] == companion.PUSH_MSG_WAITING:
@@ -213,7 +273,7 @@ class CompanionSession:
 
     def _start(self, link: CompanionLink) -> ConnectionInfo:
         cc = self._cfg.companion
-        self_info = companion.parse_self_info(link.request(companion.app_start(), [companion.RESP_SELF_INFO]))
+        self_info = companion.parse_self_info(self._app_start(link))
         device = companion.parse_device_info(link.request(companion.device_query(), [companion.RESP_DEVICE_INFO]))
         log.info(
             "companion %r (%s) firmware %s v%d, %d channel slots, radio %s",

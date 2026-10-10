@@ -14,7 +14,7 @@ import threading
 from . import __version__, admin
 from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, ReceivedNames, ReceivedReport
-from .link import CompanionError
+from .link import DTR_MODES, CompanionError
 from .names import sanitize_name
 from .runtime import setup_logging, stop_on_signals
 from .store import Store, StoreError
@@ -103,9 +103,10 @@ class PrintHandler(Handler):
         print(f"dropped ({reason}): {detail}", file=sys.stderr, flush=True)
 
 
-def _with_port(cfg: Config, port: str | None) -> Config:
-    if port:
-        return dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, port=port))
+def _with_port(cfg: Config, port: str | None, dtr: str | None = None) -> Config:
+    changes = {k: v for k, v in (("port", port), ("dtr", dtr)) if v}
+    if changes:
+        return dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, **changes))
     return cfg
 
 
@@ -137,7 +138,7 @@ def cmd_channel_show(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_listen(args: argparse.Namespace, cfg: Config) -> int:
-    cfg = _with_port(cfg, args.port)
+    cfg = _with_port(cfg, args.port, args.dtr)
     stop = stop_on_signals()
     handler = PrintHandler(stop, as_json=args.json, limit=args.count)
     session = CompanionSession(cfg, handler)
@@ -180,7 +181,7 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
 def cmd_ingest(args: argparse.Namespace, cfg: Config) -> int:
     from . import service
 
-    service.run(_with_port(cfg, args.port), stop_on_signals())
+    service.run(_with_port(cfg, args.port, args.dtr), stop_on_signals())
     return 0
 
 
@@ -204,12 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     listen = sub.add_parser("listen", help="print decoded reports live")
     listen.add_argument("--port", help="companion serial port (overrides companion.port)")
+    listen.add_argument("--dtr", choices=DTR_MODES, help="DTR when opening the port (overrides companion.dtr; see docs/operations.md)")
     listen.add_argument("--json", action="store_true", help="one JSON object per observation")
     listen.add_argument("--count", type=int, help="exit after this many observations")
     listen.set_defaults(func=cmd_listen)
 
     ingest = sub.add_parser("ingest", help="run the ingest service in the foreground (same as beacon-ingest)")
     ingest.add_argument("--port", help="companion serial port (overrides companion.port)")
+    ingest.add_argument("--dtr", choices=DTR_MODES, help="DTR when opening the port (overrides companion.dtr; see docs/operations.md)")
     ingest.set_defaults(func=cmd_ingest)
 
     _add_admin_commands(sub)

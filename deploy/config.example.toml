@@ -8,6 +8,10 @@
 # Use the stable by-id path, ttyACM numbers move. List candidates with: ls -l /dev/serial/by-id
 port = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:XX-if00"
 baud = 115200
+# DTR when opening the port. "auto" holds it low for Espressif's native USB (ESP32-S3 can reset otherwise) and raises it for
+# anything else (an nRF52 only transmits while DTR is high), retrying once the other way if the companion does not answer;
+# "on" / "off" force it. See docs/operations.md.
+dtr = "auto"
 
 # Channel slot on the companion that carries the beacon reports. Slot 0 holds the built-in Public channel.
 channel_index = 1

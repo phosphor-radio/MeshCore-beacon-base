@@ -21,6 +21,7 @@ made while implementing B2 are marked "(B2)".
 | 6 | **Time is stamped on the base**, from the Pi's clock, set manually after boot. Repeater-side timestamps are parked (see "Time"). |
 | 7 | Test base companion: **XIAO ESP32-S3 + Wio-SX1262** running `Xiao_S3_WIO_companion_radio_usb` (USB, no Bluetooth). |
 | 8 | **Beacons are identified by their 8-byte key prefix only.** Reports carry nothing else, every pipeline decision uses only the prefix, and a full key would have no use at the base (a signature check would need the *repeater's* key, which the repeater table keeps). `beacon add` takes the prefix. The reports are the source of truth, so the base does not collect beacon adverts from the companion. (Repeater adverts are collected, for their position and name: [repeater-onboarding.md](repeater-onboarding.md).) |
+| 9 | **The port's DTR level depends on the companion board.** Espressif native USB (VID `0x303A`) stays DTR low, everything else is raised (an nRF52's TinyUSB serial drops every reply otherwise), RTS is never raised. `companion.dtr = auto \| on \| off`, default `auto`, which falls back once to the opposite level when the first `APP_START` is not answered and keeps whichever works. Found on an Ikoka stick; see [../operations.md](../operations.md). |
 
 ## Goals and constraints
 
@@ -65,9 +66,11 @@ Uses the existing USB serial interface; **no firmware change is needed for the b
   (`MAX_FRAME_SIZE`). Frames are length-prefixed, so resync after garbage means scanning for `'>'`, sanity-checking the
   length and the response code, and if that fails, closing and reopening the port and sending `APP_START` again.
 - Startup sequence in `beacon-ingest`:
-  1. Open the port by `/dev/serial/by-id/...` (not `ttyACM0`, which moves). Configurable path. The ESP32-S3 uses
-     native USB, where opening the port with DTR/RTS toggling can reset the board: open with `dtr=False, rts=False`
-     (set before opening) and treat an unexpected reboot as a normal reconnect.
+  1. Open the port by `/dev/serial/by-id/...` (not `ttyACM0`, which moves). Configurable path. RTS is never raised. DTR
+     depends on the board (decision 9): the ESP32-S3 uses native USB, where raising DTR/RTS on open can reset the board, so
+     it is opened with DTR low; an nRF52 on Adafruit TinyUSB only transmits while DTR is high. Set before opening, chosen by
+     `companion.dtr` (`auto` by USB vendor, with one retry the other way if `APP_START` gets no reply). Treat an unexpected
+     reboot as a normal reconnect.
   2. `CMD_APP_START` then `CMD_DEVICE_QUERY` (firmware version, `max_channels`).
   3. Optionally apply radio parameters with `CMD_SET_RADIO_PARAMS` (905775 kHz, 62500 Hz, SF 8, CR 6) when
      `manage_radio = true`. This avoids having to build a special companion image. Check that the companion persists

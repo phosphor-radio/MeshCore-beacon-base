@@ -40,6 +40,12 @@ class FakeCompanion:
         self.queue: deque[bytes] = deque()
         # nodes the companion stores: public key -> (type, name, advert timestamp, lat, lon)
         self.contacts: dict[bytes, tuple[int, str, int, float, float]] = {}
+        # Modem-line behaviour of the USB serial port. A pty has no DTR, so whoever opens the fake tells it what the host's DTR is
+        # (set_host_dtr); the nRF52 Adafruit TinyUSB serial only transmits while the host holds DTR high, which is
+        # drop_replies_when_dtr=False. silent drops everything whatever the DTR.
+        self.host_dtr: bool | None = None
+        self.drop_replies_when_dtr: bool | None = None
+        self.silent = False
         self.manual_add = False  # the companion's manual-add mode: it stores nothing and pushes every advert in full
         self.contacts_error: int | None = None  # answer CMD_GET_CONTACTS with this error code
         self.commands: list[bytes] = []  # every command frame received, for assertions
@@ -143,11 +149,16 @@ class FakeCompanion:
     def write_frame(self, payload: bytes) -> None:
         self.write_raw(b">" + len(payload).to_bytes(2, "little") + payload)
 
+    def set_host_dtr(self, dtr: bool) -> None:
+        self.host_dtr = dtr
+
     def write_raw(self, data: bytes) -> None:
         """Write bytes to the host as they are, for garbage and torn frames."""
         with self._lock:
             if self._master < 0:
                 return
+            if self.silent or (self.drop_replies_when_dtr is not None and self.host_dtr == self.drop_replies_when_dtr):
+                return  # the port's write loop is stuck: nothing reaches the host, replies and pushes alike
             try:
                 os.write(self._master, data)
             except OSError:

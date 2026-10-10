@@ -37,6 +37,9 @@ class RadioConfig:
 class CompanionConfig:
     port: str | None = None  # prefer /dev/serial/by-id/..., ttyACM numbers move
     baud: int = 115200
+    # DTR when opening the port: "auto" picks by USB vendor (Espressif native USB stays low, anything else is raised, with one
+    # automatic retry the other way if the companion does not answer), "on" or "off" force it. RTS is never raised.
+    dtr: str = "auto"
     channel_index: int = 1  # slot 0 holds the built-in Public channel
     channel_name: str = "beacon-reports"
     manage_radio: bool = False  # apply [radio] to the companion instead of only warning when it differs
@@ -147,6 +150,8 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     database = _section(data, "database", DatabaseConfig, path)
     beacon = _section(data, "beacon", BeaconConfig, path)
     clock = _section(data, "clock", ClockConfig, path)
+    if companion.dtr not in ("auto", "on", "off"):
+        raise ConfigError(f"companion.dtr must be \"auto\", \"on\" or \"off\", not {companion.dtr!r}")
     if not 0 <= companion.channel_index <= 255:
         raise ConfigError("companion.channel_index must be 0-255")
     if not 0 < len(companion.channel_name.encode("utf-8")) < 32:

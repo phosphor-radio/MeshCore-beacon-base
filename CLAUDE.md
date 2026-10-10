@@ -59,7 +59,7 @@ Package layout (`+` marks planned modules that do not exist yet):
 
 ```
 pyproject.toml, README.md, CLAUDE.md
-docs/              plan/, wire-format.md      (+ operations.md)
+docs/              plan/, wire-format.md, operations.md
 src/beacon_base/   wire.py       report and name-announcement decoders/encoders, mirror the firmware formats
                    names.py      cleaning untrusted names (sanitize_name), how names are shown (label)
                    companion.py  companion protocol: command builders, response parsers (pure, no I/O)
@@ -119,8 +119,11 @@ deployment migration 1 may still be edited, and the development database deleted
 - **Replay protection is solely at the base**: allowlist, per-beacon high-water mark, dedupe by
   `(repeater, beacon, counter)`, operator reset. Unknown repeaters must never move a high-water mark. There is
   deliberately no counter-jump limit; the answer to lockout is visibility plus one-step reset.
-- **No companion firmware change is needed.** Open the serial port with `dtr=False, rts=False` (ESP32-S3 native USB can
-  reset otherwise), use `/dev/serial/by-id/...`, and treat reboots as ordinary reconnects.
+- **No companion firmware change is needed.** Open the serial port with RTS low always, and DTR by `companion.dtr`:
+  `auto` keeps it low for Espressif native USB (VID 0x303A, the ESP32-S3 can reset otherwise) and raises it for every other
+  or unknown device (an nRF52 on Adafruit TinyUSB only transmits while DTR is high), with one reopen the other way if the first
+  `APP_START` gets no reply (`link.choose_dtr`, `CompanionSession._app_start`). Use `/dev/serial/by-id/...` and treat reboots
+  as ordinary reconnects. See `docs/operations.md`.
 - Radio settings across all devices: 905.775 MHz, BW 62.5 kHz, SF 8, CR 4/6. The report channel key is 16 bytes.
 - Reject and log unknown report versions; never guess at a format.
 - Use numbered schema migrations from the start. Batch commits and keep `synchronous=NORMAL` (SD card wear).
