@@ -17,9 +17,14 @@ Related: [beacon-base.md](beacon-base.md) (decision 8: beacons are identified by
 | 3 | **A refresh is needed; the default is every 4 hours** (`beacon.name_refresh 4`). |
 | 4 | **Last-writer-wins.** No counter in name entries, no replay protection beyond that. |
 | 5 | **The development database is deleted.** Migration 1 is edited, no migration 2. |
-
-Proposed and not objected to, still open to comment (see "Open questions"): a separate `0xFFBF` message type, names stored
-for any prefix announced by a known repeater, latest name only (no history), prefix abbreviation of at least 6 hex digits.
+| 6 | **Names are a separate message type** (`0xFFBF`), not a change to report v1. |
+| 7 | **Names are stored for any prefix** announced by a known repeater, allowlisted or not, pruned by age. |
+| 8 | **Latest name only**, plus a log line when it changes. No rename history. |
+| 9 | **Prefix abbreviation:** any unique leading hex string of at least 6 digits is accepted. |
+| 10 | **`--notes` stays** as the only free-text field on an allowlist entry. |
+| 11 | **Repeater names stay operator-assigned and become optional.** The base never hears a repeater's advert, and repeater names matter even less than beacon names. See "CLI". |
+| 12 | **The project stays in the dev data-type range** (`0xFF00`-`0xFFFF`); `0xFFBE` and `0xFFBF` are not registered. |
+| 13 | **Existing beacons need a manual `set name auto`.** There is only one test beacon, so that is fine. |
 
 ## Goals
 
@@ -31,7 +36,7 @@ for any prefix announced by a known repeater, latest name only (no history), pre
 - No name argument on any base command, no rename command. Duplicate names are fine, the prefix is the identity.
 - Cheap on air: names are announced rarely (see "Airtime").
 
-Non-goals: repeater names (still given by the operator with their location), operator aliases for beacons, authenticating
+Non-goals: announcing repeater names (they stay operator-assigned and optional, decision 11), operator aliases for beacons, authenticating
 names beyond what reports already have.
 
 ## Current state this builds on
@@ -133,6 +138,7 @@ Edit migration 1 (pre-deployment, decision 5; delete the dev database `beacon.db
 - `beacons`: **drop `name` and its UNIQUE constraint.** Keep `prefix` (primary key), `enabled`, `hwm`..., `notes`.
 - New `beacon_names`: `prefix` (primary key), `name`, `first_seen`, `updated_at`, `repeater_prefix` (who announced it last).
   Independent of the allowlist, so names exist before a beacon is added and survive its removal.
+- `repeaters`: `name` becomes nullable and loses its UNIQUE constraint (decision 11); `prefix` stays the primary key.
 - Display name = announced name, else the first 12 hex digits of the prefix.
 - Retention (B3): prune names not updated for 90 days that are not on the allowlist.
 
@@ -151,8 +157,10 @@ Everything that took a beacon name takes the **prefix**; commands stay copy-and-
 - Output shows both: tables have `NAME` (announced name or `-`) and `PREFIX` columns, sorted by state, then name, then prefix.
   Logs and one-line messages use `name (f5b165)` so duplicate names stay distinguishable.
 - `status`: the "heard but not on the allowlist" lines show the announced name and `add: beaconctl beacon add <prefix>`.
-- `rejects`, `beacon list`, `beacon status`, ingest logs and `simulate` use the same display rule. `repeater` commands are
-  unchanged.
+- `rejects`, `beacon list`, `beacon status`, ingest logs and `simulate` use the same display rule.
+- Repeaters (decision 11): the name becomes optional, shown as `-` or the prefix when absent, and not required to be unique.
+  `repeater add <key-or-prefix> <lat> <lon> [--name N] [--window S]`, and the other `repeater` commands take the prefix
+  (same abbreviation rule) or the name when it is unambiguous. Location is still required.
 
 ## Airtime
 
@@ -205,7 +213,7 @@ vectors exist, a repeater announces names on a bench test, and a freshly flashed
 `simulate` support, logs. Done when `simulate` shows names in `status` for unlisted beacons.
 
 **N2. Base: CLI on prefixes.**
-Prefix-only arguments with abbreviation, display rule everywhere, removal of `--name-prefix` and name uniqueness code and
+Prefix-only arguments with abbreviation (beacons; repeaters take an optional name), display rule everywhere, removal of `--name-prefix` and name uniqueness code and
 tests, README and CLAUDE.md. Done when no command asks for a name and the full suite passes.
 
 **N3. Hardware check.**
@@ -215,17 +223,4 @@ N1 can start from a hand-derived fixture (the example above) before N0 lands, th
 
 ## Open questions
 
-Answered above: default names (decision 1), duplicate announcements (2), refresh (3), replay (4), database (5). Still open,
-each with the current proposal:
-
-1. **Separate type vs report v2.** Proposed: separate `0xFFBF`. Any reason to fold it into `0xFFBE` with a message-type byte?
-2. **Names for unlisted prefixes.** Proposed: stored for any prefix announced by a known repeater, pruned by age. Or only
-   prefixes already seen in reports?
-3. **Name history.** Proposed: latest name plus a log line. Or record renames in a table?
-4. **Abbreviation rule.** Proposed: any unique leading hex string of at least 6 digits (matches the derived default name).
-   Or accept only the full 16 characters?
-5. **`--notes`.** Proposed: keep as the only free-text field on an allowlist entry.
-6. **Repeater names.** The base never hears a repeater's advert, so they stay operator-supplied with their location.
-7. **Allocation.** `0xFFBF` is in the dev range next to `0xFFBE`; request real allocations for both together later.
-8. **Existing beacons.** Beacons that already stored `beacon-001` stay explicit until `set name auto`. Is the manual step on
-   the handful of test beacons fine?
+None. Repeater names are optional (decision 11, confirmed) and that work is part of N2.
