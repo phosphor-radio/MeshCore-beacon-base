@@ -78,3 +78,37 @@ beaconctl listen --dtr off         # an ESP32-S3 board
 ```
 
 Only one process can own the port at a time (it is opened exclusively), so stop `beacon-ingest` before running `listen`.
+
+## Troubleshooting
+
+### A repeater's position keeps reverting to an old value
+
+**Symptom.** A repeater's position at the base (`beaconctl repeater list`, the map) goes back to an old value at every advert, although
+`repeater locate` (or a remote `set location`) set a new one, and the repeater itself reports the new value (`beaconctl repeater remote
+<repeater> get lat` / `get lon`, or `get lat` on its console).
+
+**Cause.** The repeater's adverts carry **no position**: a saved "no position in adverts" setting. A companion only updates a stored
+contact's position when the advert carries one, so it keeps the old coordinates, and the base reads the companion's contact after each
+advert push and takes it for what the repeater just advertised. Each advert therefore writes the old position back over the new one.
+The repeater's name and its own `get lat` look fine, which is what makes it confusing. (Found on an ESP32-S3 beacon repeater.)
+
+**Diagnose.** Use [utilities/advert_probe.py](../utilities/advert_probe.py). It makes the repeater send one advert, captures it off the
+air through the base companion, and compares what the repeater says, what it transmitted and what the companion stored. Stop
+`beacon-ingest` first (it holds the port):
+
+```bash
+python3 utilities/advert_probe.py /dev/serial/by-id/<companion> <repeater> --dtr on     # nRF52 companion; --dtr off for an ESP32-S3
+```
+
+The verdict "The repeater's advert carries NO position" is this problem. The other verdicts (a replayed advert dropped because the
+repeater's clock went backwards, everything right on the radio side, a different position transmitted, nothing heard) are explained in
+[utilities/README.md](../utilities/README.md).
+
+**Fix.** Reflash the repeater with a beacon repeater build that includes firmware commit `9409103c` ("always advertise the configured
+position on beacon repeaters"). Those builds always put the configured position in adverts, and the setting cannot be changed from the
+CLI, so there is nothing to change on the repeater short of reflashing. Afterwards send an advert (`beaconctl repeater remote <repeater>
+advert`) and check `repeater adverts` and `repeater list`.
+
+Until it is reflashed, keep in mind that **an advert replaces a hand-set position** (last write wins): a position set with `repeater
+locate` lasts only until the next advert from that repeater, and a remote `set location` is written through to the base but is
+replaced the same way. Repeaters advertise every 47 hours by default, so the old value can come back much later than the change.

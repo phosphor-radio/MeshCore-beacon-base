@@ -52,6 +52,9 @@ Three cooperating processes sharing one SQLite database (WAL mode) as their only
 Everything must work without hardware: a fake companion and synthetic reports allow the pipeline and UI to be built and
 tested at a desk.
 
+Besides the package (`src/beacon_base/`) there is `utilities/`: stand-alone diagnostic scripts, not installed and not used by the
+package. See [utilities/README.md](utilities/README.md).
+
 ## Related repositories
 
 | Repo | Role |
@@ -66,7 +69,8 @@ tested at a desk.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh (a small fixed set of operations), the ingest heartbeat.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
 - [docs/deployment.md](docs/deployment.md): running the base on a Raspberry Pi in Docker with no internet: building the bundle, first start, the event, troubleshooting.
-- [docs/operations.md](docs/operations.md): running on real hardware, starting with the companion's USB serial (DTR) settings.
+- [docs/operations.md](docs/operations.md): running on real hardware: the companion's USB serial (DTR) settings, managing repeaters, troubleshooting.
+- [utilities/README.md](utilities/README.md): one-off and diagnostic scripts that are not part of the package, such as `advert_probe.py` (why a repeater's position keeps reverting).
 
 Links inside the plan docs that point at `../../src/...` or `../companion_protocol.md` refer to files in the firmware
 repo, not this one.
@@ -167,6 +171,9 @@ is flagged in `repeater list` and fails `beaconctl check`, and the position esti
 - Repeaters send a flood advert every 47 hours by default. After setting a position, run `advert` in the repeater's CLI or
   the base waits for the next one. The advert has to reach the base companion (within 8 hops and in radio range); otherwise
   use `repeater locate`.
+- This relies on the repeater's adverts **carrying its position**. If a position keeps reverting to an old value, the adverts
+  probably carry none; see "A repeater's position keeps reverting to an old value" in [docs/operations.md](docs/operations.md)
+  and `utilities/advert_probe.py`.
 - Repeaters are onboarded **before** beacons: a report from a repeater that is not trusted is stored but changes no
   beacon's counters. It is not lost to the operator though: the repeater, and the beacons in its report, show up in `status`
   straight away (a beacon is marked "only via repeaters that are not trusted yet") and can be added at once.

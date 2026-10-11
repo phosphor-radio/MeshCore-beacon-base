@@ -93,6 +93,9 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
 web/               (+) static map UI (Leaflet)
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
 deploy/            config.example.toml; docker/ (Dockerfile, compose.yaml, entrypoint, beaconctl wrapper, build-bundle.sh, smoke-test.sh)
+utilities/         one-off and diagnostic scripts that are not part of the package (README.md indexes them); advert_probe.py: why a
+                   repeater's position reverts (stand-alone, needs only pyserial, imports nothing from beacon_base; tested in
+                   tests/test_advert_probe.py against the fakes)
 ```
 
 `CompanionSession` takes a `Handler`; `service.PipelineHandler` plugs the pipeline in (`on_report` receives a
@@ -119,7 +122,7 @@ contact list at connect, `PUSH_NEW_ADVERT`, bare `PUSH_ADVERT` then `CMD_GET_CON
 manual-add mode so every advert is a full one) and applied by `Store.record_repeater_advert`: adverts with a valid non-0,0
 position are kept in `repeater_adverts` whether or not the repeater is trusted; for a trusted repeater position and name are
 overwritten, last write wins (`repeater locate` is the same, until the next advert); an advert without a position never
-erases one. 0, 0 means **unlocated**: `Store.is_located` / `located_repeaters()` is the one place that decides, and the
+erases one. This relies on the adverts *carrying* a position: a repeater that advertises none (fixed in firmware commit `9409103c`, reflash) leaves the companion's old coordinates, which the base reads back and applies, reverting a newer position; `utilities/advert_probe.py` diagnoses it (idea to guard hand-set positions: open, not built, `docs/plan/repeater-onboarding.md` decision 12). 0, 0 means **unlocated**: `Store.is_located` / `located_repeaters()` is the one place that decides, and the
 estimator must use it. `repeater add --all` and the unknown-repeater list cover repeaters that reported **or advertised** (`Store.unknown_repeaters`).
 **Auto-add** (`Store.autoadd/set_autoadd`, settings table, `beaconctl autoadd`, off by default, read per report so a running ingest sees changes):
 repeaters are trusted by a report or an advert from an unknown one; beacons only by a report from a *trusted, enabled* repeater (that report

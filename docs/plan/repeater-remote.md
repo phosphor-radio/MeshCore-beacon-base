@@ -517,6 +517,14 @@ Options if adverts still do not arrive, in order of cost:
 3. **Read adverts from the raw receive log** (`PUSH_CODE_LOG_RX_DATA`): decode and verify the signed advert packets in the base. Independent
    of the contact table and its replay check, at the price of verifying ed25519 signatures in the base.
 
+**Cause found later (2026-10-11): an advert without a position.** One repeater's position kept reverting to an old value after every
+advert even though `set location` had been confirmed and written through. Its adverts carried no position (a saved "no position in
+adverts" setting), so the companion kept the contact's old coordinates and the base read them back as a fresh advert. This is not a
+base or executor fault: it is fixed in the firmware (commit `9409103c`, beacon repeaters always advertise the configured position; the
+repeater has to be reflashed) and can be diagnosed with `utilities/advert_probe.py`. Decisions 11 and 12 of
+[repeater-onboarding.md](repeater-onboarding.md) record it, including an idea (not built) for protecting a hand-set or written-through
+position. Until a repeater is known to advertise its position, decision 7's "a later advert replaces it" can bring back an old value.
+
 ## Pacing and retries (amended during RM4)
 
 The first hardware runs, with the repeaters a few metres apart, failed on later round trips: `get all` returned most values, and a `set`
