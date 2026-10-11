@@ -160,12 +160,36 @@ def test_the_page_and_its_security_headers(client):
     assert client.get("/docs").status_code == 404  # the interactive docs would load their scripts from a CDN
 
 
+def online(cfg, url="https://tile.openstreetmap.org/{z}/{x}/{y}.png", **web):
+    return dataclasses.replace(cfg, web=dataclasses.replace(cfg.web, online_tile_url=url, **web))
+
+
 def test_online_tiles_for_development_loosen_the_image_policy_only(with_data):
-    cfg = dataclasses.replace(with_data, web=dataclasses.replace(with_data.web, online_tile_url="https://tiles.example/{z}/{x}/{y}.png"))
-    with TestClient(create_app(cfg)) as c:
+    with TestClient(create_app(online(with_data, "https://tiles.example/{z}/{x}/{y}.png"))) as c:
         assert "img-src 'self' data: https:" in c.get("/").headers["content-security-policy"]
         m = c.get("/api/map").json()
     assert (m["mode"], m["url"]) == ("online", "https://tiles.example/{z}/{x}/{y}.png")
+
+
+def test_online_tiles_send_a_referer_because_openstreetmap_blocks_requests_without_one(with_data, client):
+    """tile.openstreetmap.org answers a request with no Referer with a 403 image (its tile usage policy), so a page that loads its
+    tiles must not set a policy that strips it. A map with no outside requests keeps no-referrer."""
+    assert client.get("/").headers["referrer-policy"] == "no-referrer"
+    assert client.get("/api/state").headers["referrer-policy"] == "no-referrer"
+    with TestClient(create_app(online(with_data))) as c:
+        for path in ("/", "/api/state", "/static/app.js"):
+            assert c.get(path).headers["referrer-policy"] == "strict-origin-when-cross-origin", path
+        assert c.get("/api/map").json()["referrer_policy"] == "strict-origin-when-cross-origin"
+
+
+def test_online_openstreetmap_tiles_carry_their_attribution(with_data):
+    with TestClient(create_app(online(with_data))) as c:
+        credit = c.get("/api/map").json()["attribution"]
+    assert "OpenStreetMap" in credit and "openstreetmap.org/copyright" in credit
+    with TestClient(create_app(online(with_data, "https://tiles.example/{z}/{x}/{y}.png"))) as c:
+        assert c.get("/api/map").json()["attribution"] == ""  # not OpenStreetMap's, so not claimed
+    with TestClient(create_app(online(with_data, "https://tiles.example/{z}/{x}/{y}.png", online_tile_attribution="(c) Example"))) as c:
+        assert c.get("/api/map").json()["attribution"] == "(c) Example"
 
 
 # --- tiles ---------------------------------------------------------------------------------------------------------------

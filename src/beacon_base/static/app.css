@@ -224,7 +224,9 @@ dialog input { width: 100%; padding: 8px; border: 1px solid var(--line); border-
 }
 .repeater-icon.off { background: var(--silent); box-shadow: 0 0 0 1px var(--silent); }
 .grid-tile { pointer-events: none; }
-.leaflet-container .leaflet-control-attribution { background: color-mix(in srgb, var(--surface) 80%, transparent); color: var(--muted); }
+/* the credit online tile providers require must be easy to read over any map */
+.leaflet-container .leaflet-control-attribution { background: var(--surface); color: var(--text); padding: 1px 6px; }
+.leaflet-container .leaflet-control-attribution a { color: var(--focus); }
 
 @media (max-width: 760px) {
   body { height: auto; min-height: 100%; }

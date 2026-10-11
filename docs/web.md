@@ -65,10 +65,30 @@ Without a file the map is a plain grid labelled with coordinates, which is enoug
 other. A file that is missing or unusable is logged and the map falls back to the grid, with the reason in the note under the lists.
 
 To make a file, render your area at the zoom levels you need on a machine with internet, for example with QGIS's *Generate XYZ tiles
-(MBTiles)* algorithm over a layer you may use, then copy it to the Pi. (Not tested here.) Check the provider's terms first:
-OpenStreetMap's public tile servers do not allow bulk downloads. A builder for this (`beaconctl tiles`) is on the list in
-[plan/beacon-base.md](plan/beacon-base.md), not built. `web.online_tile_url` is **for development only** (a machine with internet,
-a tile URL template): it makes the page load images from that host and is off by default.
+(MBTiles)* algorithm over a layer you may use, then copy it to the Pi. (Not tested here.) **Do not build one by downloading
+tiles from OpenStreetMap's servers:** their [tile usage policy](https://operations.osmfoundation.org/policies/tiles/) prohibits bulk
+downloading, pre-seeding areas and building tile archives such as `.mbtiles`. Use data you may render yourself, or a provider whose
+terms allow it. A builder for this (`beaconctl tiles`) is on the list in [plan/beacon-base.md](plan/beacon-base.md), not built.
+
+### Online tiles (development only)
+
+`web.online_tile_url` (a `{z}/{x}/{y}` template) makes the page load tiles from a server on the internet, when there is no usable tiles
+file. It is for a development machine and is off by default. The browser fetches the images itself, so the server's CSP allows images
+from `https:` in this mode only.
+
+If you point it at OpenStreetMap's public server (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`), their
+[tile usage policy](https://operations.osmfoundation.org/policies/tiles/) applies, and a request that breaks it is answered with a
+tile image saying *"403 Access blocked ... not following the tile usage policy"*
+([Blocked tiles](https://wiki.openstreetmap.org/wiki/Blocked_tiles)). What the page does for it:
+
+- **Sends a Referer.** The browser must send one, and a restrictive `Referrer-Policy` blocks it. `beacon-web` normally sends
+  `Referrer-Policy: no-referrer` (nothing leaves the page), but with online tiles it sends `strict-origin-when-cross-origin`, and the
+  tile layer is given the same policy. (Until 2026-10 it sent `no-referrer` here too, which is what produced the 403 tiles.) A privacy
+  extension that strips the Referer will still cause the block: allow `tile.openstreetmap.org`.
+- **Shows attribution** (OpenStreetMap contributors, with a link) in the map's corner. `web.online_tile_attribution` sets the text for
+  another provider (HTML; empty gives none).
+- **Does not prefetch, bulk download or cache tiles itself**, and does not strip the server's cache headers: the browser's own cache
+  does the caching. Keep it to interactive viewing. A block lifts by itself once the cause is fixed; if it does not, see the Blocked tiles page.
 
 ## Trying it without hardware
 
@@ -102,7 +122,7 @@ reference, which `beaconctl` accepts, is a 404 here). Every response carries `no
 ## Safety notes
 
 - Everything the page shows is built as text, never as markup, and the server sends a `Content-Security-Policy` that allows scripts and
-  styles from the page's own origin only (images from anywhere only when `web.online_tile_url` is set).
+  styles from the page's own origin only (images from `https:` only when `web.online_tile_url` is set, in which case it also sends a Referer, see above).
 - The token is compared in constant time and is never logged; wrong guesses are not rate limited, so use the generated token (24
   random bytes), not a chosen one.
 - The reset action does what `beaconctl beacon reset` does. It is the only write. Everything else (adding and removing beacons and

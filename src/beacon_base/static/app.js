@@ -140,7 +140,11 @@
       note = info.problem ? 'Map tiles are not available (' + info.problem + '): showing a plain grid.' : 'No map tiles are installed: showing a plain grid with coordinates.';
     } else {
       const max = info.max_zoom;
-      L.tileLayer(info.url, { minZoom: info.min_zoom, maxZoom: max + 3, maxNativeZoom: max, attribution: info.attribution || '' }).addTo(map);
+      // Online tile servers such as OpenStreetMap's refuse requests that carry no Referer, so the tile images are told to send one
+      L.tileLayer(info.url, {
+        minZoom: info.min_zoom, maxZoom: max + 3, maxNativeZoom: max, attribution: info.attribution || '',
+        referrerPolicy: info.referrer_policy || 'no-referrer',
+      }).addTo(map);
       map.setMinZoom(info.min_zoom);
       map.setMaxZoom(max + 3);
       if (info.mode === 'online') note = 'Development mode: map tiles are loaded from the internet.';

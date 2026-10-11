@@ -55,6 +55,10 @@ The map follows a beacon being walked past repeaters with no internet: shown her
   nature (the median error on `simulate --walk` is a few hundred metres on a 500 m grid), not a bug; milestone 6 is where to improve it.
 - **Large uncertainty circles hid the map**, so the circle of a centroid is drawn for the selected beacon only; a range circle (one
   repeater: its whole position) is always drawn.
+- **Online tiles from OpenStreetMap came back as "403 Access blocked" images.** Their tile usage policy needs a Referer from browsers and
+  bans a Referrer-Policy that strips it; the server sent `no-referrer` on every response, and the page showed no attribution (also required).
+  Online mode now sends `strict-origin-when-cross-origin` (header and tile layer) and credits OpenStreetMap ([../web.md](../web.md)). The tests
+  check the headers; the OSM server itself is not exercised by any test.
 - **Leaflet fetches its default marker image as soon as a marker is added**, even if it is replaced a line later; the 404s are avoided by
   giving the marker its icon at creation.
 

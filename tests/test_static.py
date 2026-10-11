@@ -54,3 +54,9 @@ def test_leaflet_is_vendored_with_its_licence_and_provenance():
     readme = (leaflet / "README.md").read_text()
     for name in ("leaflet.js", "leaflet.css"):
         assert hashlib.sha256((leaflet / name).read_bytes()).hexdigest() in readme, f"{name} differs from the recorded copy"
+
+
+def test_tile_images_are_told_which_referrer_policy_to_use():
+    """Online tile servers (OpenStreetMap's policy) refuse requests without a Referer; the server says which policy, the layer applies it."""
+    js = (STATIC / "app.js").read_text()
+    assert "referrerPolicy: info.referrer_policy" in js

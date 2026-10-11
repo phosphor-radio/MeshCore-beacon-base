@@ -13,6 +13,7 @@ import sqlite3
 import time
 from importlib import resources
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -36,17 +37,33 @@ def content_security_policy(online_tiles: bool) -> str:
     return f"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src {images}; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 
+OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener">OpenStreetMap</a> contributors'
+# A referrer policy that still sends the Referer cross-origin: tile.openstreetmap.org blocks requests without one (its tile usage policy)
+ONLINE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+
+def online_attribution(cfg: Config) -> str:
+    """What the map credits when it loads tiles from the internet: the configured text, else OpenStreetMap's for its own servers."""
+    if cfg.web.online_tile_attribution:
+        return cfg.web.online_tile_attribution
+    host = urlsplit(cfg.web.online_tile_url.replace("{", "").replace("}", "")).hostname or ""
+    return OSM_ATTRIBUTION if host == "openstreetmap.org" or host.endswith(".openstreetmap.org") else ""
+
+
 def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | None = None) -> FastAPI:
     """The application for a configuration. `tiles` is the opened tile file (see tiles.open_tiles), None for the plain grid."""
     app = FastAPI(title="beacon-web", docs_url=None, redoc_url=None, openapi_url="/api/openapi.json")
-    policy = content_security_policy(bool(cfg.web.online_tile_url) and tiles is None)
+    online = bool(cfg.web.online_tile_url) and tiles is None
+    policy = content_security_policy(online)
+    # No referrer is sent from a map that loads nothing from other hosts; online tiles need one (see ONLINE_REFERRER_POLICY)
+    referrer_policy = ONLINE_REFERRER_POLICY if online else "no-referrer"
 
     @app.middleware("http")
     async def headers(request: Request, call_next):
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", policy)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Referrer-Policy", referrer_policy)
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
         elif request.url.path.startswith("/static/"):
@@ -139,7 +156,8 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
                 "bounds": info.bounds, "attribution": info.attribution or "", "name": info.name,
             }
         if cfg.web.online_tile_url:
-            return {"mode": "online", "url": cfg.web.online_tile_url, "min_zoom": 0, "max_zoom": 19, "bounds": None, "attribution": "", "problem": tiles_problem}
+            return {"mode": "online", "url": cfg.web.online_tile_url, "min_zoom": 0, "max_zoom": 19, "bounds": None,
+                    "attribution": online_attribution(cfg), "referrer_policy": ONLINE_REFERRER_POLICY, "problem": tiles_problem}
         return {"mode": "grid", "url": None, "min_zoom": 0, "max_zoom": 22, "bounds": None, "attribution": "", "problem": tiles_problem}
 
     @app.get("/tiles/{z}/{x}/{y}")

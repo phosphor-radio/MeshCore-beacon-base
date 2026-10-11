@@ -147,6 +147,7 @@ def test_estimate_and_web_sections_have_defaults_and_validate(tmp_path):
         "[web]\nhost = \"\"\n",
         "[web]\nonline_tile_url = \"https://example.invalid/tiles.png\"\n",
         "[web]\nbogus = 1\n",
+        "[web]\nonline_tile_attribution = 3\n",
         "[estimate]\npath_loss_exponent = 0\n",
         "[estimate]\nmin_radius_m = 100\nmax_radius_m = 50\n",
         "[estimate]\ntx_power_dbm = \"loud\"\n",
