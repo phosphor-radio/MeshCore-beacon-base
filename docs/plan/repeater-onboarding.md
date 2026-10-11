@@ -27,6 +27,8 @@ addressed by prefix, names are display only).
 | 8 | **A first report is visible at once.** Beacons reported by repeaters that are not trusted yet are listed (marked "only via repeaters that are not trusted yet") and can be added immediately, instead of waiting for the next beacon cycle after the repeater is trusted. Their counters are not touched until a trusted repeater reports them. `beacon add --all` includes them. |
 | 9 | **Beacon names are taken from any repeater**, trusted or not, so an unlisted beacon is recognisable before it is added. Name announcements are encrypted with the channel key, so only a holder of it can send one. (This changes the names plan, which trusted known repeaters only.) |
 | 10 | **Two auto-add modes, off by default**, switched with `beaconctl autoadd {beacons,repeaters,all} {on,off}` and stored in the database, so a running ingest uses a change at once. **Repeaters:** an unknown repeater is trusted by a report or an advert (position optional), so this also trusts ordinary mesh repeaters that never report. **Beacons:** an unknown beacon is trusted by a report from a *trusted, enabled* repeater, and that report becomes its baseline; a repeater that is not trusted can never get a beacon trusted. Discover the mesh as it is set up, then lock it with `autoadd all off`. `status` warns and `check` fails while a mode is on. |
+| 11 | **The position from adverts relies on the repeater's adverts carrying a position. Found and fixed (2026-10-11).** A beacon repeater whose saved advert-location setting was "none" advertised no position; the companion updates a stored contact's position only when the advert carries one, so it kept the old coordinates, and the base, which reads the companion's contact after each advert push, took them for a fresh advert and put the old position back over a hand-set or remotely set one (`repeater list` / `repeater adverts` showed the old value, the repeater's own `get lat` the new one). Confirmed on hardware. The firmware fix is commit `9409103c` ("always advertise the configured position on beacon repeaters"): beacon repeater builds force the configured position into adverts and the setting cannot be changed from the CLI, so the repeater has to be reflashed; the position then updated correctly. Diagnosis tool: `utilities/advert_probe.py` ([../../utilities/README.md](../../utilities/README.md)); operator entry: "A repeater's position keeps reverting to an old value" in [../operations.md](../operations.md). No change to the base was made. |
+| 12 | **OPEN, NOT IMPLEMENTED: do not let a retained companion position overwrite a hand-set one.** Idea: keep a hand-set position (`location_source = 'manual'` or `'remote'`) unless the position in the advert differs from the one the companion held for that contact *before* this advert, since an unchanged value is the companion's retained copy and not something the repeater just said. This would stop an advert without a position from reverting a hand-set position, whatever the repeater's settings. It needs the base to remember the companion's previous copy per repeater (`repeater_adverts` already keeps the last one seen) and it changes decision 2 (no lock, last write wins) for the case where the value did not change, so it is a decision to take deliberately. Not built: the cause was the firmware setting, now fixed. |
 
 ## Goals
 
@@ -148,6 +150,8 @@ Name announcements are accepted from any repeater (decision 9).
 - The advert must reach the base companion: within 8 hops of it and in radio range. A repeater whose advert never arrives is
   located by hand with `repeater locate`.
 - The position in an advert is what the repeater was told; the base does not check it against anything.
+- All of this relies on the repeater's adverts **carrying a position** (decision 11). If they do not, the companion keeps the old
+  one and the base reads it back; `utilities/advert_probe.py` shows what a repeater actually transmits.
 - Setting up a mesh: `autoadd all on`, bring repeaters and beacons up, watch `status` and the ingest log, then
   `autoadd all off`. Or leave it off and use `add --all` when the lists look right.
 
@@ -174,4 +178,4 @@ run with auto-add.
 
 ## Open questions
 
-None.
+1. **Should a retained companion position overwrite a hand-set one?** Decision 12: not implemented, recorded as an idea.
