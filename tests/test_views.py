@@ -209,3 +209,11 @@ def test_rejects_view_lists_what_was_not_accepted(env):
     assert [(x["status"], x["reason"], x["counter"]) for x in r] == [("unknown_beacon", "", 3), ("replay", "below_hwm", 40)]
     assert views.rejects_view(store, 1100.0, beacon=BEACON_PREFIX.hex())["rejects"][0]["hwm"] == 100
     assert views.rejects_view(store, 1100.0, limit=1)["rejects"][0]["counter"] == 3
+
+
+def test_last_report_is_the_newest_stored_one_not_the_heartbeats_last_write(env, cfg):
+    store, p = env
+    run_ingest(store)  # the heartbeat has never seen a report
+    assert views.health_view(store, cfg, NOW)["ingest"]["last_report_at"] is None
+    p.process(rx(A, obs(10), t=1050.0))
+    assert views.health_view(store, cfg, NOW)["ingest"]["last_report_at"] == 1050.0

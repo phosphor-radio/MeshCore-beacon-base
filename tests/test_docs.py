@@ -7,7 +7,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 # docs/plan links were written for the firmware repository's layout (see CLAUDE.md), so only the documents meant to be read here are checked
-DOCS = [ROOT / "README.md", ROOT / "CLAUDE.md", ROOT / "docs" / "deployment.md", ROOT / "docs" / "operations.md", ROOT / "docs" / "wire-format.md"]
+DOCS = [ROOT / "README.md", ROOT / "CLAUDE.md", ROOT / "docs" / "deployment.md", ROOT / "docs" / "operations.md", ROOT / "docs" / "wire-format.md", ROOT / "docs" / "web.md"]
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 
 

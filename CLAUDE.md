@@ -16,12 +16,14 @@ from repeater adverts, plus discovery and auto-add). The remote repeater managem
 `beaconctl repeater remote` (get/set, clock sync, advert, reboot), and the hardware work (pacing, retries, advert diagnostics); used on the
 hardware with three repeaters in one room, so multi-hop paths are untested. B3 (packaging for a week-long event on a Pi Zero 2 W with no
 internet, in Docker: `docs/plan/service-packaging.md`, `docs/deployment.md`) is built and tested here (watchdog, `beaconctl health`, image, compose
-bundle, guide); only the run on the Pi (B3.4) is left. B4 is not started.** The plans are the source of truth:
+bundle, guide); only the run on the Pi (B3.4) is left. B4 (the map and API: `docs/plan/web-map.md`, `docs/web.md`) is built and tested on the branch `b4-web-map`
+(estimator and `positions`, `beacon-web`, the token, MBTiles, the Leaflet page, `simulate --walk`); not yet in the Docker image, and not tried on the hardware.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
   replay pipeline, phases B0-B4, open questions.
 - [docs/plan/service-packaging.md](docs/plan/service-packaging.md): B3: Docker deployment on a Pi Zero 2 W, the decisions (no retention, `/hostdev`, watchdog), what was tested.
+- [docs/plan/web-map.md](docs/plan/web-map.md): B4: the web API and map: decisions, steps, what is left.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh: a closed set of operations run as
   jobs by ingest, the heartbeat, firmware facts (login, ACL, replay rules), the hardware script.
 
@@ -89,8 +91,10 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    executor.py   RemoteExecutor: the job state machine the session loop drives (contact, login, tagged command, retry)
                    heartbeat.py  the service_status row ingest keeps current; HeartbeatWriter, liveness (monotonic clock)
                    watchdog.py   in-process watchdog: exits the process if the session loop stalls (service.watchdog_s / $BEACON_WATCHDOG_S)
-                   (+ estimate.py api.py)
-web/               (+) static map UI (Leaflet)
+                   estimate.py   placeholder location estimator (range circle / weighted centroid); pure; the pipeline writes its output to `positions`
+                   views.py      the store as JSON-able dicts for the web (no HTTP); api.py the FastAPI app; web.py the beacon-web entry point
+                   tiles.py      raster MBTiles reader behind /tiles/{z}/{x}/{y}
+                   static/       the map page (index.html, app.js, app.css) and vendored Leaflet; package data, so `pip install .` carries it
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
 deploy/            config.example.toml; docker/ (Dockerfile, compose.yaml, entrypoint, beaconctl wrapper, build-bundle.sh, smoke-test.sh)
 ```
@@ -124,6 +128,13 @@ estimator must use it. `repeater add --all` and the unknown-repeater list cover 
 **Auto-add** (`Store.autoadd/set_autoadd`, settings table, `beaconctl autoadd`, off by default, read per report so a running ingest sees changes):
 repeaters are trusted by a report or an advert from an unknown one; beacons only by a report from a *trusted, enabled* repeater (that report
 becomes the baseline). `Verdict.auto_added` / `AdvertEffect.added` say what was added. Names are accepted from any repeater.
+
+**The map** (plan `docs/plan/web-map.md`, guide `docs/web.md`): `beacon-web` only reads the database (a connection per request) and has one write,
+reset, behind a bearer token (`[web]` in `secrets.toml` or `$BEACON_WEB_TOKEN`; no token means read-only). Positions are estimated by ingest inside the
+report's transaction (`Pipeline._locate`, one `positions` row per transmission, replaced as more repeaters report; `beaconctl positions rebuild` redoes
+them) from `Store.hearings`, which uses only enabled, located repeaters. FastAPI and uvicorn are the optional `web` extra. The page builds DOM and text
+only (names are untrusted; Leaflet reads a *string* tooltip as markup, so tooltips are given elements; `tests/test_static.py` enforces both). The Docker
+image does not carry `beacon-web` yet: pydantic has compiled wheels, which the image's pure-Python build stage cannot copy across CPUs.
 
 Pipeline rules worth remembering (full text in the base plan): unknown repeater/beacon and disabled entries are stored but
 change nothing (the repeater is checked first, so repeaters are onboarded before beacons); an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason
@@ -166,10 +177,11 @@ deployment migration 1 may still be edited, and the development database deleted
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'     # editable install; needs pyserial, pytest
-pytest                       # ~150 tests, ~10 s, no hardware needed (fake companion on a pty)
+pip install -e '.[dev]'     # editable install; needs pyserial, pytest, and fastapi/uvicorn/httpx for the web tests
+pytest                       # ~800 tests, ~2.5 min, no hardware needed (fake companion on a pty)
 beaconctl simulate --provision   # fake companion + synthetic reports (+ matching beacons/repeaters); prints the pty path
 beacon-ingest --port <path>      # store reports; then 'beaconctl status', 'rejects', 'beacon status <name>'
+beacon-web                       # the map and API on http://127.0.0.1:8080/ (needs the web extra; `beaconctl simulate --walk` for traffic)
 beaconctl listen                 # bring-up: print decoded reports without storing (only one of listen/ingest owns the port)
 ```
 

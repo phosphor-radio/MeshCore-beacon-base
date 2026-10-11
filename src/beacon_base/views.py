@@ -64,6 +64,10 @@ def health_view(store: Store, cfg: Config, now: float) -> dict[str, Any]:
                 "key_prefix": _hex(row["companion_key_prefix"]),
             },
         )
+        # the heartbeat's own figure is only written every 15 s; the newest stored report is exact
+        newest = store.conn.execute("SELECT rx_time FROM raw_frames ORDER BY id DESC LIMIT 1").fetchone()
+        if newest is not None and (ingest["last_report_at"] is None or newest["rx_time"] > ingest["last_report_at"]):
+            ingest["last_report_at"] = newest["rx_time"]
     if state == heartbeat.NEVER:
         problems.append({"code": "ingest_never", "level": "error", "text": "beacon-ingest has never run against this database; start it"})
     elif state == heartbeat.STOPPED:

@@ -6,7 +6,7 @@ in [beacon-project.md](beacon-project.md), and sets up the architecture for the 
 
 Status: B0 done (firmware commit `55fe473a`). B1 done and verified on hardware (`beaconctl listen` against the XIAO S3 WIO
 companion). B2 is done and was verified on hardware (real beacons and repeaters). The beacon names work ([beacon-names.md](beacon-names.md): firmware commit `28bb4985`, base N1 and N2) is complete and
-passed its hardware check (N3). The repeater onboarding ([repeater-onboarding.md](repeater-onboarding.md)) and the remote repeater management ([repeater-remote.md](repeater-remote.md)) are complete and were used on the hardware; the remote work also built the ingest heartbeat, the one part of B3 done so far. The rest of B3 (retention, systemd units, udev rule, install script) and B4 are not started. Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
+passed its hardware check (N3). The repeater onboarding ([repeater-onboarding.md](repeater-onboarding.md)) and the remote repeater management ([repeater-remote.md](repeater-remote.md)) are complete and were used on the hardware; the remote work also built the ingest heartbeat, the one part of B3 done so far. B3 was reshaped into a Docker deployment ([service-packaging.md](service-packaging.md); built, the Pi run left). **B4 is built and tested on the branch `b4-web-map`** ([web-map.md](web-map.md)). Decisions from the 2026-10-08 review are recorded in "Decisions" below. Refinements
 made while implementing B2 are marked "(B2)".
 
 ## Decisions
@@ -138,8 +138,8 @@ repeater's `beacon.window`, for `beaconctl check`). The database file defaults t
   why a beacon is not appearing. Unique index on `(repeater_prefix, beacon_prefix, counter)` for accepted rows.
 - `transmissions`: the group for one `(beacon, counter)`: `first_seen`, `last_seen`, `n_repeaters`, `batt_mv`,
   `final` flag.
-- `positions`: estimator output per transmission: `lat`, `lon`, `radius_m`, `method`, `n_repeaters`. Empty until the
-  estimator exists.
+- `positions`: estimator output per transmission: `lat`, `lon`, `radius_m`, `method` (`range` or `centroid`), `n_repeaters`. (B4) Migration 3;
+  written by the pipeline each time an observation of the transmission is accepted, from the enabled, located repeaters that heard it.
 - `service_status`: single row heartbeat from ingest (port connected, companion model and firmware, last frame time,
   counters, clock state) so the UI can show "ingest is down" instead of silently showing stale data.
 - `clock_events`: each time the Pi clock is observed to step (or is set with `beaconctl time`), see "Time".
@@ -292,7 +292,7 @@ with the remote repeater management work, see [repeater-remote.md](repeater-remo
 install script for a Pi and for the dev machine, logging to journald, a short operator README. Done when the service
 survives unplugging the companion and reboots of the Pi unattended.
 
-**B4. Web API and minimal map (start of milestone 6).**
+**B4. Web API and minimal map (start of milestone 6).** *Built on the branch `b4-web-map`; the plan for it, its decisions and what is left are in [web-map.md](web-map.md), the guide is [../web.md](../web.md). Differences from the text below: the static files live inside the package (`src/beacon_base/static/`), the estimator runs in ingest and stores `positions`, and the Docker image does not carry `beacon-web` yet.*
 `beacon-web`: read API (state, beacon history, transmission detail, ingest health) and a static Leaflet page showing
 repeaters, last-heard beacons, battery, an ingest-health banner, the rejected-beacon banner with Reset buttons and a
 "clock not set" banner. With a single repeater a beacon is drawn as a range circle around it; a placeholder

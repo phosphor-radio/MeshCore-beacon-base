@@ -163,12 +163,16 @@ def cmd_listen(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
+    from .estimate import Estimator
     from .fake_companion import FakeCompanion
     from .simulate import Simulator
 
     stop = stop_on_signals()
     with FakeCompanion() as fake:
-        sim = Simulator(fake, cfg.companion.channel_index, args.beacons, args.repeaters, args.seed)
+        sim = Simulator(
+            fake, cfg.companion.channel_index, args.beacons, args.repeaters, args.seed, walk=args.walk, walk_step_m=args.walk_step,
+            estimator=Estimator(cfg.estimate, cfg.radio.freq_khz),
+        )
         if args.provision:
             with Store.open(cfg.db_path) as store:
                 for beacon_id in sim.beacon_ids:
@@ -179,7 +183,7 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
         print(f"fake companion on {fake.path}")
         print(f"  ingest with:  beacon-ingest --port {fake.path}   (or: beaconctl listen --port ...)")
         for i, beacon_id in enumerate(sim.beacon_ids, 1):
-            print(f"  beacon {i}:    {beacon_id.hex()}")
+            print(f"  beacon {i}:    {beacon_id.hex()}" + ("  (walking round the repeaters)" if args.walk and i == 1 else ""))
         for i, key in enumerate(sim.repeater_keys, 1):
             print(f"  repeater {i}:  {key.hex()}", flush=True)
         sim.announce_names()
@@ -247,6 +251,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--beacons", type=int, default=3)
     sim.add_argument("--repeaters", type=int, default=3)
     sim.add_argument("--seed", type=int, default=1)
+    sim.add_argument("--walk", action="store_true", help="carry the first beacon round a course past the repeaters (all located), with RSSI from the distance")
+    sim.add_argument("--walk-step", type=float, default=80.0, metavar="METRES", help="with --walk: how far it moves each tick")
     sim.add_argument("--names-every", type=int, default=12, metavar="N", help="repeat the repeaters' name announcements every N ticks")
     sim.add_argument("--provision", action="store_true", help="also add the simulated beacons and repeaters to the database")
     sim.set_defaults(func=cmd_simulate)

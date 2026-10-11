@@ -76,3 +76,24 @@ assume_synced = false
 # beacon-ingest. A crash is restarted by the supervisor anyway; this covers a hang. 0 is off, which suits a terminal run or a debugger.
 # The container image sets BEACON_WATCHDOG_S=120, which takes precedence over this.
 watchdog_s = 0
+
+[estimate]
+# The placeholder location estimator that gives each transmission a position (docs/web.md): a circle around the one repeater that heard
+# it, or a weighted centroid when two or more did. Real estimation is later; these two numbers set how far away a given RSSI is taken to
+# be, so tune them from a walk test. After changing them, 'beaconctl positions rebuild' estimates the stored transmissions again.
+tx_power_dbm = 22          # the beacon's effective radiated power: transmit power plus antenna gain, less cable loss
+path_loss_exponent = 2.7   # 2 is free space; open ground with people about is nearer 2.5-3
+min_radius_m = 25          # no estimate is drawn tighter than this
+max_radius_m = 5000
+
+[web]
+# beacon-web, the map and API (docs/web.md). It listens on this machine only unless you say otherwise: other machines reading it is a
+# choice, and the page is plain HTTP, so the operator token (beaconctl web token generate) then crosses the network in clear.
+host = "127.0.0.1"
+port = 8080
+# Map tiles, from a raster MBTiles file (relative paths are relative to this file). With none the map is a plain grid with coordinates.
+# The Pi has no internet at the event, so tiles are made beforehand; see docs/web.md.
+tiles = ""
+# DEVELOPMENT ONLY: a tile URL template used when there is no tiles file, for a machine that has internet. Mind the provider's usage
+# policy (OpenStreetMap's public servers do not allow bulk use). Leave empty in the field.
+online_tile_url = ""
