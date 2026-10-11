@@ -70,3 +70,9 @@ silent_intervals = 3
 # The Pi has no internet in the field, so its clock is set by hand ('beaconctl time set'). Set this to true on a machine
 # whose clock is already right (NTP, RTC), such as the development machine, to trust observation times without that.
 assume_synced = false
+
+[service]
+# Exit if the session loop makes no progress for this many seconds, so a supervisor (Docker's restart policy, systemd) restarts a hung
+# beacon-ingest. A crash is restarted by the supervisor anyway; this covers a hang. 0 is off, which suits a terminal run or a debugger.
+# The container image sets BEACON_WATCHDOG_S=120, which takes precedence over this.
+watchdog_s = 0

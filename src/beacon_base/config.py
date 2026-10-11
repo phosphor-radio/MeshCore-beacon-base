@@ -81,6 +81,13 @@ class RemoteConfig:
 
 
 @dataclass(frozen=True)
+class ServiceConfig:
+    """How beacon-ingest behaves as a long-running service."""
+
+    watchdog_s: float = 0.0  # exit if the session loop makes no progress for this long, so a supervisor restarts it; 0 is off (see watchdog.py)
+
+
+@dataclass(frozen=True)
 class Config:
     companion: CompanionConfig = field(default_factory=CompanionConfig)
     radio: RadioConfig = field(default_factory=RadioConfig)
@@ -91,6 +98,7 @@ class Config:
     beacon: BeaconConfig = field(default_factory=BeaconConfig)
     clock: ClockConfig = field(default_factory=ClockConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
+    service: ServiceConfig = field(default_factory=ServiceConfig)
 
     @property
     def db_path(self) -> Path:
@@ -156,7 +164,7 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     elif required:
         raise ConfigError(f"config file not found: {path}")
 
-    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "remote", "secrets_file"}
+    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "remote", "service", "secrets_file"}
     if unknown:
         raise ConfigError(f"{path}: unknown section(s): {', '.join(sorted(unknown))}")
 
@@ -166,6 +174,9 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     beacon = _section(data, "beacon", BeaconConfig, path)
     clock = _section(data, "clock", ClockConfig, path)
     remote = _section(data, "remote", RemoteConfig, path)
+    service = _section(data, "service", ServiceConfig, path)
+    if isinstance(service.watchdog_s, bool) or not isinstance(service.watchdog_s, (int, float)) or service.watchdog_s < 0:
+        raise ConfigError("service.watchdog_s must be a number of seconds, 0 or more (0 is off)")
     if not 0 < remote.min_timeout_s <= remote.max_timeout_s or remote.timeout_factor <= 0 or remote.max_job_s <= 0 or remote.step_gap_s < 0:
         raise ConfigError(
             "remote: min_timeout_s must be positive and at most max_timeout_s, timeout_factor and max_job_s positive, step_gap_s not negative"
@@ -200,6 +211,7 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         beacon=beacon,
         clock=clock,
         remote=remote,
+        service=service,
     )
 
 

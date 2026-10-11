@@ -337,6 +337,9 @@ def _add_admin_commands(sub) -> None:
     p.set_defaults(func=admin.cmd_autoadd)
 
     sub.add_parser("check", help="sanity-check the setup, including repeater report windows").set_defaults(func=admin.cmd_check)
+    p = sub.add_parser("health", help="one line and an exit status: is beacon-ingest running (for a container healthcheck)")
+    p.add_argument("--companion", action="store_true", help="also unhealthy when the companion is not connected")
+    p.set_defaults(func=admin.cmd_health)
 
 
 def main(argv: list[str] | None = None) -> int:

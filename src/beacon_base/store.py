@@ -290,13 +290,26 @@ class Store:
         conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 10000")
-        conn.execute("PRAGMA journal_mode = WAL")
+        cls._enter_wal_mode(conn)
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA secure_delete = ON")  # freed bytes are zeroed, so an erased job password does not linger in the file
         conn.execute("PRAGMA foreign_keys = ON")
         store = cls(conn, path)
         store._migrate()
         return store
+
+    @staticmethod
+    def _enter_wal_mode(conn: sqlite3.Connection, attempts: int = 100) -> None:
+        """Switch a new database to WAL. The busy timeout does not cover this pragma, so a second process opening the file while the first is
+        still switching it (ingest starting as beaconctl is run) would fail at once with 'database is locked'; try again for a while."""
+        for attempt in range(attempts):
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) or attempt == attempts - 1:
+                    raise
+                time.sleep(0.1)
 
     def close(self) -> None:
         self.conn.close()

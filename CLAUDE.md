@@ -86,6 +86,7 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    remote_cli.py beaconctl repeater remote: parse, queue a job, wait, print; the job list
                    executor.py   RemoteExecutor: the job state machine the session loop drives (contact, login, tagged command, retry)
                    heartbeat.py  the service_status row ingest keeps current; HeartbeatWriter, liveness (monotonic clock)
+                   watchdog.py   in-process watchdog: exits the process if the session loop stalls (service.watchdog_s / $BEACON_WATCHDOG_S)
                    (+ estimate.py api.py)
 web/               (+) static map UI (Leaflet)
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)

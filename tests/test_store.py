@@ -554,3 +554,28 @@ def test_auto_add_for_repeaters_also_trusts_one_with_no_position(store):
 def test_without_auto_add_an_advert_does_not_trust_the_repeater(store):
     assert not advert(store, 40.0, -75.0).added
     assert store.repeaters() == []
+
+
+def test_opening_a_database_that_another_process_is_switching_to_wal_waits_instead_of_failing(tmp_path, monkeypatch):
+    import sqlite3
+
+    from beacon_base.store import Store
+
+    calls = []
+
+    class Conn:
+        def execute(self, sql):
+            calls.append(sql)
+            if len(calls) < 4:
+                raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    Store._enter_wal_mode(Conn())
+    assert len(calls) == 4  # three refusals, then it went through
+
+    class Broken:
+        def execute(self, sql):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        Store._enter_wal_mode(Broken())  # anything but 'locked' is raised at once

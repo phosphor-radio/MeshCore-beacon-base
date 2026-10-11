@@ -117,6 +117,7 @@ beaconctl status                             # one line per beacon, rejected and
 | `rejects [--beacon X] [--limit N]` | Recent observations that were not accepted, with the reason. |
 | `time` / `time set "YYYY-MM-DD HH:MM:SS"` / `time confirm` | Show or fix the clock state. The Pi has no internet, so its clock is set by hand; times stay provisional until then. |
 | `check` | Fails on missing setup, repeaters with no location and repeater report windows that are too long for the beacon interval. |
+| `health` / `health --companion` | One line and an exit status: 0 when `beacon-ingest` is running (with `--companion`, and the companion connected), 1 otherwise. For a container healthcheck or a script; it does not open the serial port or create a database. |
 | `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports and name announcements without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
 | `ingest [--port P]` | Same as `beacon-ingest`. |
 | `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |

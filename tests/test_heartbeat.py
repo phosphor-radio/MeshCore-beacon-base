@@ -243,8 +243,8 @@ def _run(cfg, stop, errors):
 def test_the_periodic_write_carries_counters_and_the_last_report(tmp_path, monkeypatch):
     original = service.PipelineHandler.__init__
 
-    def quick(self, store, pipeline, port=None, heartbeat_interval=1.0):  # a one second heartbeat, not the 15 s default
-        original(self, store, pipeline, port, heartbeat_interval)
+    def quick(self, store, pipeline, port=None, heartbeat_interval=1.0, **kw):  # a one second heartbeat, not the 15 s default
+        original(self, store, pipeline, port, heartbeat_interval, **kw)
 
     monkeypatch.setattr(service.PipelineHandler, "__init__", quick)
     repeater = bytes(range(32))

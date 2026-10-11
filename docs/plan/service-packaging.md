@@ -1,0 +1,126 @@
+# Service Hardening and Packaging Plan (B3)
+
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is in progress.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
+Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
+remote repeater work ([repeater-remote.md](repeater-remote.md)).
+
+**Done when** the base runs on a Raspberry Pi from a copied bundle with no internet, comes back by itself after the companion is unplugged and
+replugged and after the Pi is rebooted or loses power, a hung `beacon-ingest` is restarted without a person, and an operator can do everything
+from a short guide.
+
+## Decisions
+
+| # | Decision |
+|---|---|
+| 1 | **No retention, no pruning, no migration 3.** A week at the project's scale is about 60 MB (measured: 8.7 MB a day for 30 beacons and 10 repeaters), and each event starts with a new database. The first draft's findings about pruning (the `raw_id` reference stops raw frames being deleted; `observations_boot` is 15% of the file) are kept in "Notes for later" in case the base is ever run for months. |
+| 2 | **Docker Compose is the deployment for the Pi** (and works on the development machine). One image, one long-running service, `restart: unless-stopped`. **Local development is unchanged**: the login user runs `pip install -e` and `beacon-ingest` directly; nothing about groups or permissions is designed for it. |
+| 3 | **No bare-metal installer, systemd unit or udev installer** (the first draft's installer, `sdnotify` and the generated udev rule are dropped; no example unit either, confirmed in review). |
+| 4 | **The image is built where there is internet and carried to the Pi.** `deploy/docker/build-bundle.sh` builds the image for the Pi's platform and writes a folder: `image.tar` (`docker save`), `compose.yaml`, `config.example.toml`, `.env.example` and a one-page `README`. It goes to the Pi on a USB stick or by `scp`; there `docker load` and `docker compose up -d` are all that is needed (Docker and the compose plugin are already installed on the Pi). No registry. **The target is a Raspberry Pi Zero 2 W** (quad Cortex-A53, **512 MB RAM**, one micro-USB OTG port for the companion through an adapter, Raspberry Pi OS 13). That OS comes in 64-bit (`linux/arm64`) and 32-bit (`linux/arm/v7`) images and I do not know which is installed (`uname -m` says: `aarch64` or `armv7l`), so the script builds either with `--platform`, and builds both by default into separate tars. The Dockerfile is multi-stage: the dependencies (pure Python: `pyserial` and this package) are installed in a stage that runs on the *build* machine and copied into a base image of the *target* platform, so building for arm64 needs no emulation. |
+| 5 | **Base image `python:3.13-slim`** (Debian trixie), matching Raspberry Pi OS 13's Python 3.13. The image runs as a non-root user chosen at run time (`user: "${BEACON_UID:-1000}:${BEACON_GID:-1000}"`, with the serial group added), so the files in the data directory belong to the login user. |
+| 6 | **State lives in one host directory, `./data`, bind-mounted at `/data`**: `config.toml`, `secrets.toml` (mode 0600) and `beacon.db`. `BEACON_BASE_CONFIG=/data/config.toml` is set in the image. To start a new event, stop the stack and move the directory away. |
+| 7 | **The companion is reached through the host's `/dev`, mounted read-only at `/hostdev`** (`volumes: /dev:/hostdev:ro`), with `device_cgroup_rules` for the serial majors (`c 166:*` ttyACM, `c 188:*` ttyUSB) and the `dialout` group added; `companion.port` is `/hostdev/serial/by-id/usb-...` (the by-id links are relative, so they resolve inside the mount). A new device node and its by-id name appear as they do on the host, so the existing reconnect loop handles unplug and replug unchanged, **with no restart** (a requirement), and a container that starts before the board is plugged in simply waits. Mounting over the container's own `/dev` was rejected: it hides the container's `/dev/pts`, which `docker exec -it` (used by the `beaconctl` wrapper) needs; the DTR detection (`usb_vendor_id`) therefore matches the port by its device name, not its full path. The strict alternative, `devices: - /dev/serial/by-id/...`, is fixed at container start, so a replug would need a restart; it is a documented fallback only. |
+| 8 | **Hang detection is an in-process watchdog**, not `sd_notify`: a thread that exits the process with a non-zero status if the session loop has not ticked for `service.watchdog_s` seconds, so Docker's restart policy brings it back. Default `0` (off) in the config so a debugger or a terminal run is never killed; the image sets `BEACON_WATCHDOG_S=120` (confirmed in review). A hung loop and a crash are then handled the same way. Implemented in B3.1. |
+| 9 | **`beaconctl health`** (new): exit 0 when the heartbeat says ingest is running (and, with `--companion`, that the companion is connected), one line of output, 1 otherwise. It is the container's `HEALTHCHECK`, so `docker compose ps` shows `healthy` or `unhealthy` (an unplugged companion shows as unhealthy). Docker itself does not restart an unhealthy container; the watchdog and the exit-on-crash do that. |
+| 10 | **`beaconctl` runs inside the container** through a wrapper, `deploy/docker/beaconctl`, which is `docker compose exec` with a terminal (so prompts and `--ask-password` work). Files for `--password-file` go in `./data`. It shares the running container's database, so there is one writer process family on one file. |
+| 11 | **The clock.** The container shares the host's clock, monotonic clock and boot id, so observation times and the heartbeat's liveness work as on the host. It cannot set the host's clock: `beaconctl time set` needs `sudo timedatectl` on the host. In the container it says so and tells the operator to set the Pi's clock on the Pi (`sudo timedatectl set-time ...`); ingest notices the step and repairs provisional times by itself (or `beaconctl time confirm`). Confirmed in review. The image does not wait for any clock sync. The Zero 2 W has no RTC either. Implemented in B3.1. |
+| 12 | **Logs** stay as they are (timestamps in the text; Docker adds its own), written to stdout/stderr and kept by the `json-file` driver with `max-size: 10m`, `max-file: 3` set in the compose file, so they cannot fill the SD card. |
+| 13 | **An operator guide**, `docs/deployment.md`: building the bundle, installing Docker on the Pi with no internet, loading the image, the first-start checklist (config, channel key, clock, repeaters), daily use, unplug/replug and power-loss behaviour, a new event, troubleshooting. The README links to it. |
+| 14 | **A host-side udev rule is optional**, shipped as `deploy/99-beacon-companion.rules.example` and explained in the guide: it gives the board a stable name and, on a system that has ModemManager (desktop images), tells it to leave the port alone, since it would otherwise probe it with AT commands. |
+| 15 | **Sized for 512 MB.** The compose file sets `mem_limit: 256m` (the container is expected to use well under 100 MB, and a leak is then killed and restarted by the container's own policy rather than starving the Pi), `init: true` (a proper PID 1 that forwards SIGTERM and reaps children), and no extra containers: `beaconctl` runs inside the one that exists. |
+
+## What exists and what is missing
+
+Exists: `beacon-ingest` reconnects with backoff (a missing port is just a failed attempt), stops cleanly on SIGTERM and says so in its heartbeat,
+writes its heartbeat and tolerates a busy database; WAL with `synchronous=NORMAL` (a power cut can lose the last transactions but not corrupt
+the file); `beaconctl` and ingest share the database safely; jobs left running by a crash are failed on start; reports held by the companion are
+drained and marked late on connect; `config.example.toml`.
+
+Missing: the watchdog, `beaconctl health`, the `time set` message in a container, the image, the compose file, the bundle script, the udev
+example and the guide.
+
+## Components
+
+**Watchdog (`watchdog.py`).** `Watchdog(timeout, on_stall)` with `feed()`, `start()`, `stop()`; a daemon thread checks once a second. It is fed
+from `PipelineHandler.on_tick` (about four times a second, also while waiting to reconnect), at start-up and after a blocking call returns. The
+longest legitimate stall is a companion command (5 s) or a busy database (10 s), far below the 120 s default. On a stall it logs a critical line
+with what the loop was last doing and calls `os._exit(70)` (an exit status that is easy to spot in `docker compose ps`).
+
+**`beaconctl health`.** Reads the heartbeat (`heartbeat.state`), prints `ok: ingest running, companion connected, last report 40s ago`
+or the reason, and returns 0 or 1. Does not open the port.
+
+**Image and compose (`deploy/docker/`).** `Dockerfile` (multi-stage, two platforms), `compose.yaml` (service, `/data` and `/hostdev` mounts, cgroup
+rules, `group_add`, `restart`, `init`, `mem_limit`, `stop_grace_period: 15s`, the healthcheck, log options, `BEACON_WATCHDOG_S`), `.env.example` (`BEACON_UID`,
+`BEACON_GID`, `BEACON_TTY_GID`, `TZ`), `beaconctl` wrapper, `build-bundle.sh`, `smoke-test.sh`. The entry point runs `beacon-ingest` with the
+port from the config; the first start with no `config.toml` copies the example into `/data` and exits with a message, rather than guessing a
+port.
+
+**Time zone.** `TZ` in `.env` and `/etc/localtime` mounted read-only, so `beaconctl` prints local times as the host does.
+
+## Gaps and risks
+
+1. **Docker on the Pi with no internet.** Docker and the compose plugin must already be on the Pi (Debian packages `docker.io` and
+   `docker-compose-v2`, or Docker's own packages). With no internet at install they come from the OS image or from `.deb` files carried over; the
+   guide lists the packages and the order, but I cannot test that here (open question 1).
+2. **`/dev` bind mount is broad.** It gives the container sight of every host device, limited by the cgroup rules to serial ports. Acceptable
+   for a single-purpose Pi on an isolated network, and the strict `devices:` form is the documented fallback.
+3. **Device numbers.** `c 166` and `c 188` are the Linux majors for `ttyACM` and `ttyUSB`; a board that enumerates differently (some CDC
+   devices use other nodes) needs another rule. `ls -l /dev/ttyACM0` shows it; the guide says how to check.
+4. **`docker compose exec` needs the container running.** `beaconctl` reading the database while ingest is down is possible
+   (`docker compose run --rm`), and the wrapper falls back to it with a note.
+5. **Restart loops.** A container that exits immediately (a bad config) would restart forever; the first-start check prints the problem and
+   sleeps rather than exiting, and `restart: unless-stopped` does not back off beyond Docker's own delay.
+6. **Data-directory ownership.** If the data directory is created by Docker as root, ingest (running as the login user) cannot write it. The
+   guide has the user create it first, and the entry point checks it is writable and says what to do.
+7. **Power loss and the SD card.** `fsync` behaviour is unchanged; a cut can lose the last few transactions. Docker's own state is not
+   critical (the bundle can be reloaded). The guide recommends a clean `docker compose down` and shutdown at the end of the event.
+8. **Bitness of the Zero 2 W's OS** is not known; both images are built (decision 4), and the guide has the one-line check.
+9. **512 MB of RAM** is enough for Docker's daemon plus one small Python container, but not for much else on the Pi. No swap tuning is
+   attempted; `mem_limit` and `restart` contain a leak, and `docker stats` shows the use.
+10. **One USB port.** The companion goes in the OTG port through an adapter and the Pi is powered from the other micro-USB port, so no hub is
+    needed; a board that draws more than the Pi's supply can give (an unpowered Wio-SX1262 transmitting) is a power problem to watch for
+    during the acceptance run.
+
+## Testing
+
+- **Watchdog:** fires after the timeout with no feed, not while fed, `stop()` cancels it, `0` disables, the exit status; a stalled fake loop
+  is detected within the timeout.
+- **`beaconctl health`:** every heartbeat state (never run, stopped, down, running without the companion, running), `--companion`.
+- **`time set` in a container:** the message and exit code when `timedatectl` is missing or fails.
+- **Image (opt-in, `pytest -m docker`, skipped without Docker):** `docker build` for the host platform; start the container with the fake
+  companion inside it (`beaconctl simulate` and `beacon-ingest` in one container), `beaconctl health` is healthy, reports reach the database, kill
+  the container with SIGKILL and let compose restart it, state intact, `docker compose config` validates the file.
+- **Cross-build:** `build-bundle.sh --platform linux/arm64` produces a tar that `docker load` accepts and whose manifest says arm64.
+- **On the Pi (manual, the real acceptance test):** load the bundle, `up -d`, unplug and replug the companion, `reboot`, pull the power, set the
+  clock, run for a day, watch `beaconctl status`, `docker compose ps` and the size of `./data`.
+
+## Phases
+
+**B3.1 Service behaviour.** `watchdog.py` and `[service] watchdog_s` / `BEACON_WATCHDOG_S`, `beaconctl health`, the `time set` message,
+tests. Runnable on the development machine without Docker.
+
+**B3.2 Image and compose.** Dockerfile, compose file, `.env.example`, `beaconctl` wrapper, `build-bundle.sh`, `smoke-test.sh`, the opt-in
+Docker tests. Done when the smoke test passes here and the arm64 bundle builds.
+
+**B3.3 Guide.** `docs/deployment.md`, the udev example, README and CLAUDE.md updates.
+
+**B3.4 Pi run.** The manual acceptance test above. Done when the criterion at the top holds.
+
+## Review questions: answers (2026-10-10)
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Docker on the Pi | Docker and the compose plugin are already installed. |
+| 2 | Bare metal | The systemd unit is dropped. |
+| 3 | Container user | The login user (`BEACON_UID`/`BEACON_GID`). Local development also runs as the login user; no group permissions are designed for it. |
+| 4 | Which Pi | A Raspberry Pi Zero 2 W (512 MB, one OTG port); bitness unknown, so both platforms are built. |
+| 5 | Device access | The host `/dev` is mounted, and replug with no restart is wanted (done as `/hostdev`, decision 7). |
+| 6 | Watchdog default | 120 s in the image, off elsewhere. |
+| 7 | The clock | Set on the Pi; ingest repairs the times. |
+
+## Notes for later (not in B3)
+
+If the base is ever run for months: batch-prune old raw frames, non-accepted observations and finished remote jobs; make
+`observations.raw_id` nullable with `ON DELETE SET NULL` (it is `NOT NULL REFERENCES raw_frames`, so raw frames cannot be deleted while an
+observation points at them); make the `observations_boot` index partial (`WHERE time_trusted = 0`, 1.3 of 8.7 MB a day); keep accepted
+observations for a chosen period. A pass must run in small batches, since ingest has one thread and a long delete holds the write lock.

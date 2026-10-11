@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
 import subprocess
 import time
 
@@ -481,17 +482,26 @@ def cmd_autoadd(args: argparse.Namespace, cfg: Config) -> int:
 # --- time ----------------------------------------------------------------------------------------------------------------
 
 
+HOST_CLOCK_HINT = (
+    "If beaconctl runs in a container it cannot set the host's clock: set the Pi's clock on the Pi "
+    "(sudo timedatectl set-time 'YYYY-MM-DD HH:MM:SS'), then run 'beaconctl time confirm'; ingest also notices the change by itself."
+)
+
+
 def run_timedatectl(*args: str) -> str:
     """Run timedatectl, through sudo when not root. Isolated so tests can replace it."""
     cmd = ["timedatectl", *args]
-    if os.geteuid() != 0 and args and args[0] == "set-time":
+    setting = bool(args) and args[0] == "set-time"
+    if shutil.which("timedatectl") is None:
+        raise StoreError("this machine has no timedatectl." + (f" {HOST_CLOCK_HINT}" if setting else ""))
+    if os.geteuid() != 0 and setting:
         cmd = ["sudo", *cmd]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise StoreError(f"cannot run {' '.join(cmd)}: {e}") from e
+        raise StoreError(f"cannot run {' '.join(cmd)}: {e}" + (f". {HOST_CLOCK_HINT}" if setting else "")) from e
     if res.returncode != 0:
-        raise StoreError(f"{' '.join(cmd)} failed: {(res.stderr or res.stdout).strip()}")
+        raise StoreError(f"{' '.join(cmd)} failed: {(res.stderr or res.stdout).strip()}" + (f". {HOST_CLOCK_HINT}" if setting else ""))
     return res.stdout.strip()
 
 
@@ -541,6 +551,34 @@ def cmd_time_confirm(args: argparse.Namespace, cfg: Config) -> int:
     """The clock is already right (set another way, or an RTC): trust it for this boot and fix provisional times."""
     n = _record_clock_event(cfg, "set", clock.offset())
     print(f"clock confirmed as {fmt_time(time.time())}; corrected the time of {n} earlier observation(s)")
+    return 0
+
+
+# --- health --------------------------------------------------------------------------------------------------------------
+
+
+def cmd_health(args: argparse.Namespace, cfg: Config) -> int:
+    """One line and an exit status, for a container's HEALTHCHECK or a script: 0 when beacon-ingest is running (and, with --companion,
+    has the companion connected), 1 otherwise. Does not open the serial port and does not create a database."""
+    if not cfg.db_path.exists():
+        print(f"unhealthy: no database at {cfg.db_path}; beacon-ingest has not started")
+        return 1
+    now = time.time()
+    with _open(cfg) as store:
+        row = store.status_row()
+    state = heartbeat.state(row)
+    if state != heartbeat.UP:
+        why = {heartbeat.NEVER: "has never run", heartbeat.STOPPED: "was stopped", heartbeat.DOWN: "is not running"}[state]
+        heard = f" (last heard from {fmt_age(row['updated_at'], now)})" if row is not None else ""
+        print(f"unhealthy: beacon-ingest {why}{heard}")
+        return 1
+    if not row["connected"]:
+        if args.companion:
+            print("unhealthy: beacon-ingest is running but the companion is not connected")
+            return 1
+        print("ok: beacon-ingest is running; the companion is not connected")
+        return 0
+    print(f"ok: beacon-ingest is running, companion connected, last report {fmt_age(row['last_report_at'], now)}")
     return 0
 
 

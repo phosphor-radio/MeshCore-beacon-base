@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import os
 import sqlite3
 import sys
 import threading
@@ -18,6 +19,7 @@ from .link import DTR_MODES, CompanionError
 from .pipeline import Pipeline
 from .runtime import setup_logging, stop_on_signals
 from .store import Store, StoreError
+from .watchdog import Watchdog
 
 log = logging.getLogger("beacon-ingest")
 
@@ -25,8 +27,12 @@ log = logging.getLogger("beacon-ingest")
 class PipelineHandler(Handler):
     """Runs every decoded report through the replay/dedupe pipeline and watches for the system clock being set."""
 
-    def __init__(self, store: Store, pipeline: Pipeline, port: str | None = None, heartbeat_interval: float = heartbeat.INTERVAL):
+    def __init__(
+        self, store: Store, pipeline: Pipeline, port: str | None = None, heartbeat_interval: float = heartbeat.INTERVAL,
+        watchdog: Watchdog | None = None,
+    ):
         self._store = store
+        self._watchdog = watchdog
         self._pipeline = pipeline
         self._port = port
         self._offset = clock.offset()  # wall minus monotonic clock; a jump means someone set the clock
@@ -66,7 +72,9 @@ class PipelineHandler(Handler):
             log.error("could not record the outcome of remote job %d: %s", job.id, e)
 
     def on_tick(self) -> None:
-        """Refresh what the heartbeat reports (about once a second) and let it write when due."""
+        """Tell the watchdog the loop is alive, refresh what the heartbeat reports (about once a second) and let it write when due."""
+        if self._watchdog is not None:
+            self._watchdog.feed("session loop")
         now = time.monotonic()
         if now >= self._next_sample:
             self._next_sample = now + 1.0
@@ -178,6 +186,23 @@ class PipelineHandler(Handler):
         self._offset = offset
 
 
+WATCHDOG_ENV = "BEACON_WATCHDOG_S"
+
+
+def watchdog_seconds(cfg: Config) -> float:
+    """The watchdog timeout: $BEACON_WATCHDOG_S (how the container image turns it on) over ``service.watchdog_s``; 0 is off."""
+    raw = os.environ.get(WATCHDOG_ENV)
+    if raw is None or raw.strip() == "":
+        return float(cfg.service.watchdog_s)
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ConfigError(f"${WATCHDOG_ENV} must be a number of seconds, not {raw!r}") from None
+    if seconds < 0:
+        raise ConfigError(f"${WATCHDOG_ENV} must not be negative")
+    return seconds
+
+
 def run(cfg: Config, stop: threading.Event) -> None:
     if cfg.channel_key is None:
         raise ConfigError("no report channel key; run 'beaconctl channel generate' first")
@@ -187,13 +212,20 @@ def run(cfg: Config, stop: threading.Event) -> None:
         interrupted = store.recover_jobs()
         if interrupted:
             log.warning("%d remote job(s) were running when ingest last stopped; they are marked failed", interrupted)
-        handler = PipelineHandler(store, pipeline, cfg.companion.port)
+        seconds = watchdog_seconds(cfg)
+        watchdog = Watchdog(seconds) if seconds > 0 else None
+        handler = PipelineHandler(store, pipeline, cfg.companion.port, watchdog=watchdog)
         session = CompanionSession(cfg, handler)
         handler.bind(session)
         handler.heartbeat.write()  # so 'beaconctl status' sees ingest from the first moment, before the companion answers
+        if watchdog is not None:
+            log.info("watchdog: exiting if the session loop makes no progress for %.0f s", seconds)
+            watchdog.start()
         try:
             session.run(stop)
         finally:
+            if watchdog is not None:
+                watchdog.stop()
             handler.close()
 
 
