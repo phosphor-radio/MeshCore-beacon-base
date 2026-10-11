@@ -2,7 +2,7 @@ beacon-base @VERSION@ -- base station for the MeshCore beacon tracker
 =====================================================================
 
 This folder holds everything the Raspberry Pi needs; it does not use the internet. Docker and the compose plugin must already be installed.
-The full guide is docs/deployment.md in the repository.
+The full guide, with troubleshooting, is DEPLOYMENT.md in this folder (docs/deployment.md in the repository).
 
 First time
 ----------

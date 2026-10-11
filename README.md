@@ -12,9 +12,9 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > reads and changes a repeater's name, position, advert intervals and `beacon.*` settings, syncs its clock, sends an advert and reboots it, through
 > `beacon-ingest` and the base companion, and `beacon-ingest` keeps a heartbeat that `beaconctl status` shows. It has been used on the hardware with
 > three repeaters in one room; paths of more than zero hops have not been tested.
-> For the Raspberry Pi there is a Docker image and compose file (`deploy/docker/`, `build-bundle.sh` makes the folder to carry to a Pi with no
-> internet); the operator guide (`docs/deployment.md`) is still to come (B3, [docs/plan/service-packaging.md](docs/plan/service-packaging.md)).
-> No web UI yet (B4). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> For the Raspberry Pi there is a Docker image and compose file (`deploy/docker/`; `build-bundle.sh` makes the folder to carry to a Pi with no
+> internet) and an operator guide, [docs/deployment.md](docs/deployment.md) (B3, [docs/plan/service-packaging.md](docs/plan/service-packaging.md)); the
+> Pi run itself (B3.4) is still to do. No web UI yet (B4). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works
@@ -65,6 +65,7 @@ tested at a desk.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): base design, data model, pipeline, phases B0-B4.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh (a small fixed set of operations), the ingest heartbeat.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
+- [docs/deployment.md](docs/deployment.md): running the base on a Raspberry Pi in Docker with no internet: building the bundle, first start, the event, troubleshooting.
 - [docs/operations.md](docs/operations.md): running on real hardware, starting with the companion's USB serial (DTR) settings.
 
 Links inside the plan docs that point at `../../src/...` or `../companion_protocol.md` refer to files in the firmware
@@ -377,7 +378,7 @@ dropping the base's unscoped flood; see the plan for the fix (a default flood sc
 | B0 | Done. Firmware repo emits golden test vectors for the report format. |
 | B1 | Done and verified on hardware: wire decoder, serial framing, companion startup, `beaconctl listen`. |
 | B2 | Done and verified on hardware: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
-| B3 | Hardening and packaging: retention, systemd units, udev rule, install script. (The ingest heartbeat is done, built with the remote management work.) |
+| B3 | Packaging for a week-long event on a Pi Zero 2 W: Docker image and compose bundle, watchdog, health check, operator guide. Done except the run on the Pi (B3.4). No retention or systemd install: each event starts a new database. |
 | B4 | Web API and minimal offline map (MBTiles). |
 | Also | Done and used on hardware: beacon names, repeater onboarding (positions and names from adverts, discovery, auto-add) and remote repeater management over the mesh. |
 

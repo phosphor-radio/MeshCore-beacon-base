@@ -1,6 +1,6 @@
 # Service Hardening and Packaging Plan (B3)
 
-Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) and B3.4 (the Pi run) remain.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run) remains.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
 long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
 Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
 remote repeater work ([repeater-remote.md](repeater-remote.md)).
@@ -130,6 +130,12 @@ Docker tests. Done when the smoke test passes here and the arm64 bundle builds.
   power cut.
 
 **B3.3 Guide.** `docs/deployment.md`, the udev example, README and CLAUDE.md updates.
+
+*Done (2026-10-10).* `docs/deployment.md` covers what the plan lists: building the bundle, installing on the Pi, the first start step by step (find the
+port, edit `port` with `/hostdev` in front, channel key, clock including `set-ntp false`), onboarding and locking the mesh, what to run during the event,
+unplug/replug, reboot and power loss, a new event (keep config and key, new database), upgrades, a troubleshooting table, and the optional host udev rule
+(`deploy/99-beacon-companion.rules.example`, syntax-checked with `udevadm verify`). The bundle ships the guide as `DEPLOYMENT.md` and the rule. `tests/test_docs.py`
+checks that the documents' relative links resolve, that the files and commands the guide names exist, and that its `./beaconctl` examples parse.
 
 **B3.4 Pi run.** The manual acceptance test above. Done when the criterion at the top holds.
 

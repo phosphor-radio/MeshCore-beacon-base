@@ -14,12 +14,14 @@ verified on hardware, as is the repeater onboarding work (`docs/plan/repeater-on
 from repeater adverts, plus discovery and auto-add). The remote repeater management work
 (`docs/plan/repeater-remote.md`) is complete: companion protocol and clock, the ingest heartbeat, the job table and executor,
 `beaconctl repeater remote` (get/set, clock sync, advert, reboot), and the hardware work (pacing, retries, advert diagnostics); used on the
-hardware with three repeaters in one room, so multi-hop paths are untested. The rest of B3 (retention, systemd, udev, install) and B4 are not
-started.** The plans are the source of truth:
+hardware with three repeaters in one room, so multi-hop paths are untested. B3 (packaging for a week-long event on a Pi Zero 2 W with no
+internet, in Docker: `docs/plan/service-packaging.md`, `docs/deployment.md`) is built and tested here (watchdog, `beaconctl health`, image, compose
+bundle, guide); only the run on the Pi (B3.4) is left. B4 is not started.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
   replay pipeline, phases B0-B4, open questions.
+- [docs/plan/service-packaging.md](docs/plan/service-packaging.md): B3: Docker deployment on a Pi Zero 2 W, the decisions (no retention, `/hostdev`, watchdog), what was tested.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh: a closed set of operations run as
   jobs by ingest, the heartbeat, firmware facts (login, ACL, replay rules), the hardware script.
 

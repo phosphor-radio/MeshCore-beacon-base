@@ -1,0 +1,17 @@
+# Optional. Install on the Raspberry Pi (the host, not in the container) if you want either of these:
+#
+#   * a short fixed name for the companion: /dev/beacon-companion, which the container sees as /hostdev/beacon-companion. The names under
+#     /dev/serial/by-id already stay the same for one board, so this is only a convenience (and a way to tell two boards of one model apart).
+#   * ModemManager to leave the companion alone. ModemManager (on desktop images; Raspberry Pi OS Lite does not have it) opens new serial
+#     devices and sends them AT commands, which the companion does not expect.
+#
+# 1. Plug the companion in and read its ids:
+#        udevadm info -q property -n /dev/ttyACM0 | grep -E 'ID_VENDOR_ID|ID_MODEL_ID|ID_SERIAL_SHORT'
+# 2. Copy this file to /etc/udev/rules.d/99-beacon-companion.rules and replace VVVV, PPPP and SSSS with those three values
+#    (drop the serial test if the board has none).
+# 3. sudo udevadm control --reload && sudo udevadm trigger     then unplug and plug the companion in again.
+#
+# The first line keeps ModemManager away from the whole USB device; the second gives the serial port its name and group.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="VVVV", ATTR{idProduct}=="PPPP", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="VVVV", ENV{ID_MODEL_ID}=="PPPP", ENV{ID_SERIAL_SHORT}=="SSSS", SYMLINK+="beacon-companion", GROUP="dialout", MODE="0660"

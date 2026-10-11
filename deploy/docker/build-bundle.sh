@@ -49,6 +49,8 @@ done
 
 cp "$here/compose.yaml" "$here/beaconctl" "$here/smoke-test.sh" "$here/load-image.sh" "$bundle/"
 cp "$here/.env.example" "$bundle/.env.example"
+cp "$root/docs/deployment.md" "$bundle/DEPLOYMENT.md"
+cp "$root/deploy/99-beacon-companion.rules.example" "$bundle/99-beacon-companion.rules.example"
 sed "s/@VERSION@/$version/g" "$here/BUNDLE-README.txt" > "$bundle/README.txt"
 printf '%s\n' "$version" > "$bundle/VERSION"
 chmod 755 "$bundle/beaconctl" "$bundle/smoke-test.sh" "$bundle/load-image.sh"
