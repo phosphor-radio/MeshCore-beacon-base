@@ -118,9 +118,15 @@ def usb_vendor_id(path: str) -> int | None:
         from serial.tools import list_ports
 
         real = os.path.realpath(path)
-        for info in list_ports.comports():
+        ports = list(list_ports.comports())
+        for info in ports:
             if os.path.realpath(info.device) == real:
                 return info.vid
+        # In a container the host's /dev is mounted at another path (/hostdev), so a port is /hostdev/ttyACM0 here but /dev/ttyACM0 to the
+        # kernel's own listing; fall back to the device name, if only one listed port has it.
+        named = [info for info in ports if os.path.basename(info.device) == os.path.basename(real)]
+        if len(named) == 1:
+            return named[0].vid
     except Exception as e:  # port listing is best effort; an unknown device just gets the default
         log.debug("could not look up the USB vendor of %s: %s", path, e)
     return None

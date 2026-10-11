@@ -1,0 +1,45 @@
+# Docker Compose file for the base station on a Raspberry Pi. See docs/deployment.md.
+#
+#   docker load -i image-<arch>.tar        # once (load-image.sh picks the right file)
+#   docker compose up -d
+#   ./beaconctl status                     # beaconctl runs inside the container
+#
+# Everything the base needs to keep (configuration, secrets, database) is in ./data. For a new event, stop the stack and move ./data away.
+
+name: beacon-base
+
+services:
+  ingest:
+    image: beacon-base:${BEACON_VERSION:-latest}
+    restart: unless-stopped
+    init: true
+    # Run as the login user, so the files in ./data belong to you. Set these in .env if your ids are not 1000.
+    user: "${BEACON_UID:-1000}:${BEACON_GID:-1000}"
+    group_add:
+      - "${BEACON_TTY_GID:-20}"   # the group that owns /dev/ttyACM* (dialout is 20 on Raspberry Pi OS)
+    environment:
+      TZ: "${TZ:-UTC}"
+      BEACON_WATCHDOG_S: "120"    # exit if the session loop stalls; Docker then restarts the container
+    volumes:
+      - ./data:/data
+      # The host's /dev, so a companion that is unplugged and plugged in again is found again without restarting the container. It is mounted
+      # at /hostdev rather than over /dev so the container keeps its own /dev/pts (docker exec -it needs it); set companion.port to
+      # /hostdev/serial/by-id/usb-... in the configuration.
+      - /dev:/hostdev:ro
+      - /etc/localtime:/etc/localtime:ro
+    device_cgroup_rules:
+      - "c 166:* rmw"   # ttyACM
+      - "c 188:* rmw"   # ttyUSB
+    mem_limit: 256m       # a Pi Zero 2 W has 512 MB; a leak is killed and restarted rather than starving the Pi
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "beaconctl", "health", "--companion"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

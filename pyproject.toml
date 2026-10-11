@@ -26,3 +26,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["docker: builds and runs the container image; needs Docker and BEACON_DOCKER_TESTS=1 (see tests/test_docker.py)"]

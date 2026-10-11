@@ -12,7 +12,9 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > reads and changes a repeater's name, position, advert intervals and `beacon.*` settings, syncs its clock, sends an advert and reboots it, through
 > `beacon-ingest` and the base companion, and `beacon-ingest` keeps a heartbeat that `beaconctl status` shows. It has been used on the hardware with
 > three repeaters in one room; paths of more than zero hops have not been tested.
-> No web UI yet (B4) and no packaging (B3) beyond the heartbeat. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> For the Raspberry Pi there is a Docker image and compose file (`deploy/docker/`, `build-bundle.sh` makes the folder to carry to a Pi with no
+> internet); the operator guide (`docs/deployment.md`) is still to come (B3, [docs/plan/service-packaging.md](docs/plan/service-packaging.md)).
+> No web UI yet (B4). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works

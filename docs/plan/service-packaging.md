@@ -1,6 +1,6 @@
 # Service Hardening and Packaging Plan (B3)
 
-Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is in progress.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) and B3.4 (the Pi run) remain.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
 long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
 Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
 remote repeater work ([repeater-remote.md](repeater-remote.md)).
@@ -101,6 +101,33 @@ tests. Runnable on the development machine without Docker.
 
 **B3.2 Image and compose.** Dockerfile, compose file, `.env.example`, `beaconctl` wrapper, `build-bundle.sh`, `smoke-test.sh`, the opt-in
 Docker tests. Done when the smoke test passes here and the arm64 bundle builds.
+
+*Done (2026-10-10).* What was built, and what the work found:
+
+- **Files** (`deploy/docker/`): `Dockerfile`, `compose.yaml`, `.env.example`, `entrypoint.sh`, `bin/beaconctl` and `bin/beacon-ingest` (two-line wrappers
+  around `python -m`), `beaconctl` (the host-side wrapper), `build-bundle.sh`, `load-image.sh`, `smoke-test.sh`, `BUNDLE-README.txt`; `.dockerignore`
+  at the root. `pyproject.toml` registers the `docker` pytest marker.
+- **Cross-building works without emulation**, as designed: both `image-arm64.tar` (42 MB) and `image-armv7.tar` (38 MB) were built on an x86 machine and
+  their manifests checked (arm64; arm v7), with `SHA256SUMS`. `load-image.sh` picks the file from `uname -m` (`aarch64` / `armv7l`). The final stage
+  of the Dockerfile has no `RUN` (that would execute for the target platform); the example configuration is prepared in the build stage.
+- **The container's first-run configuration is its own example**: the repository's with `companion.port` commented out and pointing at
+  `/hostdev/serial/by-id/...`. The repository example has an active placeholder port, which would have let the container start on a port that
+  does not exist.
+- **Waiting, not crash-looping.** `entrypoint.sh` creates `data/config.toml`, then loops every ten seconds on `beacon-ingest --check` (new: a
+  configuration check, exit 2 with the reason) printing each problem once, and starts ingest by itself when the port and the channel key are there.
+  A data directory the container user cannot write is reported the same way. Any other command (`beaconctl status`) is run as given.
+- **`/hostdev` instead of `/dev`** (decision 7) was checked: `docker exec -it` still gets a `/dev/pts` terminal and `/hostdev` shows the host's devices.
+  The DTR lookup (`usb_vendor_id`) now falls back to the device name when the path differs (`/hostdev/ttyACM0` against the kernel's `/dev/ttyACM0`), and
+  refuses to guess when two listed ports share a name.
+- **Tests:** `deploy/docker/smoke-test.sh` runs a fake companion, simulated beacons and `beacon-ingest` in one throwaway container and waits for stored
+  reports (it passes here, and is in the bundle to run on the Pi). `BEACON_DOCKER_TESTS=1 pytest tests/test_docker.py` (8 tests, about 35 s) runs the
+  real `compose.yaml` and wrapper in a scratch project: the file validates, the container idles and explains until configured and then starts, the
+  companion-less state is reported as not connected, `/hostdev` and `/dev/pts` are both there, the user, memory limit, restart policy, `init` and
+  watchdog are as specified, a SIGKILLed service is restarted with the allowlist intact, `beaconctl` works through a throwaway container with the
+  stack down, and `time set` gives the clock message. The ordinary suite skips them.
+- **Not tested here, and needing the Pi:** running on the Pi's CPU (the smoke test is the first step), a real companion with unplug and replug through
+  `/hostdev` (the cgroup rules for majors 166 and 188 are as documented for Linux but the hot-plug itself needs a device), memory use on 512 MB, and a
+  power cut.
 
 **B3.3 Guide.** `docs/deployment.md`, the udev example, README and CLAUDE.md updates.
 

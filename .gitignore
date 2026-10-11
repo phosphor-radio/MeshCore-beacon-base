@@ -11,3 +11,7 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+
+# a deployment made from a checkout of deploy/docker
+/deploy/docker/.env
+/deploy/docker/data/

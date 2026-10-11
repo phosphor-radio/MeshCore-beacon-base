@@ -49,6 +49,25 @@ def test_the_vendor_is_found_through_a_by_id_link(tmp_path, monkeypatch):
     assert link_mod.usb_vendor_id(str(tmp_path / "missing")) is None
 
 
+def test_the_vendor_is_found_when_the_hosts_dev_is_mounted_at_another_path(tmp_path, monkeypatch):
+    """In the container the host's /dev is at /hostdev, so the port is /hostdev/ttyACM0 but the kernel's listing says /dev/ttyACM0."""
+    from serial.tools import list_ports
+
+    class Info:
+        def __init__(self, device, vid):
+            self.device, self.vid = device, vid
+
+    hostdev = tmp_path / "hostdev"
+    (hostdev / "serial" / "by-id").mkdir(parents=True)
+    (hostdev / "ttyACM0").write_text("")
+    (hostdev / "serial" / "by-id" / "usb-Espressif-if00").symlink_to("../../ttyACM0")  # relative, as udev makes it
+    monkeypatch.setattr(list_ports, "comports", lambda *a, **k: [Info("/dev/ttyACM1", 1), Info("/dev/ttyACM0", ESPRESSIF_VID)])
+    assert link_mod.usb_vendor_id(str(hostdev / "serial" / "by-id" / "usb-Espressif-if00")) == ESPRESSIF_VID
+    # two listed ports with the same name cannot be told apart: no guess
+    monkeypatch.setattr(list_ports, "comports", lambda *a, **k: [Info("/dev/ttyACM0", 1), Info("/other/ttyACM0", ESPRESSIF_VID)])
+    assert link_mod.usb_vendor_id(str(hostdev / "ttyACM0")) is None
+
+
 def test_a_port_that_is_not_a_usb_device_has_no_vendor():
     with FakeCompanion() as fake:
         assert link_mod.usb_vendor_id(fake.path) is None  # a pty: auto then raises DTR

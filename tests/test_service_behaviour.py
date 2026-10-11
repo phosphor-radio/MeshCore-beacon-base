@@ -220,3 +220,22 @@ def test_a_failing_timedatectl_gets_the_same_hint_but_a_read_does_not(monkeypatc
     with pytest.raises(StoreError) as e:
         admin.run_timedatectl("show", "-p", "NTPSynchronized")
     assert "Pi's clock" not in str(e.value)  # reading the NTP state does not need the hint
+
+
+# --- beacon-ingest --check ------------------------------------------------------------------------------------------------
+
+
+def test_check_reports_what_is_missing_and_what_is_ready(tmp_path, capsys):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    assert service.main(["-c", str(cfg), "--check"]) == 2
+    assert "no companion serial port" in capsys.readouterr().err
+    cfg.write_text('[companion]\nport = "/dev/ttyACM0"\n')
+    assert service.main(["-c", str(cfg), "--check"]) == 2
+    assert "no report channel key" in capsys.readouterr().err
+    (tmp_path / "secrets.toml").write_text('[channel]\nkey = "000102030405060708090a0b0c0d0e0f"\n')
+    assert service.main(["-c", str(cfg), "--check"]) == 0
+    assert "configuration ok: companion /dev/ttyACM0" in capsys.readouterr().out
+    assert not (tmp_path / "beacon.db").exists()  # checking touches nothing
+    assert service.main(["-c", str(cfg), "--check", "--port", "/dev/other"]) == 0
+    assert "companion /dev/other" in capsys.readouterr().out

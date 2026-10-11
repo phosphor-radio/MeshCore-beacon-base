@@ -90,7 +90,7 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    (+ estimate.py api.py)
 web/               (+) static map UI (Leaflet)
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
-deploy/            config.example.toml        (+ systemd units, udev rule, install script)
+deploy/            config.example.toml; docker/ (Dockerfile, compose.yaml, entrypoint, beaconctl wrapper, build-bundle.sh, smoke-test.sh)
 ```
 
 `CompanionSession` takes a `Handler`; `service.PipelineHandler` plugs the pipeline in (`on_report` receives a

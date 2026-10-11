@@ -229,12 +229,22 @@ def run(cfg: Config, stop: threading.Event) -> None:
             handler.close()
 
 
+def check_configuration(cfg: Config) -> None:
+    """Raise ConfigError unless there is what beacon-ingest cannot start without. The container's entry point uses this to wait for the
+    operator, instead of crashing and being restarted in a loop."""
+    if not cfg.companion.port:
+        raise ConfigError("no companion serial port; set companion.port in the configuration (or pass --port)")
+    if cfg.channel_key is None:
+        raise ConfigError("no report channel key; run 'beaconctl channel generate' (or 'beaconctl channel set')")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="beacon-ingest", description="Ingest beacon reports from a companion into the database")
     p.add_argument("-c", "--config", help="config file (default: $BEACON_BASE_CONFIG or ~/.config/beacon-base/config.toml)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     p.add_argument("--port", help="companion serial port (overrides companion.port)")
     p.add_argument("--dtr", choices=DTR_MODES, help="DTR when opening the port (overrides companion.dtr; see docs/operations.md)")
+    p.add_argument("--check", action="store_true", help="only check that the configuration is complete enough to run (port and channel key), then exit")
     args = p.parse_args(argv)
     setup_logging(args.verbose)
     try:
@@ -242,6 +252,10 @@ def main(argv: list[str] | None = None) -> int:
         changes = {k: v for k, v in (("port", args.port), ("dtr", args.dtr)) if v}
         if changes:
             cfg = dataclasses.replace(cfg, companion=dataclasses.replace(cfg.companion, **changes))
+        if args.check:
+            check_configuration(cfg)
+            print(f"configuration ok: companion {cfg.companion.port}, database {cfg.db_path}")
+            return 0
         run(cfg, stop_on_signals())
     except (ConfigError, CompanionError, StoreError) as e:
         print(f"beacon-ingest: {e}", file=sys.stderr)

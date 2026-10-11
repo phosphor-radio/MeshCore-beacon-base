@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run beaconctl inside the beacon-base container:  ./beaconctl status,  ./beaconctl repeater remote north get all
+# If the container is not running it runs a throwaway one against the same ./data, so the database can still be read.
+cd "$(dirname "$0")" || exit 1
+tty=""
+[ -t 0 ] || tty="-T"
+if docker compose ps --status running --services 2>/dev/null | grep -qx ingest; then
+    exec docker compose exec $tty ingest beaconctl "$@"
+fi
+echo "beacon-base is not running; using a temporary container (docker compose up -d starts it)" >&2
+exec docker compose run --rm --no-deps $tty --entrypoint beaconctl ingest "$@"

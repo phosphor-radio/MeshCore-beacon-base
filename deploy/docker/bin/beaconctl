@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python -m beacon_base.cli "$@"
