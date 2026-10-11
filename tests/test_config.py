@@ -128,3 +128,42 @@ def test_the_remote_pacing_gap_defaults_to_three_seconds_and_can_be_changed_or_t
     assert load_config(write(tmp_path / "c.toml", "[remote]\nstep_gap_s = 5.5\n")).remote.step_gap_s == 5.5
     with pytest.raises(ConfigError, match="step_gap_s"):
         load_config(write(tmp_path / "d.toml", "[remote]\nstep_gap_s = -1\n"))
+
+
+def test_estimate_and_web_sections_have_defaults_and_validate(tmp_path):
+    cfg = load_config(write(tmp_path / "c.toml", ""))
+    assert (cfg.web.host, cfg.web.port, cfg.tiles_path, cfg.web_token) == ("127.0.0.1", 8080, None, None)
+    assert cfg.estimate.tx_power_dbm == 22.0
+    cfg = load_config(write(tmp_path / "c.toml", '[web]\nport = 9000\ntiles = "map.mbtiles"\n[estimate]\npath_loss_exponent = 3.0\n'))
+    assert cfg.web.port == 9000 and cfg.estimate.path_loss_exponent == 3.0
+    assert cfg.tiles_path == tmp_path / "map.mbtiles"  # relative to the config file
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[web]\nport = 0\n",
+        "[web]\nport = \"80\"\n",
+        "[web]\nhost = \"\"\n",
+        "[web]\nonline_tile_url = \"https://example.invalid/tiles.png\"\n",
+        "[web]\nbogus = 1\n",
+        "[estimate]\npath_loss_exponent = 0\n",
+        "[estimate]\nmin_radius_m = 100\nmax_radius_m = 50\n",
+        "[estimate]\ntx_power_dbm = \"loud\"\n",
+    ],
+)
+def test_bad_web_and_estimate_settings_are_refused(tmp_path, text):
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path / "c.toml", text))
+
+
+def test_web_token_comes_from_secrets_or_the_environment(tmp_path, monkeypatch):
+    p = write(tmp_path / "c.toml", "")
+    monkeypatch.delenv(config.WEB_TOKEN_ENV, raising=False)
+    write(tmp_path / "secrets.toml", '[web]\ntoken = "0123456789abcdefghij"\n')
+    assert load_config(p).web_token == "0123456789abcdefghij"
+    monkeypatch.setenv(config.WEB_TOKEN_ENV, "environment-token-wins")
+    assert load_config(p).web_token == "environment-token-wins"
+    monkeypatch.setenv(config.WEB_TOKEN_ENV, "short")
+    with pytest.raises(ConfigError, match="at least"):
+        load_config(p)

@@ -459,6 +459,22 @@ def cmd_rejects(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+# --- positions -----------------------------------------------------------------------------------------------------------
+
+
+def cmd_positions_rebuild(args: argparse.Namespace, cfg: Config) -> int:
+    """Estimate transmissions again: positions are worked out when a report arrives, so a repeater located afterwards (an advert, or
+    'repeater locate') does not change the ones already stored until this is run."""
+    from .estimate import Estimator
+    from .pipeline import Pipeline
+
+    since = None if args.hours is None else time.time() - args.hours * 3600
+    with _open(cfg) as store:
+        n = Pipeline(store, estimator=Estimator(cfg.estimate, cfg.radio.freq_khz)).rebuild_positions(since)
+    print(f"{n} transmission(s) now have a position")
+    return 0
+
+
 # --- auto-add ------------------------------------------------------------------------------------------------------------
 
 

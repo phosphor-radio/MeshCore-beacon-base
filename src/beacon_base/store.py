@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 from . import names as names_mod
-from . import remote, wire
+from . import estimate, remote, wire
 
 PUBKEY_LEN = 32
 
@@ -206,6 +206,22 @@ MIGRATIONS: list[tuple[str, ...]] = [
                   result, error_code, error FROM remote_jobs_v1""",
         "DROP TABLE remote_jobs_v1",
         "CREATE INDEX remote_jobs_state ON remote_jobs (state, id)",
+    ),
+    # 3: where each transmission was estimated to be (estimate.py), written by the pipeline when it takes an observation; two indexes for the web map
+    (
+        """CREATE TABLE positions (
+            transmission_id INTEGER PRIMARY KEY REFERENCES transmissions (id) ON DELETE CASCADE,
+            beacon_prefix BLOB NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            radius_m REAL NOT NULL,
+            method TEXT NOT NULL CHECK (method IN ('range', 'centroid')),
+            n_repeaters INTEGER NOT NULL      -- located repeaters that heard it when this was computed
+        )""",
+        "CREATE INDEX positions_beacon ON positions (beacon_prefix, transmission_id)",
+        # the map asks for each beacon's latest transmission and each repeater's latest observation every few seconds
+        "CREATE INDEX transmissions_beacon_seen ON transmissions (beacon_prefix, last_seen)",
+        "CREATE INDEX observations_repeater ON observations (repeater_prefix, id)",
     ),
 ]
 
@@ -979,6 +995,27 @@ class Store:
         """Repeaters that have sent reports on the channel or been heard advertising but are not in the repeater table, newest
         first. `n` counts their reports (0 for one only heard advertising); name and position are from its advert."""
         return self._unknown_repeater_rows(self.conn, since)
+
+    # --- positions -----------------------------------------------------------------------------------------------------
+
+    def hearings(self, db: sqlite3.Connection, transmission_id: int) -> list[estimate.Hearing]:
+        """What the enabled, located repeaters heard of a transmission, for the estimator."""
+        rows = db.execute(
+            """SELECT r.lat, r.lon, o.rssi FROM observations o JOIN repeaters r ON r.prefix = o.repeater_prefix
+               WHERE o.transmission_id = ? AND o.status = 'accepted' AND r.enabled = 1""",
+            (transmission_id,),
+        ).fetchall()
+        return [estimate.Hearing(r["lat"], r["lon"], r["rssi"]) for r in rows if self.is_located(r["lat"], r["lon"])]
+
+    @staticmethod
+    def save_position(db: sqlite3.Connection, transmission_id: int, beacon_prefix: bytes, p: estimate.Position) -> None:
+        db.execute(
+            """INSERT INTO positions (transmission_id, beacon_prefix, lat, lon, radius_m, method, n_repeaters)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (transmission_id) DO UPDATE SET lat = excluded.lat, lon = excluded.lon, radius_m = excluded.radius_m,
+                                                           method = excluded.method, n_repeaters = excluded.n_repeaters""",
+            (transmission_id, bytes(beacon_prefix), p.lat, p.lon, p.radius_m, p.method, p.n_repeaters),
+        )
 
     def latest_transmission(self, prefix: bytes) -> sqlite3.Row | None:
         return self.conn.execute(

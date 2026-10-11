@@ -147,7 +147,7 @@ def test_migration_two_lets_a_database_from_before_it_keep_its_jobs(tmp_path):
     )
     conn.close()
     with Store.open(path) as s:
-        assert s.schema_version() == len(store_mod.MIGRATIONS) == 2
+        assert s.schema_version() == len(store_mod.MIGRATIONS)
         old = s.job(1)
         assert (old["kind"], old["op"], old["state"], json.loads(old["result"])) == ("name", "get", "done", {"values": {"name": "north"}})
         assert s.conn.execute("PRAGMA foreign_key_check").fetchall() == []

@@ -12,7 +12,7 @@ import sys
 import threading
 
 from . import __version__, admin, remote_cli
-from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
+from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key, store_web_token
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, ReceivedNames, ReceivedReport
 from .link import DTR_MODES, CompanionError
 from .names import sanitize_name
@@ -137,6 +137,22 @@ def cmd_channel_show(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_web_token_generate(args: argparse.Namespace, cfg: Config) -> int:
+    token = secrets.token_urlsafe(24)
+    path = store_web_token(cfg, token, force=args.force)
+    print(f"saved to {path} (mode 0600)")
+    print(f"web token: {token}")
+    print("beacon-web asks for it before the Reset button does anything; restart beacon-web to use it")
+    return 0
+
+
+def cmd_web_token_show(args: argparse.Namespace, cfg: Config) -> int:
+    if cfg.web_token is None:
+        raise ConfigError("no web token; run 'beaconctl web token generate'")
+    print(cfg.web_token)
+    return 0
+
+
 def cmd_listen(args: argparse.Namespace, cfg: Config) -> int:
     cfg = _with_port(cfg, args.port, args.dtr)
     stop = stop_on_signals()
@@ -202,6 +218,15 @@ def build_parser() -> argparse.ArgumentParser:
     setk.set_defaults(func=cmd_channel_set)
     show = channel.add_parser("show", help="print the channel key, for provisioning a repeater")
     show.set_defaults(func=cmd_channel_show)
+
+    web = sub.add_parser("web", help="beacon-web settings").add_subparsers(dest="web_command", required=True)
+    token = web.add_parser("token", help="the operator token beacon-web asks for before it resets a beacon").add_subparsers(
+        dest="token_command", required=True
+    )
+    gen = token.add_parser("generate", help="create a random token and store it in secrets.toml")
+    gen.add_argument("--force", action="store_true", help="replace an existing token")
+    gen.set_defaults(func=cmd_web_token_generate)
+    token.add_parser("show", help="print the token").set_defaults(func=cmd_web_token_show)
 
     listen = sub.add_parser("listen", help="print decoded reports live")
     listen.add_argument("--port", help="companion serial port (overrides companion.port)")
@@ -320,6 +345,11 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("--beacon", metavar="prefix", help="only this beacon (key prefix, six or more hex digits)")
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(func=admin.cmd_rejects)
+
+    positions = sub.add_parser("positions", help="estimated beacon positions").add_subparsers(dest="positions_command", required=True)
+    p = positions.add_parser("rebuild", help="estimate transmissions again with the repeaters' positions as they are now")
+    p.add_argument("--hours", type=float, help="only transmissions last seen within this many hours (default: all)")
+    p.set_defaults(func=admin.cmd_positions_rebuild)
 
     p = sub.add_parser("time", help="show the clock state; 'set' and 'confirm' fix it")
     p.set_defaults(func=admin.cmd_time)

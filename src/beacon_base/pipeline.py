@@ -12,7 +12,8 @@ applied or none of it, and re-running it on an unchanged database gives the same
    ``replay``. An equal counter is the current transmission and joins its group. A higher counter is a new transmission:
    accept and advance the mark.
 4. **Dedupe.** The same ``(repeater, beacon, counter)`` twice is stored as ``duplicate``.
-5. **Group.** Accepted observations of one ``(beacon, counter)`` form a transmission.
+5. **Group.** Accepted observations of one ``(beacon, counter)`` form a transmission. Each time one is added the placeholder
+   estimator (``estimate.py``) runs over what the located repeaters heard and the transmission's ``positions`` row is written.
 
 Reset (``Store.reset_beacon``) clears the mark and bumps the beacon's epoch. Dedupe and grouping are scoped to the epoch,
 so counters that legitimately restart after a reset are not mistaken for old ones.
@@ -25,7 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Protocol
 
-from . import clock, names, store, wire
+from . import clock, estimate, names, store, wire
 from .ingest import ReceivedNames, ReceivedReport
 from .store import (
     ACCEPTED, AUTOADD_BEACONS, AUTOADD_REPEATERS, DISABLED, DUPLICATE, REPLAY, UNKNOWN_BEACON, UNKNOWN_REPEATER, Store,
@@ -72,8 +73,11 @@ class Verdict:
 
 
 class Pipeline:
-    def __init__(self, store: Store, assume_synced: bool = False, boot: str | None = None):
+    def __init__(
+        self, store: Store, assume_synced: bool = False, boot: str | None = None, estimator: estimate.Estimator | None = None
+    ):
         self._store = store
+        self._estimator = estimator or estimate.Estimator()
         self._assume_synced = assume_synced
         self._boot = boot or clock.boot_id()
 
@@ -211,7 +215,9 @@ class Pipeline:
                    WHERE prefix = ?""",
                 (o.counter, now, now, now, o.beacon_id),
             )
-            return record(ACCEPTED, transmission_id=tx_id)
+            verdict = record(ACCEPTED, transmission_id=tx_id)
+            self._locate(db, tx_id, o.beacon_id)
+            return verdict
 
         # counter == hwm: another report of the current transmission
         tx = db.execute(
@@ -243,4 +249,23 @@ class Pipeline:
             (now, o.batt_mv, tx_id, tx_id),
         )
         db.execute("UPDATE beacons SET last_accept_at = ?, rejects_since_accept = 0 WHERE prefix = ?", (now, o.beacon_id))
+        self._locate(db, tx_id, o.beacon_id)
         return verdict
+
+    def _locate(self, db: sqlite3.Connection, transmission_id: int, beacon_prefix: bytes) -> estimate.Position | None:
+        """(Re)estimate where a transmission was from what its located repeaters heard. A transmission nobody located heard gets no
+        position, and keeps none it had."""
+        position = self._estimator.estimate(self._store.hearings(db, transmission_id))
+        if position is not None:
+            self._store.save_position(db, transmission_id, beacon_prefix, position)
+        return position
+
+    def rebuild_positions(self, since: float | None = None) -> int:
+        """Estimate again every transmission since a time (all of them if None), with the repeaters' positions as they are now: for
+        positions that were missing or wrong because a repeater was located after its transmissions arrived. Returns how many
+        transmissions have a position afterwards."""
+        with self._store.transaction() as db:
+            rows = db.execute(
+                "SELECT id, beacon_prefix FROM transmissions WHERE last_seen >= ? ORDER BY id", (-1.0 if since is None else since,)
+            ).fetchall()
+            return sum(self._locate(db, r["id"], bytes(r["beacon_prefix"])) is not None for r in rows)
