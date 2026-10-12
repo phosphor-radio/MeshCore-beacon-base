@@ -94,6 +94,9 @@ port = 8080
 # Map tiles, from a raster MBTiles file (relative paths are relative to this file). With none the map is a plain grid with coordinates.
 # The Pi has no internet at the event, so tiles are made beforehand; see docs/web.md.
 tiles = ""
+# The credit shown in the map's corner for the tiles file (HTML). Empty uses the file's own `attribution` metadata. Tiles made from OpenStreetMap
+# data must credit it, e.g. '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' (docs/map-tiles.md).
+tiles_attribution = ""
 # DEVELOPMENT ONLY: a tile URL template used when there is no tiles file, for a machine that has internet. The page then sends a Referer
 # to the tile server and shows its attribution. OpenStreetMap's public server (https://tile.openstreetmap.org/{z}/{x}/{y}.png) has a
 # usage policy (https://operations.osmfoundation.org/policies/tiles/): interactive viewing only, no bulk downloads, no tile archives.

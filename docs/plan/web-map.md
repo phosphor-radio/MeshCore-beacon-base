@@ -71,5 +71,5 @@ The map follows a beacon being walked past repeaters with no internet: shown her
   at build time), or write the API on Starlette, which FastAPI is built on and which is pure Python (it also removes pydantic from a 512 MB
   Pi). Either is small; do it with B3.4, then add a `web` service to the compose file (publish `127.0.0.1:8080` unless the
   operator asks for the LAN) and run `tests/test_docker.py`. Not done here because the image cannot be built or run for the Pi from this machine.
-- **A tile builder** (`beaconctl tiles`), which was already in "Later" in [beacon-base.md](beacon-base.md).
+- **A tile builder** (`beaconctl tiles`), which was already in "Later" in [beacon-base.md](beacon-base.md). Until then, [../map-tiles.md](../map-tiles.md) describes making a file by hand from a Geofabrik extract (documented from the tools' own docs, not run), and `web.tiles_attribution` plus a log warning keep the OpenStreetMap credit on the map.
 - **Tuning the estimator** on a walk with the real hardware.

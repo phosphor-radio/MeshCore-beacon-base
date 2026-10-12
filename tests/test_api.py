@@ -238,6 +238,22 @@ def test_map_config_describes_the_tile_file(tile_client):
     assert m["bounds"] == [-76.0, 39.0, -74.0, 41.0]
 
 
+def test_the_configured_credit_replaces_or_fills_in_the_files_attribution(with_data, tmp_path, caplog):
+    covered = make_mbtiles(tmp_path / "a.mbtiles", [(0, 0, 0, PNG)], attribution="from the file")
+    bare = make_mbtiles(tmp_path / "b.mbtiles", [(0, 0, 0, PNG)])
+
+    def credit(path, **web):
+        cfg = dataclasses.replace(with_data, web=dataclasses.replace(with_data.web, tiles=str(path), **web))
+        with TestClient(app_from_config(cfg)) as c:
+            return c.get("/api/map").json()["attribution"]
+
+    assert credit(covered) == "from the file"
+    assert credit(covered, tiles_attribution="configured") == "configured"
+    assert credit(bare, tiles_attribution="configured") == "configured"
+    assert "no attribution" not in caplog.text
+    assert credit(bare) == "" and "no attribution in its metadata" in caplog.text  # nothing to show, and the operator is told
+
+
 def test_without_tiles_the_map_is_a_plain_grid(client):
     assert client.get("/api/map").json()["mode"] == "grid"
     assert client.get("/tiles/0/0/0").status_code == 404

@@ -57,6 +57,9 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
     policy = content_security_policy(online)
     # No referrer is sent from a map that loads nothing from other hosts; online tiles need one (see ONLINE_REFERRER_POLICY)
     referrer_policy = ONLINE_REFERRER_POLICY if online else "no-referrer"
+    if tiles is not None and not (cfg.web.tiles_attribution or tiles.info.attribution):
+        # Map data usually needs a credit (OpenStreetMap's licence, the ODbL, does): say so rather than show an uncredited map in silence
+        log.warning("the tiles file has no attribution in its metadata, so the map shows no credit; set web.tiles_attribution if one is required")
 
     @app.middleware("http")
     async def headers(request: Request, call_next):
@@ -153,7 +156,7 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
             info = tiles.info
             return {
                 "mode": "mbtiles", "url": "tiles/{z}/{x}/{y}", "min_zoom": info.min_zoom, "max_zoom": info.max_zoom,
-                "bounds": info.bounds, "attribution": info.attribution or "", "name": info.name,
+                "bounds": info.bounds, "attribution": cfg.web.tiles_attribution or info.attribution or "", "name": info.name,
             }
         if cfg.web.online_tile_url:
             return {"mode": "online", "url": cfg.web.online_tile_url, "min_zoom": 0, "max_zoom": 19, "bounds": None,

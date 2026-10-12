@@ -72,6 +72,7 @@ package. See [utilities/README.md](utilities/README.md).
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): base design, data model, pipeline, phases B0-B4.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh (a small fixed set of operations), the ingest heartbeat.
 - [docs/web.md](docs/web.md): the map and API: running `beacon-web`, reading the page, tiles with no internet, the API, safety notes.
+- [docs/map-tiles.md](docs/map-tiles.md): making an offline MBTiles map for your area from a Geofabrik OpenStreetMap extract, and the credit it needs.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
 - [docs/deployment.md](docs/deployment.md): running the base on a Raspberry Pi in Docker with no internet: building the bundle, first start, the event, troubleshooting.
 - [docs/operations.md](docs/operations.md): running on real hardware: the companion's USB serial (DTR) settings, managing repeaters, troubleshooting.
@@ -405,3 +406,11 @@ Later: location estimation, offline tile-cache builder, repeater timestamps, air
 ## License
 
 Not yet chosen. The firmware fork is MIT licensed.
+
+## Credits
+
+Map data is © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, available under the
+[Open Data Commons Open Database Licence (ODbL)](https://opendatacommons.org/licenses/odbl/1-0/). Regional extracts come from
+[Geofabrik](https://download.geofabrik.de/) ("Data processed by Geofabrik GmbH and created by OpenStreetMap Contributors"). The map page shows the
+credit in its corner and must keep doing so for any tiles made from that data ([docs/map-tiles.md](docs/map-tiles.md)). The map is drawn
+with [Leaflet](https://leafletjs.com/) (BSD 2-Clause, vendored in `src/beacon_base/static/vendor/leaflet/`).

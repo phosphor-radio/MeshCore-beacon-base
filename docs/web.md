@@ -64,11 +64,13 @@ vector `.pbf` tiles are refused). Set `web.tiles` to its path and restart `beaco
 Without a file the map is a plain grid labelled with coordinates, which is enough to see the repeaters and beacons in relation to each
 other. A file that is missing or unusable is logged and the map falls back to the grid, with the reason in the note under the lists.
 
-To make a file, render your area at the zoom levels you need on a machine with internet, for example with QGIS's *Generate XYZ tiles
-(MBTiles)* algorithm over a layer you may use, then copy it to the Pi. (Not tested here.) **Do not build one by downloading
+To make a file for your area from a regional OpenStreetMap extract (Geofabrik's Ontario file, say), see
+[map-tiles.md](map-tiles.md): which tools, the steps, and the credit that has to stay on the map. **Do not build one by downloading
 tiles from OpenStreetMap's servers:** their [tile usage policy](https://operations.osmfoundation.org/policies/tiles/) prohibits bulk
-downloading, pre-seeding areas and building tile archives such as `.mbtiles`. Use data you may render yourself, or a provider whose
-terms allow it. A builder for this (`beaconctl tiles`) is on the list in [plan/beacon-base.md](plan/beacon-base.md), not built.
+downloading, pre-seeding areas and building tile archives such as `.mbtiles`. Render your own from the data instead.
+
+The credit is the file's `attribution` metadata, shown in the map's corner; `web.tiles_attribution` overrides it, and the server logs a
+warning if there is neither.
 
 ### Online tiles (development only)
 
