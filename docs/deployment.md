@@ -65,7 +65,7 @@ configuration is complete (it looks every ten seconds), so there is nothing to r
    `/hostdev`; that is how a companion that is unplugged and plugged in again is found again without restarting anything.)
 3. **Make the channel key**: `./beaconctl channel generate` (or `./beaconctl channel set <key>` to use a key the repeaters already have). It is
    written to `data/secrets.toml` (mode 600). `./beaconctl channel show` prints it again when you need it for a repeater.
-4. **Set the Pi's clock.** The Pi has no internet and no battery clock, so it starts with the time of its last shutdown. On the Pi (not in the
+4. **Set the Pi's clock.** The Pi has no internet and no battery clock. After a clean reboot it keeps the time, but after a power cut it carries on from where it stopped, so it is behind by the length of the outage. On the Pi (not in the
    container):
 
    ```bash
@@ -125,7 +125,7 @@ The database grows by about 9 MB a day at 30 beacons and 10 repeaters, a few ten
   different port the `by-id` name stays the same; a different *board* has a different name and key (change `port`; the repeaters will want the admin password
   again for remote management, as the base's key changed).
 - **The Pi reboots or the power is cut**: Docker starts the container again at boot, and ingest takes up where it was. The database survives an unclean
-  stop (a cut can lose the last few seconds of reports). The clock does not: set it again (step 3.4) and check with `./beaconctl time`.
+  stop (a cut can lose the last few seconds of reports). The clock survives a reboot, but after a power cut it is behind by the outage (observed on the Pi Zero 2 W): set it again (step 3.4) and check with `./beaconctl time`. Until then new observations carry provisional times and remote repeater commands are refused (`clock_untrusted`); both are corrected or allowed once the clock is set.
 - **`beacon-ingest` crashes or hangs**: Docker restarts it; a hang is detected after two minutes with no progress and the process exits so Docker
   restarts it. `docker compose ps` shows the restart count; `docker compose logs` shows why.
 - **To stop cleanly** at the end: `docker compose down`, then `sudo shutdown now`.

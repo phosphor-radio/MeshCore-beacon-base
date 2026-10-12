@@ -1,6 +1,6 @@
 # Service Hardening and Packaging Plan (B3)
 
-Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run) remains.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run) is under way: the first four steps passed, the one-day run is pending.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
 long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
 Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
 remote repeater work ([repeater-remote.md](repeater-remote.md)).
@@ -138,6 +138,15 @@ unplug/replug, reboot and power loss, a new event (keep config and key, new data
 checks that the documents' relative links resolve, that the files and commands the guide names exist, and that its `./beaconctl` examples parse.
 
 **B3.4 Pi run.** The manual acceptance test above. Done when the criterion at the top holds.
+
+*Results so far (2026-10-11, on the Pi Zero 2 W):*
+
+- Loading the bundle's image, the smoke test, `docker compose up -d` with the real companion, and unplugging and replugging the companion all worked.
+- **Reboot:** the container came back by itself and the clock was kept.
+- **Power cut:** the container came back by itself; the clock carried on from where it stopped, so it was behind by the length of the outage. That was
+  expected (no RTC, no internet) and is the case the guide already tells the operator to handle by setting the clock again. The guide now says plainly
+  which of the two (reboot or power cut) keeps the time, and what is refused or provisional until it is set.
+- **Pending:** one day of running, then memory use (`docker stats`), the size of `./data`, restart counts and whether anything went `unhealthy` unexplained.
 
 ## Review questions: answers (2026-10-10)
 
