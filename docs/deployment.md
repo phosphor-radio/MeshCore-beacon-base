@@ -161,7 +161,8 @@ starts; a database from a newer version is refused rather than damaged.
 | Reports stop and `status` shows beacons `silent` | Is `companion: connected`? Are the repeaters on and on the right channel (`./beaconctl rejects`; `./beaconctl check`)? |
 | A beacon shows `rejected` | See the README "When a beacon is locked out": usually `./beaconctl beacon reset <prefix>`. |
 | The container keeps restarting | `docker compose logs --tail 100`. The exit code 70 means the watchdog fired (no progress for two minutes); anything else is in the log. |
-| The Pi is slow or runs out of memory | A Pi Zero 2 W has 512 MB; the container is limited to 256 MB. `docker stats --no-stream`. Do not run other things on the Pi. |
+| `docker stats` shows memory as `0B / 0B` | Raspberry Pi OS has the kernel's memory cgroup off, so Docker can neither show nor limit the container's memory (the 256 MB limit in `compose.yaml` is then not applied; the base itself is small). To see the process's size anyway: `ps -eo rss,args \| grep beacon_base.service` (RSS in kB) and `free -m`. To turn the cgroup on, add `cgroup_enable=memory cgroup_memory=1` to the one line in `/boot/firmware/cmdline.txt` (remove `cgroup_disable=memory` if present) and reboot; not needed for the base to work. |
+| The Pi is slow or runs out of memory | A Pi Zero 2 W has 512 MB. `free -m`, and the `ps` line above. Do not run other things on the Pi. |
 | `./beaconctl time set` fails | It cannot set the host's clock from inside the container: use `sudo timedatectl set-time` on the Pi, then `./beaconctl time confirm`. |
 
 If `docker compose ps` is empty after a reboot, Docker is not starting at boot (`sudo systemctl enable --now docker`) or the stack was stopped
