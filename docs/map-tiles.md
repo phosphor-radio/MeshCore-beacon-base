@@ -194,6 +194,11 @@ coverages:
 mapproxy-seed -f mapproxy.yaml -s seed.yaml -c 2     # -n for a dry run, --summary to list the tasks
 ```
 
+> **MapProxy numbers the rows of its MBTiles cache from the north (XYZ), not from the south as the MBTiles specification says.** It
+> stores each tile under its grid's own row, and `GLOBAL_WEBMERCATOR` counts from the north-west corner. A file seeded this way is correct
+> for MapProxy and wrong for anything that follows the specification: read the usual way it shows no tiles at all (every request is a
+> 404). `beacon-web` notices this by itself where it can (see step 7), and step 6 converts the file so that nothing has to.
+
 `-c` is the number of concurrent workers; match it to the server's `THREADS` (4 by default). If the run is interrupted, use
 `--progress-file` and `--continue` to resume. It walks the pyramid depth first, skipping tiles outside the coverage.
 
@@ -201,34 +206,76 @@ mapproxy-seed -f mapproxy.yaml -s seed.yaml -c 2     # -n for a dry run, --summa
 > converts them to MBTiles (a write-up of that route: [Creating self-hosted tile maps from OpenStreetMap data](https://terinstock.com/post/2023/06/Creating-Self-Hosted-Tile-Maps-from-OpenStreetMap-Data/)).
 > It means compiling `meta2tile`; the seed route above does not.
 
-### 6. Write the metadata, the credit above all
+### 6. Check the file, number its rows properly, write the metadata
 
-Seeding may leave the `metadata` table empty or missing. Fill it in (the bounds are the box you cut; the attribution is what appears
-on the map):
+First ask what you have (it compares the file with where your located repeaters are, so add the repeaters first):
+
+```bash
+beaconctl tiles check area.mbtiles
+```
+
+It lists the zoom levels with their tile counts and sizes, shows the metadata, and says how the rows are numbered. For a MapProxy file it
+reports `with the rows read as TMS 0 have a tile, as XYZ 3` or similar. Then fix what it reports:
+
+**Rows.** If the rows are numbered from the north (XYZ), renumber them from the south. This writes a new table, so keep a copy of the file
+until you have looked at the result:
 
 ```python
+import sqlite3
+import sys
+
+db = sqlite3.connect("area.mbtiles")
+db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
+if db.execute("SELECT 1 FROM metadata WHERE name = 'scheme' AND value = 'tms'").fetchone():
+    sys.exit("already numbered from the south: nothing to do")
+db.executescript("""
+CREATE TABLE tiles_tms AS
+    SELECT zoom_level, tile_column, ((1 << zoom_level) - 1 - tile_row) AS tile_row, tile_data FROM tiles;
+DROP TABLE tiles;
+ALTER TABLE tiles_tms RENAME TO tiles;
+CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
+INSERT INTO metadata VALUES ('scheme', 'tms');
+""")
+db.execute("VACUUM")
+```
+
+(Doing it twice would undo it: the script records `scheme = tms` in the metadata and refuses a second time.)
+
+**Metadata.** Seeding leaves the `metadata` table empty or missing. Fill it in. The zoom range and the bounds are read from the tiles (run
+it after the rows are numbered from the south), and the attribution is what appears on the map:
+
+```python
+import math
 import sqlite3
 
 db = sqlite3.connect("area.mbtiles")
 db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
+low, high = db.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles").fetchone()
+n = 1 << high
+x0, x1, r0, r1 = db.execute(
+    "SELECT min(tile_column), max(tile_column), min(tile_row), max(tile_row) FROM tiles WHERE zoom_level = ?", (high,)
+).fetchone()
+lon = lambda x: x / n * 360 - 180
+lat = lambda y: math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))   # y counted from the north
+bounds = f"{lon(x0):.5f},{lat(n - r0):.5f},{lon(x1 + 1):.5f},{lat(n - 1 - r1):.5f}"   # west, south, east, north
 rows = {
     "name": "Event area",
     "format": "png",
-    "minzoom": "12",
-    "maxzoom": "17",
-    "bounds": "-75.7256,45.4020,-75.6744,45.4380",
+    "minzoom": str(low),
+    "maxzoom": str(high),
+    "bounds": bounds,
     "attribution": '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     "description": "Rendered from OpenStreetMap data (ODbL) with the OpenStreetMap Carto style. Data processed by Geofabrik GmbH.",
 }
 db.execute(f"DELETE FROM metadata WHERE name IN ({','.join('?' * len(rows))})", list(rows))
 db.executemany("INSERT INTO metadata VALUES (?, ?)", rows.items())
 db.commit()
+print(bounds)
 print(db.execute("SELECT zoom_level, count(*), round(sum(length(tile_data)) / 1048576.0, 1) FROM tiles GROUP BY 1 ORDER BY 1").fetchall())
 ```
 
-The last line prints a row per zoom level: the level, how many tiles and their size in MB. It should match your count from step 1; a
-level with far fewer tiles means the seed did not finish. MBTiles stores rows from the south (TMS) while the web asks from the north;
-`beacon-web` converts, and MapProxy writes the standard layout, so nothing to do there.
+It prints the bounds and then a row per zoom level: the level, how many tiles and their size in MB. It should match your count from step 1; a level
+with far fewer tiles means the seed did not finish. Run `beaconctl tiles check area.mbtiles` again: it should end with `ok`.
 
 ### 7. Use it
 
@@ -239,8 +286,13 @@ Copy `area.mbtiles` next to the base's configuration and set it:
 tiles = "area.mbtiles"      # relative to the config file's directory
 ```
 
+If the file is not numbered as the specification says (a MapProxy file that was not converted, or one from another tool that does the same),
+`beacon-web` reads the rows the right way round by itself when it can tell from where your located repeaters are, and logs a warning
+saying so; `web.tiles_scheme = "xyz"` states it outright, and `"tms"` does the opposite. A file that follows the specification needs
+nothing.
+
 Restart `beacon-web`, open the map, and check that: the tiles are drawn, with no 403s or blank squares; the credit is in the bottom-right
-corner; and zooming to the lowest and highest levels still shows tiles. A log line says what was opened (`map tiles from ... (zoom 12-17)`),
+corner; and zooming to the lowest and highest levels still shows tiles. A log line says what was opened (`map tiles from ... (zoom 12-17, rows read as tms: ...)`),
 or why not. Unplug the network for the real test.
 
 ### 8. Clean up
@@ -276,13 +328,14 @@ the project.
 
 | Symptom | Likely cause |
 |---|---|
+| Every tile is a 404 (the map is blank, the log shows `GET /tiles/...` returning 404) | The rows are numbered from the north, which is how MapProxy writes them. Run `beaconctl tiles check area.mbtiles`; step 6 converts the file. |
 | `beacon-web` says the file is "not an MBTiles file" | No `metadata` or `tiles` table: do step 6; check that seeding wrote to `area.mbtiles` and not another file. |
 | The map is a grid, with a note about vector tiles | The file's `format` is `pbf`: it came from planetiler or tilemaker directly. Render rasters from it (route B). |
 | Tiles missing at one zoom level | The seed stopped early, or its levels did not cover that zoom: compare step 6's count with step 1's. |
 | Blank or half-drawn tiles at the edge of the area | The extract was cut too tight: cut a larger box, import again. |
 | Import fails with memory or shared-memory errors | `OSM2PGSQL_EXTRA_ARGS="-C 4096"` on `import`; `--shm-size` on `run`. |
 | Tiles are slow to appear while seeding | They are rendered on first request. Wait, or lower `-c`. |
-| No credit on the map | The file's metadata has no `attribution` and `web.tiles_attribution` is empty (step 6). |
+| No credit on the map | The file's metadata has no `attribution` and `web.tiles_attribution` is empty (step 6). `beaconctl tiles check` says so. |
 
 ## Sources
 

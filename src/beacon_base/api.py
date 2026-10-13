@@ -182,6 +182,16 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
     return app
 
 
+def located_points(cfg: Config) -> list[tuple[float, float]]:
+    """Where the base's enabled repeaters are, to check a tiles file against. Nothing when the database cannot be read: that is not a
+    reason for the map not to start."""
+    try:
+        with Store.open(cfg.db_path) as store:
+            return [(r["lat"], r["lon"]) for r in store.located_repeaters()]
+    except (sqlite3.Error, StoreError, OSError):
+        return []
+
+
 def app_from_config(cfg: Config) -> FastAPI:
-    tiles, problem = open_tiles(cfg.tiles_path)
+    tiles, problem = open_tiles(cfg.tiles_path, cfg.web.tiles_scheme, located_points(cfg) if cfg.tiles_path else None)
     return create_app(cfg, tiles, problem)

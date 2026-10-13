@@ -69,6 +69,11 @@ To make a file for your area from a regional OpenStreetMap extract (Geofabrik's 
 tiles from OpenStreetMap's servers:** their [tile usage policy](https://operations.osmfoundation.org/policies/tiles/) prohibits bulk
 downloading, pre-seeding areas and building tile archives such as `.mbtiles`. Render your own from the data instead.
 
+`beaconctl tiles check [file]` says what a file holds (zoom levels with counts and sizes, metadata) and whether the map will show it
+where your repeaters are. In particular, MBTiles specifies rows counted from the south while some tools (MapProxy among them) write them from
+the north, and such a file shows no tiles at all. `web.tiles_scheme` (`auto`, `tms`, `xyz`) says which; `auto` reads the file's `scheme`
+metadata, else tries both against the located repeaters and logs a warning if it had to read the file as XYZ.
+
 The credit is the file's `attribution` metadata, shown in the map's corner; `web.tiles_attribution` overrides it, and the server logs a
 warning if there is neither.
 

@@ -99,6 +99,7 @@ class WebConfig:
     host: str = "127.0.0.1"  # serving the LAN is an explicit choice; the operator token then travels in clear over HTTP
     port: int = 8080
     tiles: str = ""  # a raster MBTiles file; a relative path is relative to the config file's directory. Empty: a plain grid
+    tiles_scheme: str = "auto"  # how the tiles file numbers its rows: "tms" (the MBTiles specification), "xyz", or "auto" (see tiles.py)
     tiles_attribution: str = ""  # credit shown with the tiles file (HTML); empty uses the file's own `attribution` metadata
     online_tile_attribution: str = ""  # credit shown with online tiles (HTML); empty is OpenStreetMap's for its own servers, else none
     online_tile_url: str = ""  # development only: a {z}/{x}/{y} URL template used when there is no tiles file. Never set it in the field
@@ -225,6 +226,8 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         raise ConfigError("estimate: path_loss_exponent must be positive and min_radius_m positive and at most max_radius_m")
     if not isinstance(web.host, str) or not web.host or isinstance(web.port, bool) or not isinstance(web.port, int) or not 1 <= web.port <= 65535:
         raise ConfigError("web.host must be an address and web.port a port number (1-65535)")
+    if web.tiles_scheme not in ("auto", "tms", "xyz"):
+        raise ConfigError(f"web.tiles_scheme must be \"auto\", \"tms\" or \"xyz\", not {web.tiles_scheme!r}")
     if not all(isinstance(v, str) for v in (web.tiles, web.tiles_attribution, web.online_tile_url, web.online_tile_attribution)):
         raise ConfigError("web.tiles, web.tiles_attribution, web.online_tile_url and web.online_tile_attribution must be strings")
     if web.online_tile_url and not all(part in web.online_tile_url for part in ("{z}", "{x}", "{y}")):

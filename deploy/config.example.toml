@@ -94,6 +94,10 @@ port = 8080
 # Map tiles, from a raster MBTiles file (relative paths are relative to this file). With none the map is a plain grid with coordinates.
 # The Pi has no internet at the event, so tiles are made beforehand; see docs/web.md.
 tiles = ""
+# How the tiles file numbers its rows: "tms" (the MBTiles specification: from the south), "xyz" (from the north: what MapProxy writes), or
+# "auto": the file's own `scheme` metadata if it has one, else whichever makes the file show tiles under the located repeaters, else "tms".
+# 'beaconctl tiles check' says what a file does. A file that shows no tiles at all is usually this.
+tiles_scheme = "auto"
 # The credit shown in the map's corner for the tiles file (HTML). Empty uses the file's own `attribution` metadata. Tiles made from OpenStreetMap
 # data must credit it, e.g. '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' (docs/map-tiles.md).
 tiles_attribution = ""

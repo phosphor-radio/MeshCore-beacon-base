@@ -352,6 +352,12 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(func=admin.cmd_rejects)
 
+    tiles = sub.add_parser("tiles", help="map tiles file").add_subparsers(dest="tiles_command", required=True)
+    p = tiles.add_parser("check", help="what a tiles file holds, and whether the map will show it where the repeaters are")
+    p.add_argument("file", nargs="?", help="an MBTiles file (default: web.tiles)")
+    p.add_argument("--scheme", choices=("auto", "tms", "xyz"), help="read the rows this way (default: web.tiles_scheme)")
+    p.set_defaults(func=admin.cmd_tiles_check)
+
     positions = sub.add_parser("positions", help="estimated beacon positions").add_subparsers(dest="positions_command", required=True)
     p = positions.add_parser("rebuild", help="estimate transmissions again with the repeaters' positions as they are now")
     p.add_argument("--hours", type=float, help="only transmissions last seen within this many hours (default: all)")

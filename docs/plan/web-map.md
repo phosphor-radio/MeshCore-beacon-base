@@ -59,6 +59,12 @@ The map follows a beacon being walked past repeaters with no internet: shown her
   bans a Referrer-Policy that strips it; the server sent `no-referrer` on every response, and the page showed no attribution (also required).
   Online mode now sends `strict-origin-when-cross-origin` (header and tile layer) and credits OpenStreetMap ([../web.md](../web.md)). The tests
   check the headers; the OSM server itself is not exercised by any test.
+- **A tiles file made by the guide showed no tiles at all (every `/tiles` request a 404).** MapProxy's MBTiles cache writes rows counted from the
+  north (XYZ), the specification says from the south (TMS), and the first version of the guide said MapProxy wrote the standard layout (not
+  checked: wrong). `tiles.py` now reads either scheme (`web.tiles_scheme`, the file's `scheme` metadata, or detection against the located
+  repeaters), the zoom range is what the tiles table holds (a metadata maximum above it had the page ask for levels that are not there),
+  `beaconctl tiles check` diagnoses a file, and the guide converts the rows and derives the metadata from the tiles. Checked on a copy of
+  the file that showed the fault.
 - **Leaflet fetches its default marker image as soon as a marker is added**, even if it is replaced a line later; the 404s are avoided by
   giving the marker its icon at creation.
 

@@ -475,6 +475,66 @@ def cmd_positions_rebuild(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+# --- tiles ---------------------------------------------------------------------------------------------------------------
+
+
+def cmd_tiles_check(args: argparse.Namespace, cfg: Config) -> int:
+    """Say what is in a tiles file and whether beacon-web will show it where the repeaters are: the zoom levels, the metadata, how the rows
+    are numbered. Exit status 1 when it will not show them."""
+    from . import tiles as tiles_mod
+
+    path = args.file or cfg.tiles_path
+    if not path:
+        raise StoreError("no tiles file: give one, or set web.tiles in the configuration")
+    try:
+        mb = tiles_mod.MBTiles(path, args.scheme or cfg.web.tiles_scheme)
+    except tiles_mod.TilesError as e:
+        print(f"problem: {e}")
+        return 1
+    with _open(cfg) as store:
+        points = [(r["lat"], r["lon"]) for r in store.located_repeaters()]
+    problems: list[str] = []
+    print(f"file          {mb.path}")
+    with mb._lock:
+        levels = mb._conn.execute(
+            "SELECT zoom_level, count(*), round(sum(length(tile_data)) / 1048576.0, 1) FROM tiles GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+    print("zoom levels   " + (", ".join(f"{z}: {n} tiles ({mb_size} MB)" for z, n, mb_size in levels) if levels else "none"))
+    if not levels:
+        problems.append("the file has no tiles")
+    meta = mb.metadata
+    print(f"metadata      {', '.join(f'{k}={str(v)[:40]!r}' for k, v in sorted(meta.items())) if meta else 'none'}")
+    if not meta:
+        problems.append("no metadata: the map has no credit and no declared zoom range (docs/map-tiles.md, step 6)")
+    elif not (cfg.web.tiles_attribution or meta.get("attribution")):
+        problems.append("no attribution in the metadata and web.tiles_attribution is empty: the map shows no credit")
+    declared = (meta.get("minzoom"), meta.get("maxzoom"))
+    if all(declared) and levels and (int(declared[0]), int(declared[1])) != (levels[0][0], levels[-1][0]):
+        problems.append(f"the metadata says zoom {declared[0]}-{declared[1]} but the tiles are zoom {levels[0][0]}-{levels[-1][0]}; the map uses the overlap")
+    print(f"map zoom      {mb.info.min_zoom}-{mb.info.max_zoom}")
+    counts = mb.resolve_scheme(points)
+    if not points:
+        print("repeaters     none is located, so the rows cannot be checked against them (beaconctl repeater list)")
+    else:
+        found, counts = tiles_mod.detect_scheme(mb, points)
+        print(f"repeaters     {len(points)} located; with the rows read as TMS {counts['tms']} have a tile, as XYZ {counts['xyz']}")
+    print(f"scheme        {mb.scheme} ({mb.scheme_source})")
+    if points:
+        if counts["tms"] == counts["xyz"] == 0:
+            problems.append("no tile lies under any repeater at any zoom level: the file is for another area")
+        elif found is None:
+            problems.append("the repeaters do not say how the rows are numbered")
+        elif found != mb.scheme:
+            problems.append(f"the rows are numbered as {found}, but the scheme is set to {mb.scheme}: nothing will show; use web.tiles_scheme = \"{found}\"")
+        elif mb.detected:
+            print(f"              this file is not as the MBTiles specification says; set web.tiles_scheme = \"{found}\" to say so, or convert it (docs/map-tiles.md)")
+    for p in problems:
+        print(f"problem: {p}")
+    if not problems:
+        print("ok")
+    return 1 if problems else 0
+
+
 # --- auto-add ------------------------------------------------------------------------------------------------------------
 
 
