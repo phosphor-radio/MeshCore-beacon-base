@@ -6,9 +6,9 @@ import sqlite3
 
 import pytest
 
-pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
-from fastapi.testclient import TestClient  # noqa: E402
+pytest.importorskip("starlette")
+pytest.importorskip("httpx2")
+from starlette.testclient import TestClient  # noqa: E402
 
 from beacon_base.api import app_from_config  # noqa: E402
 from beacon_base.cli import main  # noqa: E402

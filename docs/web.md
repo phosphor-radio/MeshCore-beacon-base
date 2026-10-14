@@ -7,7 +7,7 @@ can be stopped, restarted or left off without losing a report. The design is in 
 ## Running it
 
 ```bash
-pip install -e '.[web]'        # FastAPI and uvicorn; the '.[dev]' extra includes them
+pip install -e '.[web]'        # Starlette and uvicorn; the '.[dev]' extra includes them
 beaconctl web token generate   # once: the token the Reset button asks for (saved in secrets.toml, mode 0600)
 beacon-web                     # http://127.0.0.1:8080/
 ```
@@ -22,7 +22,8 @@ Options: `-c <config>`, `--host`, `--port`, `-v` (a log line per request). The `
   The token can also be given in `$BEACON_WEB_TOKEN` (at least 16 characters), which wins over `secrets.toml`.
 - It does not need `beacon-ingest` to be running: it says so in a banner and shows what was stored.
 
-The Docker image and compose file of the Pi deployment do not run `beacon-web` yet; see "Not done yet" below.
+In the Pi's Docker deployment it is the compose file's second service, `web`, on port 8080 ([deployment.md](deployment.md), step 3.6): it publishes on every
+interface by default, and the token is made with `./beaconctl web token generate` followed by `docker compose restart web`.
 
 ## Reading the page
 
@@ -127,7 +128,6 @@ reference, which `beaconctl` accepts, is a 404 here). Every response carries `no
 | `/api/rejects?beacon={prefix}&limit=50` | Recent observations that were not accepted, with the reason (as `beaconctl rejects`). |
 | `POST /api/beacons/{prefix}/reset` | **Needs `Authorization: Bearer <token>`.** Clears the high-water mark; returns what was cleared. 403 when no token is configured, 401 for a wrong one. |
 | `/api/map` | How to draw the background (`mbtiles`, `online` or `grid`). |
-| `/api/openapi.json` | The schema FastAPI generates (the interactive `/docs` page is off: it would load its scripts from the internet). |
 
 ## Safety notes
 
@@ -140,9 +140,5 @@ reference, which `beaconctl` accepts, is a 404 here). Every response carries `no
 
 ## Not done yet
 
-- **The Docker image and compose file do not include `beacon-web`.** The image installs the dependencies in a stage that runs on the
-  build machine and copies them for the target CPU, which only works for pure-Python packages
-  ([plan/service-packaging.md](plan/service-packaging.md), decision 4). FastAPI needs pydantic, which has compiled wheels, so the
-  Dockerfile must install the web extra for the target platform (or the API be moved to Starlette, which is pure Python). To be done
-  with the Pi run (B3.4), when the Pi's CPU architecture is known.
-- A tile builder, and a walk test of the placeholder estimator on the hardware.
+- A tile builder (`beaconctl tiles` makes no tiles itself: [map-tiles.md](map-tiles.md) describes the tools), and a walk test of the placeholder
+  estimator on the hardware.

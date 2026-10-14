@@ -257,6 +257,10 @@ If the file is not numbered as the specification says (a MapProxy file that was 
 saying so; `web.tiles_scheme = "xyz"` states it outright, and `"tms"` does the opposite. A file that follows the specification needs
 nothing.
 
+In the Pi's Docker deployment the file goes into `data/` and the path is relative to the configuration, which the container sees as `/data`, so
+`tiles = "area.mbtiles"` finds `data/area.mbtiles`; run the commands of step 6 with the container's path (`./beaconctl tiles write-metadata
+/data/area.mbtiles`) and `docker compose restart web` ([deployment.md](deployment.md), step 3.6).
+
 Restart `beacon-web`, open the map, and check that: the tiles are drawn, with no 403s or blank squares; the credit is in the bottom-right
 corner; and zooming to the lowest and highest levels still shows tiles. A log line says what was opened (`map tiles from ... (zoom 12-17, rows read as tms: ...)`),
 or why not. Unplug the network for the real test.

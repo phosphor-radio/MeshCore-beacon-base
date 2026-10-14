@@ -1,24 +1,32 @@
 """The beacon-web HTTP application: a read API over the store, the map page, tiles, and the one operator action (reset).
 
-Thin on purpose: the data comes from ``views``. Each request opens its own connection to the database (cheap, and a connection
-must not be shared between the threads FastAPI runs requests on); beacon-web never needs ingest to be running. See
-docs/plan/web-map.md.
+Plain Starlette (pure Python, so the Docker image can copy it to another CPU; docs/plan/web-docker.md). Thin on purpose: the data comes
+from ``views``. Handlers are ordinary functions, which Starlette runs on a thread pool, and each opens its own connection to the database
+(cheap, and a connection must not be shared between threads); beacon-web never needs ingest to be running. See docs/plan/web-map.md.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import math
 import sqlite3
 import time
+from functools import wraps
 from importlib import resources
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
-from typing import Iterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from starlette.applications import Starlette
+from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import views
 from .config import Config
@@ -49,9 +57,55 @@ def online_attribution(cfg: Config) -> str:
     return OSM_ATTRIBUTION if host == "openstreetmap.org" or host.endswith(".openstreetmap.org") else ""
 
 
-def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | None = None) -> FastAPI:
+class SecurityHeaders:
+    """Adds the page's security headers, and the cache rules for the API and the static files, to every response that lacks them.
+    Plain ASGI rather than BaseHTTPMiddleware, which would run each request through an extra task and stream."""
+
+    def __init__(self, app: ASGIApp, policy: str, referrer_policy: str):
+        self.app = app
+        self.fixed = {"Content-Security-Policy": policy, "X-Content-Type-Options": "nosniff", "Referrer-Policy": referrer_policy}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope["path"]
+
+        async def add_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in self.fixed.items():
+                    headers.setdefault(name, value)
+                if path.startswith("/api/"):
+                    headers.setdefault("Cache-Control", "no-store")
+                elif path.startswith("/static/"):
+                    headers.setdefault("Cache-Control", "no-cache")  # revalidate (cheap, by ETag), so an upgrade is seen at once
+            await send(message)
+
+        await self.app(scope, receive, add_headers)
+
+
+def query_number(request: Request, name: str, default: float, kind: type = int, low: float | None = None, high: float | None = None,
+                 low_inclusive: bool = True) -> float:
+    """A numeric query value within bounds, or the default when it is not given. A bad one is a 422 with a message, as the API always said."""
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    try:
+        value = kind(raw)
+    except ValueError:
+        raise HTTPException(422, f"{name} must be {'a whole number' if kind is int else 'a number'}") from None
+    if kind is float and not math.isfinite(value):
+        raise HTTPException(422, f"{name} must be a number")
+    if low is not None and (value < low if low_inclusive else value <= low):
+        raise HTTPException(422, f"{name} must be {'at least' if low_inclusive else 'more than'} {low:g}")
+    if high is not None and value > high:
+        raise HTTPException(422, f"{name} must be at most {high:g}")
+    return value
+
+
+def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | None = None) -> Starlette:
     """The application for a configuration. `tiles` is the opened tile file (see tiles.open_tiles), None for the plain grid."""
-    app = FastAPI(title="beacon-web", docs_url=None, redoc_url=None, openapi_url="/api/openapi.json")
     online = bool(cfg.web.online_tile_url) and tiles is None
     policy = content_security_policy(online)
     # No referrer is sent from a map that loads nothing from other hosts; online tiles need one (see ONLINE_REFERRER_POLICY)
@@ -60,111 +114,109 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
         # Map data usually needs a credit (OpenStreetMap's licence, the ODbL, does): say so rather than show an uncredited map in silence
         log.warning("the tiles file has no attribution in its metadata, so the map shows no credit; set web.tiles_attribution if one is required")
 
-    @app.middleware("http")
-    async def headers(request: Request, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("Content-Security-Policy", policy)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", referrer_policy)
-        if request.url.path.startswith("/api/"):
-            response.headers.setdefault("Cache-Control", "no-store")
-        elif request.url.path.startswith("/static/"):
-            response.headers.setdefault("Cache-Control", "no-cache")  # revalidate (cheap, by ETag), so an upgrade is seen at once
-        return response
+    def reading(handler: Callable[[Request, Store], Response]) -> Callable[[Request], Response]:
+        """A handler that gets its own connection to the database for the length of the request."""
 
-    @app.exception_handler(views.NotFound)
-    async def not_found(_: Request, e: views.NotFound):
-        return JSONResponse({"detail": str(e)}, status_code=404)
+        @wraps(handler)
+        def wrapper(request: Request) -> Response:
+            with Store.open(cfg.db_path) as store:
+                return handler(request, store)
 
-    @app.exception_handler(StoreError)
-    async def store_error(_: Request, e: StoreError):
-        return JSONResponse({"detail": str(e)}, status_code=400)
+        return wrapper
 
-    @app.exception_handler(sqlite3.OperationalError)
-    async def busy(_: Request, e: sqlite3.OperationalError):
-        log.warning("database error: %s", e)
-        return JSONResponse({"detail": "the database is busy; try again"}, status_code=503)
-
-    def get_store() -> Iterator[Store]:
-        store = Store.open(cfg.db_path)
-        try:
-            yield store
-        finally:
-            store.close()
-
-    def require_operator(authorization: str | None = Header(default=None)) -> None:
+    def require_operator(request: Request) -> None:
         token = cfg.web_token
         if token is None:
             raise HTTPException(403, "operator actions are off: no web token is configured (beaconctl web token generate)")
+        authorization = request.headers.get("authorization")
         given = authorization[7:].strip() if authorization and authorization[:7].lower() == "bearer " else ""
         if not hmac.compare_digest(given.encode(), token.encode()):
             raise HTTPException(401, "wrong or missing operator token", headers={"WWW-Authenticate": "Bearer"})
 
+    # --- errors: every one is {"detail": ...} -----------------------------------------------------------------------------
+
+    def http_error(_: Request, e: HTTPException) -> Response:
+        return JSONResponse({"detail": e.detail}, status_code=e.status_code, headers=getattr(e, "headers", None))
+
+    def not_found(_: Request, e: views.NotFound) -> Response:
+        return JSONResponse({"detail": str(e)}, status_code=404)
+
+    def store_error(_: Request, e: StoreError) -> Response:
+        return JSONResponse({"detail": str(e)}, status_code=400)
+
+    def busy(_: Request, e: sqlite3.OperationalError) -> Response:
+        log.warning("database error: %s", e)
+        return JSONResponse({"detail": "the database is busy; try again"}, status_code=503)
+
     # --- read API -------------------------------------------------------------------------------------------------------
 
-    @app.get("/api/health")
-    def api_health(store: Store = Depends(get_store)):
-        return views.health_view(store, cfg, time.time())
+    @reading
+    def api_health(request: Request, store: Store) -> Response:
+        return JSONResponse(views.health_view(store, cfg, time.time()))
 
-    @app.get("/api/state")
-    def api_state(store: Store = Depends(get_store)):
-        return views.state_view(store, cfg, time.time(), operator=cfg.web_token is not None)
+    @reading
+    def api_state(request: Request, store: Store) -> Response:
+        return JSONResponse(views.state_view(store, cfg, time.time(), operator=cfg.web_token is not None))
 
-    @app.get("/api/beacons")
-    def api_beacons(store: Store = Depends(get_store)):
+    @reading
+    def api_beacons(request: Request, store: Store) -> Response:
         now = time.time()
-        return {"now": now, "beacons": views.beacons_view(store, cfg, now)}
+        return JSONResponse({"now": now, "beacons": views.beacons_view(store, cfg, now)})
 
-    @app.get("/api/beacons/{prefix}")
-    def api_beacon(prefix: str, limit: int = Query(50, ge=1, le=500), store: Store = Depends(get_store)):
-        return views.beacon_view(store, cfg, prefix, time.time(), limit)
+    @reading
+    def api_beacon(request: Request, store: Store) -> Response:
+        limit = query_number(request, "limit", 50, int, 1, 500)
+        return JSONResponse(views.beacon_view(store, cfg, request.path_params["prefix"], time.time(), limit))
 
-    @app.get("/api/beacons/{prefix}/track")
-    def api_track(
-        prefix: str, hours: float = Query(6.0, gt=0, le=24 * 31), limit: int = Query(200, ge=1, le=2000), store: Store = Depends(get_store)
-    ):
-        return views.track_view(store, prefix, time.time(), hours, limit)
+    @reading
+    def api_track(request: Request, store: Store) -> Response:
+        hours = query_number(request, "hours", 6.0, float, 0, 24 * 31, low_inclusive=False)
+        limit = query_number(request, "limit", 200, int, 1, 2000)
+        return JSONResponse(views.track_view(store, request.path_params["prefix"], time.time(), hours, limit))
 
-    @app.get("/api/transmissions/{transmission_id}")
-    def api_transmission(transmission_id: int, store: Store = Depends(get_store)):
-        return views.transmission_view(store, transmission_id, time.time())
+    @reading
+    def api_transmission(request: Request, store: Store) -> Response:
+        return JSONResponse(views.transmission_view(store, request.path_params["transmission_id"], time.time()))
 
-    @app.get("/api/repeaters")
-    def api_repeaters(store: Store = Depends(get_store)):
+    @reading
+    def api_repeaters(request: Request, store: Store) -> Response:
         now = time.time()
-        return {"now": now, "repeaters": views.repeaters_view(store, now)}
+        return JSONResponse({"now": now, "repeaters": views.repeaters_view(store, now)})
 
-    @app.get("/api/rejects")
-    def api_rejects(beacon: str | None = None, limit: int = Query(50, ge=1, le=500), store: Store = Depends(get_store)):
-        return views.rejects_view(store, time.time(), beacon, limit)
+    @reading
+    def api_rejects(request: Request, store: Store) -> Response:
+        limit = query_number(request, "limit", 50, int, 1, 500)
+        return JSONResponse(views.rejects_view(store, time.time(), request.query_params.get("beacon"), limit))
 
     # --- operator action ------------------------------------------------------------------------------------------------
 
-    @app.post("/api/beacons/{prefix}/reset", dependencies=[Depends(require_operator)])
-    def api_reset(prefix: str, store: Store = Depends(get_store)):
-        result = views.reset_beacon(store, prefix)
+    def api_reset(request: Request) -> Response:
+        require_operator(request)  # before the database is opened, so a wrong token costs nothing
+        with Store.open(cfg.db_path) as store:
+            result = views.reset_beacon(store, request.path_params["prefix"])
         log.info("operator reset beacon %s (was high-water mark %s)", result["label"], result["old_hwm"])
-        return result
+        return JSONResponse(result)
 
     # --- map ------------------------------------------------------------------------------------------------------------
 
-    @app.get("/api/map")
-    def api_map():
+    def api_map(request: Request) -> Response:
         """How the page should draw its background: local tiles, a development URL, or the plain grid."""
         if tiles is not None:
             info = tiles.info
-            return {
+            return JSONResponse({
                 "mode": "mbtiles", "url": "tiles/{z}/{x}/{y}", "min_zoom": info.min_zoom, "max_zoom": info.max_zoom,
                 "bounds": info.bounds, "attribution": cfg.web.tiles_attribution or info.attribution or "", "name": info.name,
-            }
+            })
         if cfg.web.online_tile_url:
-            return {"mode": "online", "url": cfg.web.online_tile_url, "min_zoom": 0, "max_zoom": 19, "bounds": None,
-                    "attribution": online_attribution(cfg), "referrer_policy": ONLINE_REFERRER_POLICY, "problem": tiles_problem}
-        return {"mode": "grid", "url": None, "min_zoom": 0, "max_zoom": 22, "bounds": None, "attribution": "", "problem": tiles_problem}
+            return JSONResponse({
+                "mode": "online", "url": cfg.web.online_tile_url, "min_zoom": 0, "max_zoom": 19, "bounds": None,
+                "attribution": online_attribution(cfg), "referrer_policy": ONLINE_REFERRER_POLICY, "problem": tiles_problem,
+            })
+        return JSONResponse({"mode": "grid", "url": None, "min_zoom": 0, "max_zoom": 22, "bounds": None, "attribution": "", "problem": tiles_problem})
 
-    @app.get("/tiles/{z}/{x}/{y}")
-    def tile(z: int, x: int, y: int):
-        found = tiles.tile(z, x, y) if tiles is not None else None
+    def tile(request: Request) -> Response:
+        p = request.path_params
+        found = tiles.tile(p["z"], p["x"], p["y"]) if tiles is not None else None
         if found is None:
             return Response(status_code=404)
         data, mime = found
@@ -172,13 +224,35 @@ def create_app(cfg: Config, tiles: MBTiles | None = None, tiles_problem: str | N
 
     # --- the page -------------------------------------------------------------------------------------------------------
 
-    @app.get("/", include_in_schema=False)
-    def index():
+    def index(request: Request) -> Response:
         return FileResponse(STATIC_DIR / "index.html", headers=NO_CACHE)
 
+    routes = [
+        Route("/api/health", api_health),
+        Route("/api/state", api_state),
+        Route("/api/beacons", api_beacons),
+        Route("/api/beacons/{prefix}", api_beacon),
+        Route("/api/beacons/{prefix}/track", api_track),
+        Route("/api/beacons/{prefix}/reset", api_reset, methods=["POST"]),
+        Route("/api/transmissions/{transmission_id:int}", api_transmission),
+        Route("/api/repeaters", api_repeaters),
+        Route("/api/rejects", api_rejects),
+        Route("/api/map", api_map),
+        Route("/tiles/{z:int}/{x:int}/{y:int}", tile),
+        Route("/", index),
+    ]
     if STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    return app
+        routes.append(Mount("/static", app=StaticFiles(directory=STATIC_DIR), name="static"))
+    return Starlette(
+        routes=routes,
+        middleware=[Middleware(SecurityHeaders, policy=policy, referrer_policy=referrer_policy)],
+        exception_handlers={
+            HTTPException: http_error,
+            views.NotFound: not_found,
+            StoreError: store_error,
+            sqlite3.OperationalError: busy,
+        },
+    )
 
 
 def located_points(cfg: Config) -> list[tuple[float, float]]:
@@ -191,6 +265,6 @@ def located_points(cfg: Config) -> list[tuple[float, float]]:
         return []
 
 
-def app_from_config(cfg: Config) -> FastAPI:
+def app_from_config(cfg: Config) -> Starlette:
     tiles, problem = open_tiles(cfg.tiles_path, cfg.web.tiles_scheme, located_points(cfg) if cfg.tiles_path else None)
     return create_app(cfg, tiles, problem)

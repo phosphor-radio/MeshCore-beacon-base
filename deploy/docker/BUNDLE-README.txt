@@ -18,12 +18,18 @@ First time
    The container starts by itself once the configuration is complete.
 8. Set the Pi's clock (it has no internet):  sudo timedatectl set-time 'YYYY-MM-DD HH:MM:SS'
 9. ./beaconctl status             and ./beaconctl check
+10. The map: open http://<the Pi's address>:8080/ in a browser on another machine (the Pi serves it on every interface; set
+    BEACON_WEB_BIND=127.0.0.1 in .env to keep it to the Pi, BEACON_WEB_PORT to change the port).
+    To let its Reset button work: ./beaconctl web token generate, then docker compose restart web.
+    Map tiles: put your .mbtiles file in data/, set web.tiles = "yourfile.mbtiles" under [web] in data/config.toml, ./beaconctl tiles write-metadata
+    /data/yourfile.mbtiles (once; /data is where the container sees data/), docker compose restart web.
 
 Every day
 ---------
   ./beaconctl status              the beacons, the repeaters, whether ingest is running
   ./beaconctl <anything>          beaconctl runs inside the container
-  docker compose ps               healthy / unhealthy (unhealthy: the companion is not connected)
+  docker compose ps               healthy / unhealthy (ingest unhealthy: the companion is not connected); web is the map
+  docker compose restart web     after changing the web settings, the token or the tiles file
   docker compose logs --tail 50
 
 A new event

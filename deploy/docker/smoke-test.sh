@@ -1,6 +1,6 @@
 #!/bin/sh
 # Check that the image runs on this machine, with no companion attached: a fake companion and simulated beacons run inside one throwaway
-# container together with beacon-ingest, and this waits until reports have been stored.
+# container together with beacon-ingest and beacon-web, and this waits until reports have been stored and the map's API shows them.
 #
 #   ./smoke-test.sh [IMAGE]        (default beacon-base:latest)
 #
@@ -27,6 +27,7 @@ docker run -d --name "$name" --user "$(id -u):$(id -g)" -v "$data:/data" -e BEAC
         sleep 0.2
     done
     [ -n "$port" ] || { echo "the simulator did not start"; cat /tmp/simulate.log; exit 1; }
+    beacon-web --host 127.0.0.1 --port 8080 > /tmp/web.log 2>&1 &
     exec beacon-ingest --port "$port"
 ' >/dev/null || fail "docker run"
 
@@ -35,12 +36,19 @@ i=0
 while [ "$i" -lt 90 ]; do
     if docker exec "$name" beaconctl health --companion >/dev/null 2>&1 \
         && docker exec "$name" beaconctl status 2>/dev/null | grep -q "last report [0-9]*s ago"; then
-        docker exec "$name" beaconctl status | sed -n '1,6p'
-        echo "smoke test passed"
-        exit 0
+        # the map's API, asked from inside: ingest is up and it lists the simulated beacons
+        if docker exec "$name" python -c "
+import json, sys, urllib.request
+state = json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/state', timeout=5))
+sys.exit(0 if state['health']['ingest']['state'] == 'up' and len(state['beacons']) >= 1 else 1)" >/dev/null 2>&1; then
+            docker exec "$name" beaconctl status | sed -n '1,6p'
+            echo "the map answers: /api/state shows ingest running and the simulated beacons"
+            echo "smoke test passed"
+            exit 0
+        fi
     fi
     [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ] || fail "the container stopped"
     i=$((i + 1))
     sleep 1
 done
-fail "no reports were stored within 90 seconds"
+fail "no reports were stored, or the map did not show them, within 90 seconds"
