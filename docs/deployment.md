@@ -132,7 +132,7 @@ of these does, and "Managing repeaters over the mesh" covers changing a repeater
 `./beaconctl` works with the stack stopped too, using a temporary container on the same `./data`.
 
 With the memory cgroup on, `docker stats` shows what each container uses against its limit. One sample on a Pi Zero 2 W with both services running:
-`ingest` about 6 MiB of 256 MiB and `web` about 28 MiB of 128 MiB, each at about 0.5% CPU when idle (a reading taken as a container starts is higher for a moment); a figure far above that is worth a look in the logs.
+`ingest` 6 to 11 MiB of 256 MiB (two readings, a few hours apart) and `web` about 28 MiB of 128 MiB, each at about 0.5% CPU when idle (a reading taken as a container starts is higher for a moment); a figure far above that is worth a look in the logs.
 
 The database grows by about 9 MB a day at 30 beacons and 10 repeaters, a few tens of megabytes over a week; nothing needs pruning.
 
@@ -179,10 +179,11 @@ The `compose.yaml` and the image must come from the same bundle: copying a new `
 | The `web` service restarts forever and its log says `entrypoint.sh: 10: exec: web: not found` (exit code 127) | The `compose.yaml` is newer than the image: an image from before the map was added does not know the command `web`. The two go together. Load the image from the same bundle as the compose file (`./load-image.sh`), then `docker compose up -d`, which recreates both containers. To check which image you have: `docker run --rm --entrypoint ls beacon-base:latest /usr/local/bin` lists `beacon-web` in a new one and not in an old one. `./smoke-test.sh` fails on an old image too. |
 | `exec format error` | The wrong image for this CPU. `uname -m`, and `./load-image.sh` again (it picks by that); `docker image inspect beacon-base:latest -f '{{.Architecture}}'`. |
 | `status` warns the clock is NOT SET, or times look wrong | Step 3.4. Observation times are corrected once the clock is set. |
+| After setting the clock, `Up 46 hours`, `started 2d ago` or `connected 2d ago` look far too long | They are computed from times saved before the clock jumped, so they include the jump (a 40-hour correction shows as 40 extra hours). For the real uptime use `uptime` on the Pi. A restart count of 0 does not rule out a reboot either: Docker starts the container again after a reboot without counting it. |
 | Reports stop and `status` shows beacons `silent` | Is `companion: connected`? Are the repeaters on and on the right channel (`./beaconctl rejects`; `./beaconctl check`)? |
 | A beacon shows `rejected` | See the README "When a beacon is locked out": usually `./beaconctl beacon reset <prefix>`. |
 | The container keeps restarting | `docker compose logs --tail 100`. The exit code 70 means the watchdog fired (no progress for two minutes); anything else is in the log. |
-| `docker stats` shows memory as `0B / 0B` | The kernel's memory cgroup is off (see "What you need"): Docker can neither show nor limit memory, so the limits in `compose.yaml` do nothing. Turn it on and reboot. To see a process's size anyway: `ps -eo rss,args \| grep -E 'beacon_base\.(service\|web)'` (RSS in kB) and `free -m`. |
+| `docker stats` shows memory as `0B / 0B` | The kernel's memory cgroup is off (see "What you need"): Docker can neither show nor limit memory, so the limits in `compose.yaml` do nothing (with the cgroup on and only `ingest` running, about 11 MB was in use on a Pi Zero 2 W). Turn it on and reboot. To see a process's size anyway: `ps -eo rss,args \| grep -E 'beacon_base\.(service\|web)'` (RSS in kB) and `free -m`. |
 | The map does not open from another machine | `docker compose ps`: is `web` up and `healthy`? Is `BEACON_WEB_BIND` in `.env` `127.0.0.1` (the Pi only)? Is the address right (`hostname -I`) and the port `BEACON_WEB_PORT`? `docker compose logs web`. |
 | The map's Reset button shows a command instead | No token is configured, or `web` has not been restarted since it was made: `./beaconctl web token generate` then `docker compose restart web`. |
 | The map is a plain grid with a note, or shows no credit, or every tile is missing | See [map-tiles.md](map-tiles.md) and run `./beaconctl tiles check /data/<file>.mbtiles`: it says what the file holds, whether its rows are numbered the way the map reads them, and whether it has a credit. |
