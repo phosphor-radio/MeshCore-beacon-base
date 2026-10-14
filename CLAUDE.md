@@ -135,7 +135,7 @@ becomes the baseline). `Verdict.auto_added` / `AdvertEffect.added` say what was 
 **The map** (plan `docs/plan/web-map.md`, guide `docs/web.md`): `beacon-web` only reads the database (a connection per request) and has one write,
 reset, behind a bearer token (`[web]` in `secrets.toml` or `$BEACON_WEB_TOKEN`; no token means read-only). Positions are estimated by ingest inside the
 report's transaction (`Pipeline._locate`, one `positions` row per transmission, replaced as more repeaters report; `beaconctl positions rebuild` redoes
-them) from `Store.hearings`, which uses only enabled, located repeaters. FastAPI and uvicorn are the optional `web` extra. The page builds DOM and text
+them) from `Store.hearings`, which uses only enabled, located repeaters. Tiles files: `tiles.py` reads either row numbering (`web.tiles_scheme`; MapProxy writes XYZ rows, the spec says TMS), `beaconctl tiles check` diagnoses one and `tiles write-metadata` renumbers it and writes the metadata and the OpenStreetMap credit (guide `docs/map-tiles.md`). FastAPI and uvicorn are the optional `web` extra. The page builds DOM and text
 only (names are untrusted; Leaflet reads a *string* tooltip as markup, so tooltips are given elements; `tests/test_static.py` enforces both). The Docker
 image does not carry `beacon-web` yet: pydantic has compiled wheels, which the image's pure-Python build stage cannot copy across CPUs.
 

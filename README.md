@@ -140,6 +140,7 @@ beacon-web                                   # http://127.0.0.1:8080/
 | `simulate [--provision] [--walk] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. `--walk` carries the first beacon round a course past located repeaters, for the map. |
 | `web token generate [--force]` / `web token show` | The operator token `beacon-web` asks for before it resets a beacon, kept in `secrets.toml` next to the channel key. |
 | `tiles check [file] [--scheme S]` | What a map tiles file holds, how it numbers its rows, and whether the map will show it where the repeaters are ([docs/map-tiles.md](docs/map-tiles.md)). |
+| `tiles write-metadata <file> [--name N] [--attribution HTML] [--rows tms\|xyz] [--dry-run]` | Make a tiles file ready for the map: renumber its rows from the south if they are from the north (MapProxy), and write its metadata, the OpenStreetMap credit by default. Echoes the metadata. |
 | `positions rebuild [--hours H]` | Estimate stored transmissions again with the repeaters' positions as they are now (positions are worked out once, when a report arrives). |
 
 ### What the base sets on the companion at startup

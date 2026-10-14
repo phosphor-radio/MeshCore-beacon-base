@@ -74,6 +74,9 @@ where your repeaters are. In particular, MBTiles specifies rows counted from the
 the north, and such a file shows no tiles at all. `web.tiles_scheme` (`auto`, `tms`, `xyz`) says which; `auto` reads the file's `scheme`
 metadata, else tries both against the located repeaters and logs a warning if it had to read the file as XYZ.
 
+`beaconctl tiles write-metadata FILE` makes a file ready: it renumbers rows written from the north and writes the metadata, with the
+OpenStreetMap credit by default ([map-tiles.md](map-tiles.md), step 6).
+
 The credit is the file's `attribution` metadata, shown in the map's corner; `web.tiles_attribution` overrides it, and the server logs a
 warning if there is neither.
 

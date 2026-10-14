@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from . import views
 from .config import Config
 from .store import Store, StoreError
-from .tiles import MBTiles, open_tiles
+from .tiles import OSM_ATTRIBUTION, MBTiles, open_tiles
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ def content_security_policy(online_tiles: bool) -> str:
     return f"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src {images}; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 
-OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener">OpenStreetMap</a> contributors'
 # A referrer policy that still sends the Referer cross-origin: tile.openstreetmap.org blocks requests without one (its tile usage policy)
 ONLINE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 

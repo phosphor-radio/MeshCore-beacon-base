@@ -535,6 +535,37 @@ def cmd_tiles_check(args: argparse.Namespace, cfg: Config) -> int:
     return 1 if problems else 0
 
 
+def cmd_tiles_write_metadata(args: argparse.Namespace, cfg: Config) -> int:
+    """Make a tiles file ready for the map: renumber its rows from the south when they are numbered from the north, and write its metadata,
+    the credit above all. Prints the whole metadata table afterwards."""
+    from . import tiles as tiles_mod
+
+    with _open(cfg) as store:
+        points = [(r["lat"], r["lon"]) for r in store.located_repeaters()]
+    try:
+        r = tiles_mod.write_metadata(
+            args.file, points, args.rows, name=args.name, attribution=args.attribution, description=args.description, dry_run=args.dry_run
+        )
+    except tiles_mod.TilesError as e:
+        raise StoreError(str(e)) from None
+    would = "" if r.written else "would be "
+    print(f"file      {args.file}" + ("   (dry run: nothing is written)" if args.dry_run else ""))
+    if r.renumbered:
+        print(f"rows      {would}RENUMBERED from the north (XYZ) to the south (TMS), the MBTiles specification: {r.tiles} tiles ({r.rows_note})")
+    else:
+        print(f"rows      numbered from the south (TMS) already: left as they are ({r.rows_note})")
+    print("levels    " + ", ".join(f"{z}: {n}" for z, n in r.levels))
+    print("metadata  written:" if r.written else "metadata  as it would be written:")
+    width = max(len(k) for k in r.metadata)
+    for key, value in sorted(r.metadata.items()):
+        print(f"  {key:<{width}}  {value}")
+    if not (r.metadata.get("attribution") or "").strip():
+        print("warning: the attribution is empty, so the map shows no credit")
+    if r.written:
+        print("check it with:  beaconctl tiles check " + str(args.file) + "   (restart beacon-web to use the new file)")
+    return 0
+
+
 # --- auto-add ------------------------------------------------------------------------------------------------------------
 
 

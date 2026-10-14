@@ -29,7 +29,7 @@ Contributors."
 How this project keeps the credit:
 
 - **On the page.** The map shows the file's `attribution` metadata in its bottom-right corner (it is HTML). If the file has none,
-  `beacon-web` logs a warning and the map shows no credit, so **always write the attribution into the file** (step 6) or set
+  `beacon-web` logs a warning and the map shows no credit, so **always write the attribution into the file** (`beaconctl tiles write-metadata`, step 6) or set
   `web.tiles_attribution` in the configuration, which replaces whatever the file says.
 - **In the code and docs.** The README has a *Credits* section naming OpenStreetMap, the ODbL and Geofabrik. Keep it. Anything that
   ships tiles or an extract (a deployment bundle, a repository) should carry the same notice.
@@ -206,76 +206,31 @@ mapproxy-seed -f mapproxy.yaml -s seed.yaml -c 2     # -n for a dry run, --summa
 > converts them to MBTiles (a write-up of that route: [Creating self-hosted tile maps from OpenStreetMap data](https://terinstock.com/post/2023/06/Creating-Self-Hosted-Tile-Maps-from-OpenStreetMap-Data/)).
 > It means compiling `meta2tile`; the seed route above does not.
 
-### 6. Check the file, number its rows properly, write the metadata
-
-First ask what you have (it compares the file with where your located repeaters are, so add the repeaters first):
+### 6. Make the file ready for the map
 
 ```bash
-beaconctl tiles check area.mbtiles
+beaconctl tiles write-metadata area.mbtiles
 ```
 
-It lists the zoom levels with their tile counts and sizes, shows the metadata, and says how the rows are numbered. For a MapProxy file it
-reports `with the rows read as TMS 0 have a tile, as XYZ 3` or similar. Then fix what it reports:
+One command does both jobs, in one transaction (a failure leaves the file as it was):
 
-**Rows.** If the rows are numbered from the north (XYZ), renumber them from the south. This writes a new table, so keep a copy of the file
-until you have looked at the result:
+- **Rows.** MapProxy numbers its tile rows from the north; the MBTiles specification says from the south. If the file is numbered from the
+  north the command renumbers it, and reports it (`rows  RENUMBERED from the north (XYZ) to the south (TMS)`). It works out which it is from the
+  file's own `scheme` metadata, else from where your **located repeaters** are (so add them first), and stops with a message rather than guess
+  when it cannot tell; then say `--rows xyz` or `--rows tms`. A file already numbered from the south is left alone, so running it again is safe.
+- **Metadata.** It writes the `metadata` table the map uses: `minzoom`, `maxzoom`, `bounds` and `format` from the tiles themselves, `name`
+  (from `--name`, else the file's, else the file name), `description`, `scheme = tms`, and the **attribution**: by default
+  `© OpenStreetMap contributors` with a link to the licence, which is the credit the map must show. `--attribution TEXT` (HTML) and
+  `--description TEXT` change them; other metadata the file already has is kept.
 
-```python
-import sqlite3
-import sys
+It prints the whole metadata table afterwards. `--dry-run` shows what it would do and changes nothing. Stop `beacon-web` while it runs, or
+restart it afterwards; the file is rewritten, so keep a copy of the original if the seed took long. Then look at the result:
 
-db = sqlite3.connect("area.mbtiles")
-db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
-if db.execute("SELECT 1 FROM metadata WHERE name = 'scheme' AND value = 'tms'").fetchone():
-    sys.exit("already numbered from the south: nothing to do")
-db.executescript("""
-CREATE TABLE tiles_tms AS
-    SELECT zoom_level, tile_column, ((1 << zoom_level) - 1 - tile_row) AS tile_row, tile_data FROM tiles;
-DROP TABLE tiles;
-ALTER TABLE tiles_tms RENAME TO tiles;
-CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
-INSERT INTO metadata VALUES ('scheme', 'tms');
-""")
-db.execute("VACUUM")
+```bash
+beaconctl tiles check area.mbtiles      # zoom levels with tile counts and sizes, and whether the map will show it: should end with "ok"
 ```
 
-(Doing it twice would undo it: the script records `scheme = tms` in the metadata and refuses a second time.)
-
-**Metadata.** Seeding leaves the `metadata` table empty or missing. Fill it in. The zoom range and the bounds are read from the tiles (run
-it after the rows are numbered from the south), and the attribution is what appears on the map:
-
-```python
-import math
-import sqlite3
-
-db = sqlite3.connect("area.mbtiles")
-db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
-low, high = db.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles").fetchone()
-n = 1 << high
-x0, x1, r0, r1 = db.execute(
-    "SELECT min(tile_column), max(tile_column), min(tile_row), max(tile_row) FROM tiles WHERE zoom_level = ?", (high,)
-).fetchone()
-lon = lambda x: x / n * 360 - 180
-lat = lambda y: math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))   # y counted from the north
-bounds = f"{lon(x0):.5f},{lat(n - r0):.5f},{lon(x1 + 1):.5f},{lat(n - 1 - r1):.5f}"   # west, south, east, north
-rows = {
-    "name": "Event area",
-    "format": "png",
-    "minzoom": str(low),
-    "maxzoom": str(high),
-    "bounds": bounds,
-    "attribution": '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-    "description": "Rendered from OpenStreetMap data (ODbL) with the OpenStreetMap Carto style. Data processed by Geofabrik GmbH.",
-}
-db.execute(f"DELETE FROM metadata WHERE name IN ({','.join('?' * len(rows))})", list(rows))
-db.executemany("INSERT INTO metadata VALUES (?, ?)", rows.items())
-db.commit()
-print(bounds)
-print(db.execute("SELECT zoom_level, count(*), round(sum(length(tile_data)) / 1048576.0, 1) FROM tiles GROUP BY 1 ORDER BY 1").fetchall())
-```
-
-It prints the bounds and then a row per zoom level: the level, how many tiles and their size in MB. It should match your count from step 1; a level
-with far fewer tiles means the seed did not finish. Run `beaconctl tiles check area.mbtiles` again: it should end with `ok`.
+The tile counts should match your count from step 1; a level with far fewer tiles means the seed did not finish.
 
 ### 7. Use it
 
@@ -328,7 +283,7 @@ the project.
 
 | Symptom | Likely cause |
 |---|---|
-| Every tile is a 404 (the map is blank, the log shows `GET /tiles/...` returning 404) | The rows are numbered from the north, which is how MapProxy writes them. Run `beaconctl tiles check area.mbtiles`; step 6 converts the file. |
+| Every tile is a 404 (the map is blank, the log shows `GET /tiles/...` returning 404) | The rows are numbered from the north, which is how MapProxy writes them. Run `beaconctl tiles check area.mbtiles`; `beaconctl tiles write-metadata area.mbtiles` (step 6) converts the file. |
 | `beacon-web` says the file is "not an MBTiles file" | No `metadata` or `tiles` table: do step 6; check that seeding wrote to `area.mbtiles` and not another file. |
 | The map is a grid, with a note about vector tiles | The file's `format` is `pbf`: it came from planetiler or tilemaker directly. Render rasters from it (route B). |
 | Tiles missing at one zoom level | The seed stopped early, or its levels did not cover that zoom: compare step 6's count with step 1's. |

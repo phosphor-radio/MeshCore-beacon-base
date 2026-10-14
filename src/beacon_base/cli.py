@@ -357,6 +357,21 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("file", nargs="?", help="an MBTiles file (default: web.tiles)")
     p.add_argument("--scheme", choices=("auto", "tms", "xyz"), help="read the rows this way (default: web.tiles_scheme)")
     p.set_defaults(func=admin.cmd_tiles_check)
+    p = tiles.add_parser(
+        "write-metadata",
+        help="make a tiles file ready for the map: renumber its rows from the south if they are from the north, and write its metadata",
+        description="Renumber the file's rows from the south (the MBTiles specification) when they are numbered from the north, as MapProxy "
+        "writes them, and write the metadata the map uses: zoom range, bounds and format from the tiles, the credit from --attribution "
+        "(default: OpenStreetMap's). It decides how the rows are numbered from the file's own scheme metadata, else from where your located "
+        "repeaters are; say --rows if neither can. One transaction: a failure leaves the file as it was. Stop beacon-web first, or restart it after.",
+    )
+    p.add_argument("file", help="an MBTiles file with raster tiles")
+    p.add_argument("--name", help="the name of the map (default: the file's, else its file name)")
+    p.add_argument("--attribution", help="the credit shown in the map's corner, HTML (default: OpenStreetMap contributors with a link to the licence)")
+    p.add_argument("--description", help="a description of where the tiles came from")
+    p.add_argument("--rows", choices=("auto", "tms", "xyz"), default="auto", help="how the file numbers its rows now (default: work it out)")
+    p.add_argument("--dry-run", action="store_true", help="show what would be done and change nothing")
+    p.set_defaults(func=admin.cmd_tiles_write_metadata)
 
     positions = sub.add_parser("positions", help="estimated beacon positions").add_subparsers(dest="positions_command", required=True)
     p = positions.add_parser("rebuild", help="estimate transmissions again with the repeaters' positions as they are now")

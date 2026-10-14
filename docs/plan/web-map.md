@@ -63,7 +63,7 @@ The map follows a beacon being walked past repeaters with no internet: shown her
   north (XYZ), the specification says from the south (TMS), and the first version of the guide said MapProxy wrote the standard layout (not
   checked: wrong). `tiles.py` now reads either scheme (`web.tiles_scheme`, the file's `scheme` metadata, or detection against the located
   repeaters), the zoom range is what the tiles table holds (a metadata maximum above it had the page ask for levels that are not there),
-  `beaconctl tiles check` diagnoses a file, and the guide converts the rows and derives the metadata from the tiles. Checked on a copy of
+  `beaconctl tiles check` diagnoses a file, and `beaconctl tiles write-metadata` renumbers the rows and writes the metadata (zoom range, bounds and format from the tiles, the OpenStreetMap credit by default). Checked on a copy of
   the file that showed the fault.
 - **Leaflet fetches its default marker image as soon as a marker is added**, even if it is replaced a line later; the 404s are avoided by
   giving the marker its icon at creation.

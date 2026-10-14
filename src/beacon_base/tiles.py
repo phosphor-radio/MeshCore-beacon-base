@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 
 MAX_ZOOM = 24
 SCHEMES = ("auto", "tms", "xyz")
+OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener">OpenStreetMap</a> contributors'
+DEFAULT_DESCRIPTION = "Rendered from OpenStreetMap data (ODbL). Data processed by Geofabrik GmbH."
 RASTER_FORMATS = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
 _SIGNATURES = ((b"\x89PNG", "image/png"), (b"\xff\xd8\xff", "image/jpeg"), (b"RIFF", "image/webp"))
 
@@ -141,11 +143,8 @@ class MBTiles:
     def coverage(self, points: list[tuple[float, float]]) -> dict[str, int]:
         """How many of the points (latitude, longitude) have a tile at some zoom level of the file, reading its rows as `tms` and as `xyz`.
         A file with the right scheme covers the places it was made for; with the wrong one it covers almost nothing."""
-        levels = self._levels()
-        return {
-            scheme: sum(1 for lat, lon in points if any(self.has_tile(z, *xyz_tile(lat, lon, z), scheme=scheme) for z in reversed(levels)))
-            for scheme in ("tms", "xyz")
-        }
+        with self._lock:
+            return row_coverage(self._conn, points)
 
     def resolve_scheme(self, points: list[tuple[float, float]]) -> dict[str, int]:
         """With scheme `auto` and nothing in the file saying how its rows are numbered, take the scheme under which the points have tiles
@@ -163,15 +162,34 @@ class MBTiles:
         self._conn.close()
 
 
+def row_coverage(conn: sqlite3.Connection, points: list[tuple[float, float]]) -> dict[str, int]:
+    """How many of the points have a tile at some zoom level of the file behind `conn`, reading its rows as `tms` and as `xyz`."""
+    levels = [r[0] for r in conn.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")]
+    sql = "SELECT 1 FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1"
+    counts = {"tms": 0, "xyz": 0}
+    for lat, lon in points:
+        for scheme in counts:
+            for z in reversed(levels):
+                x, y = xyz_tile(lat, lon, z)
+                if conn.execute(sql, (z, x, y if scheme == "xyz" else (1 << z) - 1 - y)).fetchone():
+                    counts[scheme] += 1
+                    break
+    return counts
+
+
+def _verdict(counts: dict[str, int]) -> str | None:
+    if counts["tms"] > counts["xyz"]:
+        return "tms"
+    if counts["xyz"] > counts["tms"]:
+        return "xyz"
+    return None
+
+
 def detect_scheme(tiles: MBTiles, points: list[tuple[float, float]]) -> tuple[str | None, dict[str, int]]:
     """Which row scheme puts the file's tiles where the points are: ('tms' or 'xyz', the counts), or (None, counts) when the points do not
     say (none given, or the same number under both, which includes none under either)."""
     counts = tiles.coverage(points)
-    if counts["tms"] > counts["xyz"]:
-        return "tms", counts
-    if counts["xyz"] > counts["tms"]:
-        return "xyz", counts
-    return None, counts
+    return _verdict(counts), counts
 
 
 def open_tiles(
@@ -201,3 +219,133 @@ def open_tiles(
         log.warning("%s has no metadata, so it has no attribution and no declared zoom range (docs/map-tiles.md, step 6)", path)
     log.info("map tiles from %s (zoom %d-%d, rows read as %s: %s)", path, tiles.info.min_zoom, tiles.info.max_zoom, tiles.scheme, tiles.scheme_source)
     return tiles, None
+
+
+# --- writing the metadata --------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class MetadataResult:
+    renumbered: bool  # the rows were (or, in a dry run, would be) renumbered from the north to the south
+    rows_note: str  # why: what said the rows were numbered the way they were
+    tiles: int  # tiles in the file
+    levels: list[tuple[int, int]]  # (zoom level, tiles)
+    metadata: dict[str, str]  # the whole metadata table after the write (or as it would be)
+    written: bool  # False for a dry run
+
+
+def _bounds(conn: sqlite3.Connection, zoom: int, rows_from_north: bool) -> str:
+    """west,south,east,north of the tiles at one zoom level, from the extent of their columns and rows."""
+    n = 1 << zoom
+    x0, x1, r0, r1 = conn.execute(
+        "SELECT min(tile_column), max(tile_column), min(tile_row), max(tile_row) FROM tiles WHERE zoom_level = ?", (zoom,)
+    ).fetchone()
+    y_top, y_bottom = (r0, r1) if rows_from_north else (n - 1 - r1, n - 1 - r0)  # northernmost and southernmost XYZ rows
+
+    def lat(y: int) -> float:
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+
+    return f"{x0 / n * 360 - 180:.5f},{lat(y_bottom + 1):.5f},{(x1 + 1) / n * 360 - 180:.5f},{lat(y_top):.5f}"
+
+
+def write_metadata(
+    path: str | Path,
+    points: list[tuple[float, float]] | None = None,
+    rows: str = "auto",
+    name: str | None = None,
+    attribution: str | None = None,
+    description: str | None = None,
+    dry_run: bool = False,
+) -> MetadataResult:
+    """Make a raster MBTiles file ready for the map: number its rows from the south as the specification says (when they are numbered
+    from the north, as MapProxy writes them), and write the metadata the map uses, taken from the tiles where it can be (zoom range, bounds,
+    format) and otherwise from the arguments (name, attribution, description). All in one transaction: a failure leaves the file as it was.
+
+    `rows` says how the rows are numbered now: ``tms`` (leave them), ``xyz`` (renumber them), or ``auto``: the file's own `scheme` metadata,
+    else whichever makes the tiles lie under `points` (the located repeaters). Nothing to go on is an error rather than a guess, since
+    renumbering a file that is already right would break it."""
+    if rows not in SCHEMES:
+        raise TilesError(f"rows must be one of {', '.join(SCHEMES)}, not {rows!r}")
+    path = Path(path)
+    if not path.is_file():
+        raise TilesError(f"tiles file {path} not found")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro" if dry_run else str(path), uri=dry_run, isolation_level=None, timeout=30)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    except sqlite3.Error as e:
+        raise TilesError(f"{path} is not an MBTiles file: {e}") from None
+    try:
+        kind = conn.execute("SELECT type FROM sqlite_master WHERE name = 'tiles'").fetchone()
+        if kind is None:
+            raise TilesError(f"{path} has no tiles table: not an MBTiles file")
+        if kind[0] != "table":
+            raise TilesError(f"{path}: `tiles` is a {kind[0]}, not a table, so its rows cannot be renumbered; export it to a plain table first")
+        levels = [(z, n) for z, n in conn.execute("SELECT zoom_level, count(*) FROM tiles GROUP BY 1 ORDER BY 1")]
+        if not levels:
+            raise TilesError(f"{path} has no tiles")
+        has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'metadata' AND type = 'table'").fetchone() is not None
+        meta = dict(conn.execute("SELECT name, value FROM metadata").fetchall()) if has_meta else {}
+        if (meta.get("format") or "png").lower() not in RASTER_FORMATS:
+            raise TilesError(f"{path} holds {meta['format']!r} tiles; only raster tiles can be shown")
+
+        # how the rows are numbered now
+        declared = (meta.get("scheme") or "").lower()
+        if rows != "auto":
+            current, note = rows, "as you said (--rows)"
+        elif declared in ("tms", "xyz"):
+            current, note = declared, "as the file's scheme metadata says"
+        else:
+            found, counts = detect_scheme_on(conn, points or [])
+            if found is None:
+                why = "no repeater is located, so there is nothing to compare the file with" if not points else (
+                    "no tile lies under any located repeater, or the repeaters do not agree" if counts["tms"] == counts["xyz"] else "the repeaters do not say")
+                raise TilesError(f"cannot tell how {path} numbers its rows: {why}. Say it with --rows xyz (from the north: what MapProxy writes) or --rows tms")
+            current = found
+            note = f"{counts[found]} of {len(points or [])} located repeaters have tiles that way, {counts['xyz' if found == 'tms' else 'tms']} the other way"
+        renumber = current == "xyz"
+
+        # the metadata, from the tiles where they say it
+        sample = conn.execute("SELECT tile_data FROM tiles LIMIT 1").fetchone()[0]
+        fmt = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(content_type(bytes(sample), ""), (meta.get("format") or "png").lower())
+        new = {
+            "name": name or meta.get("name") or path.stem,
+            "format": fmt,
+            "minzoom": str(levels[0][0]),
+            "maxzoom": str(levels[-1][0]),
+            "bounds": _bounds(conn, levels[-1][0], rows_from_north=current == "xyz"),
+            "attribution": attribution if attribution is not None else OSM_ATTRIBUTION,
+            "description": description if description is not None else DEFAULT_DESCRIPTION,
+            "scheme": "tms",
+        }
+        result = MetadataResult(renumber, note, sum(n for _, n in levels), levels, {**meta, **new}, written=not dry_run)
+        if dry_run:
+            return result
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if renumber:
+                conn.execute(
+                    "CREATE TABLE tiles_tms AS SELECT zoom_level, tile_column, ((1 << zoom_level) - 1 - tile_row) AS tile_row, tile_data FROM tiles"
+                )
+                conn.execute("DROP TABLE tiles")
+                conn.execute("ALTER TABLE tiles_tms RENAME TO tiles")
+                conn.execute("CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row)")
+            conn.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
+            conn.execute(f"DELETE FROM metadata WHERE name IN ({','.join('?' * len(new))})", list(new))
+            conn.executemany("INSERT INTO metadata VALUES (?, ?)", new.items())
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        if renumber:
+            conn.execute("VACUUM")  # the old table's pages are free: give them back
+        return result
+    except sqlite3.Error as e:
+        raise TilesError(f"{path}: {e}") from None
+    finally:
+        conn.close()
+
+
+def detect_scheme_on(conn: sqlite3.Connection, points: list[tuple[float, float]]) -> tuple[str | None, dict[str, int]]:
+    """detect_scheme for an open connection."""
+    counts = row_coverage(conn, points) if points else {"tms": 0, "xyz": 0}
+    return _verdict(counts), counts

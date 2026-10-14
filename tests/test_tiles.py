@@ -200,3 +200,171 @@ def test_check_without_a_file_or_a_configured_one_asks_for_one(cfg, capsys):
 def test_check_reports_a_file_that_is_not_mbtiles(located, tmp_path, capsys):
     code, out = run_check(located, capsys, str(tmp_path / "config.toml"))
     assert code == 1 and "not an MBTiles file" in out
+
+
+# --- beaconctl tiles write-metadata -----------------------------------------------------------------------------------------------
+
+
+def write_args(path, *extra):
+    return ["tiles", "write-metadata", str(path), *extra]
+
+
+def table(path, name="metadata"):
+    with sqlite3.connect(path) as db:
+        return dict(db.execute(f"SELECT name, value FROM {name}").fetchall())
+
+
+def many_rows(scheme):
+    """Tiles at two zoom levels over SITE and a neighbour, numbered the way `scheme` says."""
+    out = []
+    for z in (14, 15):
+        x, y = xyz_tile(*SITE, z)
+        for dx, dy in ((0, 0), (1, 0), (0, 1)):
+            out.append((z, x + dx, (y + dy) if scheme == "xyz" else (1 << z) - 1 - (y + dy)))
+    return out
+
+
+def run(cfg, capsys, *args):
+    code = main(["-c", str(cfg.config_path), *args])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_a_file_numbered_from_the_north_is_renumbered_and_given_its_metadata(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("xyz"))
+    code, out, _ = run(located, capsys, *write_args(path))
+    assert code == 0
+    assert "RENUMBERED from the north (XYZ) to the south (TMS)" in out and "6 tiles" in out
+    meta = table(path)
+    assert {k: meta[k] for k in ("format", "minzoom", "maxzoom", "scheme", "name")} == {
+        "format": "png", "minzoom": "14", "maxzoom": "15", "scheme": "tms", "name": "a"
+    }
+    assert "OpenStreetMap" in meta["attribution"] and "openstreetmap.org/copyright" in meta["attribution"]
+    for key, value in meta.items():  # the output echoes every metadata entry in full
+        assert f"  {key}" in out and value in out
+    tiles = MBTiles(path)  # and the map reads it as the specification says, with no detection involved
+    assert (tiles.scheme, tiles.scheme_source) == ("tms", "the file's scheme metadata")
+    x, y = xyz_tile(*SITE, 15)
+    assert tiles.tile(15, x, y) is not None and tiles.tile(15, x + 1, y + 1) is None
+
+
+def test_the_bounds_come_from_the_tiles_and_hold_the_repeater(located, tmp_path, capsys):
+    for scheme in ("xyz", "tms"):
+        path = make(tmp_path / f"{scheme}.mbtiles", many_rows(scheme))
+        assert run(located, capsys, *write_args(path))[0] == 0
+        west, south, east, north = (float(v) for v in table(path)["bounds"].split(","))
+        assert west < SITE[1] < east and south < SITE[0] < north, scheme
+        assert MBTiles(path).info.bounds == (west, south, east, north)
+
+
+def test_a_file_that_follows_the_specification_is_left_alone_but_given_metadata(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("tms"))
+    code, out, _ = run(located, capsys, *write_args(path))
+    assert code == 0 and "numbered from the south (TMS) already: left as they are" in out and "RENUMBERED" not in out
+    assert "1 of 1 located repeaters have tiles that way" in out
+    assert MBTiles(path).tile(15, *xyz_tile(*SITE, 15)) is not None
+
+
+def test_running_it_twice_does_not_renumber_twice(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("xyz"))
+    run(located, capsys, *write_args(path))
+    before = sqlite3.connect(path).execute("SELECT zoom_level, tile_column, tile_row FROM tiles ORDER BY 1, 2, 3").fetchall()
+    code, out, _ = run(located, capsys, *write_args(path))
+    assert code == 0 and "RENUMBERED" not in out and "as the file's scheme metadata says" in out
+    assert sqlite3.connect(path).execute("SELECT zoom_level, tile_column, tile_row FROM tiles ORDER BY 1, 2, 3").fetchall() == before
+
+
+def test_it_will_not_guess_without_a_repeater_to_go_by(cfg, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("xyz"))
+    original = path.read_bytes()
+    code, _, err = run(cfg, capsys, *write_args(path))
+    assert code == 2 and "cannot tell how" in err and "--rows xyz" in err
+    assert path.read_bytes() == original  # nothing was touched
+    code, out, _ = run(cfg, capsys, *write_args(path, "--rows", "xyz"))
+    assert code == 0 and "RENUMBERED" in out and "as you said (--rows)" in out
+    assert MBTiles(path).tile(15, *xyz_tile(*SITE, 15)) is not None
+
+
+def test_a_file_for_another_area_is_not_guessed_at_either(located, tmp_path, capsys):
+    code, _, err = run(located, capsys, *write_args(make(tmp_path / "a.mbtiles", [(15, 1, 1), (15, 2, 2)])))
+    assert code == 2 and "cannot tell how" in err
+
+
+def test_a_dry_run_changes_nothing_and_says_what_it_would_do(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("xyz"))
+    original = path.read_bytes()
+    code, out, _ = run(located, capsys, *write_args(path, "--dry-run"))
+    assert code == 0 and "nothing is written" in out and "would be RENUMBERED" in out and "as it would be written" in out
+    assert path.read_bytes() == original
+
+
+def test_the_credit_name_and_description_can_be_given(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("tms"), name="old", custom="kept")
+    run(located, capsys, *write_args(path, "--name", "Event", "--attribution", "(c) Example", "--description", "d"))
+    meta = table(path)
+    assert (meta["name"], meta["attribution"], meta["description"], meta["custom"]) == ("Event", "(c) Example", "d", "kept")
+    run(located, capsys, *write_args(path))  # a later run keeps the name it was given
+    assert table(path)["name"] == "Event"
+
+
+def test_an_empty_attribution_is_a_warning(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("tms"))
+    code, out, _ = run(located, capsys, *write_args(path, "--attribution", ""))
+    assert code == 0 and "the map shows no credit" in out
+
+
+def test_a_file_with_no_metadata_table_and_extra_columns_is_handled(located, tmp_path, capsys):
+    path = tmp_path / "mapproxy.mbtiles"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB, last_modified TEXT)")
+    conn.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?, 'now')", [(z, x, r, PNG) for z, x, r in many_rows("xyz")])
+    conn.execute("CREATE UNIQUE INDEX idx_tile ON tiles (zoom_level, tile_column, tile_row)")
+    conn.commit()
+    conn.close()
+    code, out, _ = run(located, capsys, *write_args(path))
+    assert code == 0 and "RENUMBERED" in out
+    assert table(path)["maxzoom"] == "15" and MBTiles(path).tile(14, *xyz_tile(*SITE, 14)) is not None
+    assert sqlite3.connect(path).execute("SELECT count(*) FROM tiles").fetchone()[0] == 6
+
+
+def test_the_format_is_taken_from_the_tiles(located, tmp_path, capsys):
+    path = make(tmp_path / "a.mbtiles", many_rows("tms"), format="png")
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE tiles SET tile_data = ?", (b"\xff\xd8\xff\xe0jpeg",))
+    run(located, capsys, *write_args(path))
+    assert table(path)["format"] == "jpg"
+
+
+@pytest.mark.parametrize("what", ["vector", "empty", "view", "not-a-database", "missing"])
+def test_files_that_cannot_be_made_ready_are_refused_with_a_reason(located, tmp_path, capsys, what):
+    path = tmp_path / "x.mbtiles"
+    if what == "vector":
+        make(path, many_rows("tms"), format="pbf")
+    elif what == "empty":
+        make(path, [])
+    elif what == "view":
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE images (tile_id TEXT, tile_data BLOB)")
+        conn.execute("CREATE TABLE map (zoom_level INT, tile_column INT, tile_row INT, tile_id TEXT)")
+        conn.execute("CREATE VIEW tiles AS SELECT zoom_level, tile_column, tile_row, tile_data FROM map JOIN images USING (tile_id)")
+        conn.commit()
+        conn.close()
+    elif what == "not-a-database":
+        path.write_text("hello, this is not sqlite at all")
+    code, _, err = run(located, capsys, *write_args(path))
+    assert code == 2 and err.startswith("beaconctl: ")
+    if what == "vector":
+        assert "only raster" in err
+    if what == "view":
+        assert "not a table" in err
+
+
+def test_a_failure_part_way_leaves_the_file_as_it_was(located, tmp_path, capsys, monkeypatch):
+    """The renumbering is one transaction: if the metadata cannot be written, the rows are not renumbered either."""
+    path = make(tmp_path / "a.mbtiles", many_rows("xyz"))
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TRIGGER no_metadata BEFORE INSERT ON metadata BEGIN SELECT RAISE(ABORT, 'refused'); END")
+    code, _, err = run(located, capsys, *write_args(path))
+    assert code == 2 and "refused" in err
+    rows = sqlite3.connect(path).execute("SELECT zoom_level, tile_column, tile_row FROM tiles ORDER BY 1, 2, 3").fetchall()
+    assert rows == sorted(many_rows("xyz"))
