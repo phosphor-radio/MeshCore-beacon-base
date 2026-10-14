@@ -1,6 +1,6 @@
 # Service Hardening and Packaging Plan (B3)
 
-Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run) remains.** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run): the steps passed and it ran healthy for 10 hours (2026-10-12); the full day was not waited for, and memory use could not be measured (see the results).** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
 long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
 Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
 remote repeater work ([repeater-remote.md](repeater-remote.md)).
@@ -138,6 +138,26 @@ unplug/replug, reboot and power loss, a new event (keep config and key, new data
 checks that the documents' relative links resolve, that the files and commands the guide names exist, and that its `./beaconctl` examples parse.
 
 **B3.4 Pi run.** The manual acceptance test above. Done when the criterion at the top holds.
+
+*Results so far (2026-10-11, on the Pi Zero 2 W):*
+
+- Loading the bundle's image, the smoke test, `docker compose up -d` with the real companion, and unplugging and replugging the companion all worked.
+- **Reboot:** the container came back by itself and the clock was kept.
+- **Power cut:** the container came back by itself; the clock carried on from where it stopped, so it was behind by the length of the outage. That was
+  expected (no RTC, no internet) and is the case the guide already tells the operator to handle by setting the clock again. The guide now says plainly
+  which of the two (reboot or power cut) keeps the time, and what is refused or provisional until it is set.
+- **Ten hours of running (2026-10-12):** the container was `Up 10 hours (healthy)` with a restart count of 0; `beaconctl status` showed `ingest: running`, the
+  companion (an Ikoka Stick-E22 / Xiao nRF52, firmware v1.17.1) connected for the whole time with its last frame 12 s old, two beacons `ok`, each heard by
+  three repeaters, the last report 2 minutes old. `./data` was 4.4 MB (two beacons, three repeaters; the simulated 9 MB a day was for 30 beacons). The log
+  held only the start-up lines: the watchdog notice and two `unknown_repeater` warnings from the first minutes, before the repeaters were added. `check`
+  warned that `beacon.window` was not recorded for the three repeaters, which is configuration (`beaconctl repeater window`, or any `repeater remote ... get
+  beacon.window`, which records it), not a fault. The operator ended the session at ten hours instead of a full day.
+- **Memory could not be measured, and the limit is not enforced.** `docker stats` showed `0B / 0B` for memory: Raspberry Pi OS ships with the kernel's memory
+  cgroup off, so Docker cannot account for or limit memory, and the compose file's `mem_limit: 256m` (decision 15) does nothing on a stock install. Nothing
+  went wrong in ten hours (no restarts, healthy), so a leak is unlikely, but it is unproven. To turn the controller on, add `cgroup_enable=memory
+  cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; this has **not** been tried
+  on this Pi. Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
+  The guide now says all of this.
 
 ## Review questions: answers (2026-10-10)
 
