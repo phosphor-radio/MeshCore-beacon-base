@@ -4,9 +4,11 @@
 is how to make one for a small area from a regional OpenStreetMap extract such as Geofabrik's
 [Ontario](https://download.geofabrik.de/north-america/canada/ontario.html), on a machine that has internet, before the event.
 
-> **Status: not run.** Nothing below has been run for this project. The tools and their options are taken from their own documentation
-> (read 2026-10-12), and the places where I could not confirm a detail are marked **(check)**. The first real run is the test: try it on a small area
-> first (a few km, a few zoom levels), look at the result in `beacon-web`, and correct this page where it was wrong.
+> **Status: verified (route A).** The whole of route A below was run end to end for this project on 2026-10-13: an Ontario extract cut to a
+> 10 km by 6 km area, imported, seeded to zoom 14 to 19, made ready with `beaconctl tiles write-metadata`, and then shown by `beacon-web`
+> with no internet connection. Running it found the row-numbering fault in step 5 and the empty metadata (so no credit), both now handled
+> by step 6. Routes B and C are outlines from the tools' documentation and have **not** been run; a detail
+> marked **(check)** there is one I could not confirm.
 
 ## What `beacon-web` needs
 
@@ -86,9 +88,19 @@ def count(west, south, east, north, zmin, zmax):
 print(count(-75.7256, 45.4020, -75.6744, 45.4380, 12, 17))   # about 4 km by 4 km: 534 tiles
 ```
 
-That 4 km square is 534 tiles for zoom 12 to 17 (1, 4, 9, 30, 110 and 380 per level); level 18 would add 1,482. A raster tile is
-tens of kilobytes at most and empty ones are tiny, so even tens of thousands of tiles are tens or hundreds of megabytes: measure a
-small run rather than trust an estimate. Rendering time grows with the tile count and with how dense the area is.
+That 4 km square is 534 tiles for zoom 12 to 17 (1, 4, 9, 30, 110 and 380 per level); level 18 would add 1,482. The area that was
+actually run, about 10 km by 6 km at zoom 14 to 19, came to this:
+
+| Zoom | 14 | 15 | 16 | 17 | 18 | 19 | Total |
+|---|---|---|---|---|---|---|---|
+| Tiles | 24 | 84 | 336 | 1,316 | 5,170 | 20,570 | 27,500 |
+| Size (MB) | 0.2 | 0.6 | 1.7 | 4.8 | 13.5 | 42.0 | 91 |
+
+Each level has about four times the tiles of the one before and about three times the size, so the last level or two is nearly all of
+the file: dropping zoom 19 would have made it about a third of the size. A tile averaged 3 KB (2 KB at zoom 19, where many tiles show
+little). Work out the count for your own area, add up what you can afford to carry, and choose the highest zoom from that. To read the
+coordinates of a box you have in mind, OpenStreetMap's [export page](https://www.openstreetmap.org/export) shows them as you draw it.
+Rendering time grows with the tile count and with how dense the area is.
 
 ### 2. Download the regional extract and cut out your area
 
@@ -99,8 +111,7 @@ osmium extract --bbox=-75.7256,45.4020,-75.6744,45.4380 --strategy=smart ontario
 
 Geofabrik's page lists `ontario-latest.osm.pbf` at about 1 GB, rebuilt daily, with the time the data runs up to. Its public files leave out
 user names and changeset IDs. `osmium extract` takes `-b`/`--bbox` as left,bottom,right,top, and the `smart` strategy also keeps
-whole multipolygons (lakes, parks, buildings) that touch the box; it reads the input three times, so allow a few minutes. **(check)**
-the strategy option's spelling with `osmium extract -h`. A `.poly` file works instead of a box (`--polygon`) if the area is not a rectangle.
+whole multipolygons (lakes, parks, buildings) that touch the box; it reads the input three times, so allow a few minutes. A `.poly` file works instead of a box (`--polygon`) if the area is not a rectangle.
 
 Cutting first matters: the import in the next step then handles a few megabytes, not a gigabyte, and finishes in minutes.
 
@@ -144,7 +155,7 @@ python3 -m venv seed-venv && . seed-venv/bin/activate
 pip install MapProxy
 ```
 
-`mapproxy.yaml` **(check against the MapProxy documentation: only the seed file below was confirmed)**:
+`mapproxy.yaml`:
 
 ```yaml
 services:

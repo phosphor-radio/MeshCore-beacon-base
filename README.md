@@ -17,8 +17,8 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > Pi run itself (B3.4) is still to do.
 > **The map and API (B4, branch `b4-web-map`) are built and tested here**: `beacon-web` serves a Leaflet map with local tiles, the repeaters, the beacons
 > with a placeholder position estimate, banners for a down ingest, an unset clock and locked-out beacons, and a token-protected Reset
-> ([docs/web.md](docs/web.md), [docs/plan/web-map.md](docs/plan/web-map.md)). It is not in the Docker image yet, and it has not been tried with real
-> beacons walking past real repeaters. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> ([docs/web.md](docs/web.md), [docs/plan/web-map.md](docs/plan/web-map.md)). Making its offline map tiles from a Geofabrik extract has been verified end to end ([docs/map-tiles.md](docs/map-tiles.md)). It is not in the
+> Docker image yet, and it has not been tried with real beacons walking past real repeaters. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works

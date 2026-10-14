@@ -5,8 +5,9 @@ Implements phase B4 of [beacon-base.md](beacon-base.md): `beacon-web`, a read AP
 2026-10-10. Work is on the branch `b4-web-map`.
 
 Status: **B4.1-B4.5 are built and tested on this branch** (821 tests; the page was driven in a browser against `simulate --walk` with
-real `beacon-ingest` and `beacon-web` processes). **Left**: carrying `beacon-web` in the Docker image (below), and the hardware run: real
-beacons walked past real repeaters, with real tiles. Guide: [../web.md](../web.md).
+real `beacon-ingest` and `beacon-web` processes). **Offline tiles are verified**: the process in [../map-tiles.md](../map-tiles.md) was run end to end and `beacon-web` shown with no
+internet, from a 27,500-tile MBTiles file made that way (2026-10-13). **Left**: carrying `beacon-web` in the Docker image (below), and the hardware
+run: real beacons walked past real repeaters. Guide: [../web.md](../web.md).
 
 ## Decisions
 
@@ -77,5 +78,5 @@ The map follows a beacon being walked past repeaters with no internet: shown her
   at build time), or write the API on Starlette, which FastAPI is built on and which is pure Python (it also removes pydantic from a 512 MB
   Pi). Either is small; do it with B3.4, then add a `web` service to the compose file (publish `127.0.0.1:8080` unless the
   operator asks for the LAN) and run `tests/test_docker.py`. Not done here because the image cannot be built or run for the Pi from this machine.
-- **A tile builder** (`beaconctl tiles`), which was already in "Later" in [beacon-base.md](beacon-base.md). Until then, [../map-tiles.md](../map-tiles.md) describes making a file by hand from a Geofabrik extract (documented from the tools' own docs, not run), and `web.tiles_attribution` plus a log warning keep the OpenStreetMap credit on the map.
+- **A tile builder** (`beaconctl tiles`), which was already in "Later" in [beacon-base.md](beacon-base.md). Until then, [../map-tiles.md](../map-tiles.md) describes making a file from a Geofabrik extract (route A verified end to end), and `web.tiles_attribution` plus a log warning keep the OpenStreetMap credit on the map.
 - **Tuning the estimator** on a walk with the real hardware.
