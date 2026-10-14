@@ -131,6 +131,9 @@ of these does, and "Managing repeaters over the mesh" covers changing a repeater
 
 `./beaconctl` works with the stack stopped too, using a temporary container on the same `./data`.
 
+With the memory cgroup on, `docker stats` shows what each container uses against its limit. One sample on a Pi Zero 2 W with both services running:
+`ingest` about 6 MiB of 256 MiB and `web` about 28 MiB of 128 MiB, each at about 0.5% CPU when idle (a reading taken as a container starts is higher for a moment); a figure far above that is worth a look in the logs.
+
 The database grows by about 9 MB a day at 30 beacons and 10 repeaters, a few tens of megabytes over a week; nothing needs pruning.
 
 ## 6. Unplugging, rebooting, power loss
@@ -161,6 +164,8 @@ docker compose up -d                                    # then onboard the mesh 
 copy over `.env`, move or point to the same `data` folder (`mv ../old/data .`), and `docker compose up -d`. The database is upgraded when ingest
 starts; a database from a newer version is refused rather than damaged.
 
+The `compose.yaml` and the image must come from the same bundle: copying a new `compose.yaml` over an old install without `./load-image.sh` leaves an image that does not match it (see Troubleshooting). Run `./smoke-test.sh` after loading; it fails on an image that is too old.
+
 ## 8. Troubleshooting
 
 | What you see | What it means and what to do |
@@ -171,6 +176,7 @@ starts; a database from a newer version is refused rather than damaged.
 | `unhealthy`, and `status` says `companion: not connected` | The port name is wrong, or the companion is unplugged. `ls /dev/serial/by-id` on the Pi; the config needs `/hostdev` in front. `docker compose logs` shows the open error. |
 | The log says `Permission denied` opening the port | The container user is not in the port's group: set `BEACON_TTY_GID` in `.env` to the group id from `ls -ln /dev/ttyACM0`, then `docker compose up -d`. |
 | The log says `no reply to APP_START` | The board answers only with DTR high (an nRF52) or low (an ESP32-S3) and `companion.dtr = auto` could not decide; set `dtr = "on"` or `"off"` in the config. See [operations.md](operations.md). |
+| The `web` service restarts forever and its log says `entrypoint.sh: 10: exec: web: not found` (exit code 127) | The `compose.yaml` is newer than the image: an image from before the map was added does not know the command `web`. The two go together. Load the image from the same bundle as the compose file (`./load-image.sh`), then `docker compose up -d`, which recreates both containers. To check which image you have: `docker run --rm --entrypoint ls beacon-base:latest /usr/local/bin` lists `beacon-web` in a new one and not in an old one. `./smoke-test.sh` fails on an old image too. |
 | `exec format error` | The wrong image for this CPU. `uname -m`, and `./load-image.sh` again (it picks by that); `docker image inspect beacon-base:latest -f '{{.Architecture}}'`. |
 | `status` warns the clock is NOT SET, or times look wrong | Step 3.4. Observation times are corrected once the clock is set. |
 | Reports stop and `status` shows beacons `silent` | Is `companion: connected`? Are the repeaters on and on the right channel (`./beaconctl rejects`; `./beaconctl check`)? |

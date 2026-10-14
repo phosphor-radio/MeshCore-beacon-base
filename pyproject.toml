@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beacon-base"
-version = "0.1.0"
+version = "0.1.1"
 description = "Base station software for the MeshCore beacon tracker"
 readme = "README.md"
 requires-python = ">=3.11"

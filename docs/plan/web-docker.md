@@ -4,7 +4,7 @@ Dated 2026-10-13. Follows [web-map.md](web-map.md) ("Left, and why") and [servic
 `main`, built on FastAPI and run from a checkout; this puts them in the image and compose bundle that go to the Pi (a Pi Zero 2 W, **arm64**),
 and moves the API from FastAPI to Starlette so that the image's build stays pure Python.
 
-Status: **W1-W4 built and tested here (2026-10-13); W5, the run on the Pi, is to do.** The open questions were answered the same day; the answers are in
+Status: **W1-W4 built and tested here, and W5, the run on the Pi Zero 2 W, reported successful (2026-10-13).** The open questions were answered the same day; the answers are in
 "Decisions" below and the original questions are kept at the end.
 
 ## Why Starlette
@@ -128,12 +128,31 @@ off on Raspberry Pi OS and `docker stats` shows nothing, see service-packaging.m
 - **W4.** Docs: [../deployment.md](../deployment.md) (the memory cgroup as a step of preparing the Pi, step 3.6 opening the map, the token, tiles, troubleshooting rows),
   [../web.md](../web.md), [../map-tiles.md](../map-tiles.md), the README, CLAUDE.md, [web-map.md](web-map.md), [service-packaging.md](service-packaging.md) (decision 15 and the cgroup note).
 
-## To do: W5 (on the Pi)
+## W5: the run on the Pi (2026-10-13)
+
+**Result: the operator reports the Pi run successful.** The plan for it was:
 
 Build the arm64 bundle (`deploy/docker/build-bundle.sh --platform linux/arm64`), copy it over, `./load-image.sh`, `./smoke-test.sh`, `docker compose up -d` (both services
 `healthy`), open `http://<the Pi>:8080/` from another machine, make a token and restart `web`, reset a beacon, and put a tiles file in `data/`. Record what the web
 process weighs (`ps -eo rss,args | grep beacon_base.web`, or `docker stats` now the cgroup is on) and that unplugging the companion leaves the map up and says so. Anything
 found goes back here.
+
+*Found on the way:* the first attempt left `web` restarting with `entrypoint.sh: 10: exec: web: not found` (exit 127): the Pi had the new `compose.yaml` and
+the **old image**, whose entrypoint tried to run a program called `web`. The compose file and the image must come from the same bundle; the guide
+([../deployment.md](../deployment.md), Troubleshooting and "A new version") now says so and how to tell. Loading the new image fixed it.
+
+*Memory and CPU.* `docker stats` on the Pi (the memory cgroup is on, so the limits are applied). One sample:
+
+| Container | CPU (that sample) | Memory / limit | PIDs |
+|---|---|---|---|
+| ingest | 59.75% | 6.0 MiB / 256 MiB (2.35%) | 3 |
+| web | 8.93% | 28.1 MiB / 128 MiB (21.9%) | 4 |
+
+The CPU figures in that sample were instants: **both processes normally sit at about 0.5% CPU** (operator, 2026-10-13). Web is well inside its 128 MiB, so the
+limit is generous as intended.
+
+*Steps.* The operator ran **every step listed above** (the bundle, `./smoke-test.sh`, both services healthy, the map from another machine, the token and `restart web`,
+a reset, a tiles file in `data/`, and the companion unplugged with the map open) and reports them all successful.
 
 ## The questions as asked (answers in "Decisions")
 

@@ -155,7 +155,8 @@ checks that the documents' relative links resolve, that the files and commands t
 - **Memory could not be measured, and the limit was not enforced (until the cgroup was turned on).** `docker stats` showed `0B / 0B` for memory: Raspberry Pi OS ships with the kernel's memory
   cgroup off, so Docker cannot account for or limit memory, and the compose file's `mem_limit: 256m` (decision 15) does nothing on a stock install. Nothing
   went wrong in ten hours (no restarts, healthy), so a leak is unlikely, but it is unproven. To turn the controller on, add `cgroup_enable=memory
-  cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; the operator has since done this and made it a step of preparing the Pi (2026-10-13), so the limits apply. Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
+  cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; the operator has since done this and made it a step of preparing the Pi (2026-10-13), so the limits apply. With it on, one `docker stats` sample on the Pi with both services
+  running read: ingest 6.0 MiB of 256 MiB, web 28.1 MiB of 128 MiB ([web-docker.md](web-docker.md), W5). Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
   The guide now says all of this.
 
 ## Review questions: answers (2026-10-10)
