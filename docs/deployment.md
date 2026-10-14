@@ -19,6 +19,9 @@ Contents: [What you need](#what-you-need) · [1. Build the bundle](#1-build-the-
   boot (`systemctl is-enabled docker` says `enabled`), so the base comes back after a power cut.
 - The companion (a MeshCore companion radio with USB serial firmware) in the Pi's data USB port. On a Pi Zero 2 W that is the inner micro-USB
   port, through an OTG adapter; the other micro-USB port is the power input.
+- **The kernel's memory cgroup turned on** (part of preparing the Pi): add `cgroup_enable=memory cgroup_memory=1` to the single line in
+  `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot. Without it Docker cannot limit or show the containers'
+  memory and the limits in `compose.yaml` (256 MB for ingest, 128 MB for the map) do nothing; see Troubleshooting.
 - A machine **with internet and Docker** (with buildx) to build the bundle once.
 - Which CPU the Pi is running: `uname -m` says `aarch64` (64-bit Raspberry Pi OS) or `armv7l` (32-bit). The bundle has an image for each.
 
@@ -76,7 +79,17 @@ configuration is complete (it looks every ten seconds), so there is nothing to r
    Times stored before the clock is set are marked provisional and are corrected as soon as it is: `beacon-ingest` notices the change by itself
    (or run `./beaconctl time confirm`). `./beaconctl time` shows the state. Check it again after every reboot, until the Pi has a clock of its own.
 5. **Check:** `./beaconctl status` should start with `ingest: running` and `companion: ... connected`. `docker compose ps` should say `healthy`
-   (the first minute it says `starting`).
+   for both services, `ingest` and `web` (the first minute it says `starting`).
+6. **Open the map.** The second service, `web`, serves the map and its API ([web.md](web.md)) on port 8080 of the Pi, on every interface, so from a laptop
+   or phone on the same network open `http://<the Pi's address>:8080/` (`hostname -I` on the Pi shows it). It needs nothing but `./data` and does not
+   wait for the companion: it says in a banner when ingest is down. To keep it to the Pi itself, set `BEACON_WEB_BIND=127.0.0.1` in `.env`; to change
+   the port, `BEACON_WEB_PORT` (inside the container it is always 8080, and `web.port` in the configuration does not apply). The page is plain HTTP.
+   - **Reset button.** The map shows a locked-out beacon with a **Reset** button that needs a token: `./beaconctl web token generate`, then
+     `docker compose restart web` (the map reads the token when it starts). Without a token the button is replaced by the `beaconctl` command to run.
+     The token crosses the network in clear when it is used; use a network you trust.
+   - **Tiles.** Without a tiles file the map is a plain grid. Make one beforehand ([map-tiles.md](map-tiles.md)), copy it into `data/`, run
+     `./beaconctl tiles write-metadata /data/<file>.mbtiles` once (inside the container, so the path starts with `/data`), set `tiles = "<file>.mbtiles"`
+     under `[web]` in `data/config.toml`, and `docker compose restart web`. The map shows the credit that is in the file.
 
 ## 4. Onboard the repeaters and beacons
 
@@ -110,11 +123,16 @@ of these does, and "Managing repeaters over the mesh" covers changing a repeater
 | Is the container up and the companion connected? | `docker compose ps` (`healthy` / `unhealthy`; unhealthy usually means the companion is not connected) |
 | A single line for a script | `./beaconctl health --companion` (exit 0 is good) |
 | What it is doing | `docker compose logs --tail 50`, or `-f` to follow |
-| A beacon that stopped being accepted | `./beaconctl rejects`, then `./beaconctl beacon reset <prefix>` |
+| The map | `http://<the Pi's address>:8080/` (step 3.6) |
+| A beacon that stopped being accepted | The map's banner and **Reset** button, or `./beaconctl rejects` then `./beaconctl beacon reset <prefix>` |
+| The map's log; after changing its settings, the token or the tiles | `docker compose logs --tail 50 web`; `docker compose restart web` |
 | What each repeater last advertised | `./beaconctl repeater adverts` |
 | Any other `beaconctl` command | `./beaconctl <command>` |
 
 `./beaconctl` works with the stack stopped too, using a temporary container on the same `./data`.
+
+With the memory cgroup on, `docker stats` shows what each container uses against its limit. One sample on a Pi Zero 2 W with both services running:
+`ingest` 6 to 11 MiB of 256 MiB (two readings, a few hours apart) and `web` about 28 MiB of 128 MiB, each at about 0.5% CPU when idle (a reading taken as a container starts is higher for a moment); a figure far above that is worth a look in the logs.
 
 The database grows by about 9 MB a day at 30 beacons and 10 repeaters, a few tens of megabytes over a week; nothing needs pruning.
 
@@ -146,6 +164,8 @@ docker compose up -d                                    # then onboard the mesh 
 copy over `.env`, move or point to the same `data` folder (`mv ../old/data .`), and `docker compose up -d`. The database is upgraded when ingest
 starts; a database from a newer version is refused rather than damaged.
 
+The `compose.yaml` and the image must come from the same bundle: copying a new `compose.yaml` over an old install without `./load-image.sh` leaves an image that does not match it (see Troubleshooting). Run `./smoke-test.sh` after loading; it fails on an image that is too old.
+
 ## 8. Troubleshooting
 
 | What you see | What it means and what to do |
@@ -156,13 +176,17 @@ starts; a database from a newer version is refused rather than damaged.
 | `unhealthy`, and `status` says `companion: not connected` | The port name is wrong, or the companion is unplugged. `ls /dev/serial/by-id` on the Pi; the config needs `/hostdev` in front. `docker compose logs` shows the open error. |
 | The log says `Permission denied` opening the port | The container user is not in the port's group: set `BEACON_TTY_GID` in `.env` to the group id from `ls -ln /dev/ttyACM0`, then `docker compose up -d`. |
 | The log says `no reply to APP_START` | The board answers only with DTR high (an nRF52) or low (an ESP32-S3) and `companion.dtr = auto` could not decide; set `dtr = "on"` or `"off"` in the config. See [operations.md](operations.md). |
+| The `web` service restarts forever and its log says `entrypoint.sh: 10: exec: web: not found` (exit code 127) | The `compose.yaml` is newer than the image: an image from before the map was added does not know the command `web`. The two go together. Load the image from the same bundle as the compose file (`./load-image.sh`), then `docker compose up -d`, which recreates both containers. To check which image you have: `docker run --rm --entrypoint ls beacon-base:latest /usr/local/bin` lists `beacon-web` in a new one and not in an old one. `./smoke-test.sh` fails on an old image too. |
 | `exec format error` | The wrong image for this CPU. `uname -m`, and `./load-image.sh` again (it picks by that); `docker image inspect beacon-base:latest -f '{{.Architecture}}'`. |
 | `status` warns the clock is NOT SET, or times look wrong | Step 3.4. Observation times are corrected once the clock is set. |
 | After setting the clock, `Up 46 hours`, `started 2d ago` or `connected 2d ago` look far too long | They are computed from times saved before the clock jumped, so they include the jump (a 40-hour correction shows as 40 extra hours). For the real uptime use `uptime` on the Pi. A restart count of 0 does not rule out a reboot either: Docker starts the container again after a reboot without counting it. |
 | Reports stop and `status` shows beacons `silent` | Is `companion: connected`? Are the repeaters on and on the right channel (`./beaconctl rejects`; `./beaconctl check`)? |
 | A beacon shows `rejected` | See the README "When a beacon is locked out": usually `./beaconctl beacon reset <prefix>`. |
 | The container keeps restarting | `docker compose logs --tail 100`. The exit code 70 means the watchdog fired (no progress for two minutes); anything else is in the log. |
-| `docker stats` shows memory as `0B / 0B` | Raspberry Pi OS has the kernel's memory cgroup off, so Docker can neither show nor limit the container's memory (the 256 MB limit in `compose.yaml` is then not applied; the base itself is small: about 11 MB in use on a Pi Zero 2 W once the cgroup was turned on). To see the process's size anyway: `ps -eo rss,args \| grep beacon_base.service` (RSS in kB) and `free -m`. To turn the cgroup on, add `cgroup_enable=memory cgroup_memory=1` to the one line in `/boot/firmware/cmdline.txt` (remove `cgroup_disable=memory` if present) and reboot; not needed for the base to work. |
+| `docker stats` shows memory as `0B / 0B` | The kernel's memory cgroup is off (see "What you need"): Docker can neither show nor limit memory, so the limits in `compose.yaml` do nothing (with the cgroup on and only `ingest` running, about 11 MB was in use on a Pi Zero 2 W). Turn it on and reboot. To see a process's size anyway: `ps -eo rss,args \| grep -E 'beacon_base\.(service\|web)'` (RSS in kB) and `free -m`. |
+| The map does not open from another machine | `docker compose ps`: is `web` up and `healthy`? Is `BEACON_WEB_BIND` in `.env` `127.0.0.1` (the Pi only)? Is the address right (`hostname -I`) and the port `BEACON_WEB_PORT`? `docker compose logs web`. |
+| The map's Reset button shows a command instead | No token is configured, or `web` has not been restarted since it was made: `./beaconctl web token generate` then `docker compose restart web`. |
+| The map is a plain grid with a note, or shows no credit, or every tile is missing | See [map-tiles.md](map-tiles.md) and run `./beaconctl tiles check /data/<file>.mbtiles`: it says what the file holds, whether its rows are numbered the way the map reads them, and whether it has a credit. |
 | The Pi is slow or runs out of memory | A Pi Zero 2 W has 512 MB. `free -m`, and the `ps` line above. Do not run other things on the Pi. |
 | `./beaconctl time set` fails | It cannot set the host's clock from inside the container: use `sudo timedatectl set-time` on the Pi, then `./beaconctl time confirm`. |
 

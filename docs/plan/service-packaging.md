@@ -27,7 +27,7 @@ from a short guide.
 | 12 | **Logs** stay as they are (timestamps in the text; Docker adds its own), written to stdout/stderr and kept by the `json-file` driver with `max-size: 10m`, `max-file: 3` set in the compose file, so they cannot fill the SD card. |
 | 13 | **An operator guide**, `docs/deployment.md`: building the bundle, installing Docker on the Pi with no internet, loading the image, the first-start checklist (config, channel key, clock, repeaters), daily use, unplug/replug and power-loss behaviour, a new event, troubleshooting. The README links to it. |
 | 14 | **A host-side udev rule is optional**, shipped as `deploy/99-beacon-companion.rules.example` and explained in the guide: it gives the board a stable name and, on a system that has ModemManager (desktop images), tells it to leave the port alone, since it would otherwise probe it with AT commands. |
-| 15 | **Sized for 512 MB.** The compose file sets `mem_limit: 256m` (the container is expected to use well under 100 MB, and a leak is then killed and restarted by the container's own policy rather than starving the Pi), `init: true` (a proper PID 1 that forwards SIGTERM and reaps children), and no extra containers: `beaconctl` runs inside the one that exists. |
+| 15 | **Sized for 512 MB.** The compose file sets `mem_limit: 256m` (the container is expected to use well under 100 MB, and a leak is then killed and restarted by the container's own policy rather than starving the Pi), `init: true` (a proper PID 1 that forwards SIGTERM and reaps children), and, at first, no extra containers (`beaconctl` runs inside the one that exists). **Updated 2026-10-13:** a second service, `web` (the map and API), runs from the same image with `mem_limit: 128m` ([web-docker.md](web-docker.md)); the memory cgroup is turned on as part of preparing the Pi, so both limits apply. |
 
 ## What exists and what is missing
 
@@ -152,11 +152,11 @@ checks that the documents' relative links resolve, that the files and commands t
   held only the start-up lines: the watchdog notice and two `unknown_repeater` warnings from the first minutes, before the repeaters were added. `check`
   warned that `beacon.window` was not recorded for the three repeaters, which is configuration (`beaconctl repeater window`, or any `repeater remote ... get
   beacon.window`, which records it), not a fault. The operator ended the session at ten hours instead of a full day.
-- **Memory could not be measured, and the limit is not enforced.** `docker stats` showed `0B / 0B` for memory: Raspberry Pi OS ships with the kernel's memory
+- **Memory could not be measured, and the limit was not enforced (until the cgroup was turned on).** `docker stats` showed `0B / 0B` for memory: Raspberry Pi OS ships with the kernel's memory
   cgroup off, so Docker cannot account for or limit memory, and the compose file's `mem_limit: 256m` (decision 15) does nothing on a stock install. Nothing
   went wrong in ten hours (no restarts, healthy), so a leak is unlikely, but it is unproven. To turn the controller on, add `cgroup_enable=memory
-  cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; this has **not** been tried
-  on this Pi. Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
+  cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; the operator has since done this and made it a step of preparing the Pi (2026-10-13), so the limits apply. With it on, one `docker stats` sample on the Pi with both services
+  running read: ingest 6.0 MiB of 256 MiB, web 28.1 MiB of 128 MiB ([web-docker.md](web-docker.md), W5). Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
   The guide now says all of this.
 - **Longer run, after the memory cgroup was turned on (2026-10-14):** the setting above works on the Pi Zero 2 W: `docker stats` shows `10.7MiB / 256MiB`
   (4.2%), so the container is far under the 256 MB limit and the limit is now enforced. CPU 0.9%, 3 processes, `./data` 5.2 MB (two beacons, three repeaters),

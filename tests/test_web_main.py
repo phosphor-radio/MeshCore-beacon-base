@@ -73,3 +73,12 @@ def test_without_the_web_extra_it_says_what_to_install(config, monkeypatch, caps
     monkeypatch.setattr(builtins, "__import__", refuse)
     assert web.main(["-c", config]) == 2
     assert "pip install 'beacon-base[web]'" in capsys.readouterr().err
+
+
+def test_check_reads_the_configuration_and_opens_nothing(config, served, tmp_path, capsys):
+    assert web.main(["-c", config, "--check"]) == 0
+    assert "configuration ok" in capsys.readouterr().out
+    assert served == [] and not (tmp_path / "beacon.db").exists()  # no server, and no database created as a side effect
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[web]\nport = 0\n")
+    assert web.main(["-c", str(bad), "--check"]) == 2

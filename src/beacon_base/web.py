@@ -30,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging, and a line per request")
     p.add_argument("--host", help="address to listen on (overrides web.host; the default is 127.0.0.1)")
     p.add_argument("--port", type=int, help="port to listen on (overrides web.port)")
+    p.add_argument("--check", action="store_true", help="only check that the configuration can be read, then exit (the container's entry point waits on this)")
     args = p.parse_args(argv)
     setup_logging(args.verbose)
     try:
@@ -44,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
         changes = {k: v for k, v in (("host", args.host), ("port", args.port)) if v}
         if changes:
             cfg = dataclasses.replace(cfg, web=dataclasses.replace(cfg.web, **changes))
+        if args.check:  # nothing is opened: no database is created and no tiles file is read
+            print(f"configuration ok: database {cfg.db_path}, serving {cfg.web.host}:{cfg.web.port}")
+            return 0
         app = app_from_config(cfg)
     except (ConfigError, StoreError) as e:
         print(f"beacon-web: {e}", file=sys.stderr)

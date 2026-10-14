@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
-from fastapi.testclient import TestClient  # noqa: E402
+pytest.importorskip("starlette")
+pytest.importorskip("httpx2")
+from starlette.testclient import TestClient  # noqa: E402
 
 from beacon_base import heartbeat  # noqa: E402
 from beacon_base.api import app_from_config, create_app  # noqa: E402
@@ -99,7 +99,7 @@ def test_unknown_things_are_404_not_500(client, path):
 def test_limits_are_validated(client):
     assert client.get(f"/api/beacons/{BEACON_PREFIX.hex()}?limit=0").status_code == 422
     assert client.get(f"/api/beacons/{BEACON_PREFIX.hex()}/track?hours=-1").status_code == 422
-    assert client.get("/api/transmissions/abc").status_code == 422
+    assert client.get("/api/transmissions/abc").status_code == 404  # not a number: the route does not match
 
 
 def test_the_api_can_be_read_with_ingest_never_having_run(cfg):
@@ -277,3 +277,66 @@ def test_mbtiles_reader_directly(tmp_path):
     with pytest.raises(TilesError, match="pbf"):
         MBTiles(make_mbtiles(tmp_path / "b.mbtiles", [], fmt="pbf"))
     assert open_tiles(None) == (None, None)
+
+
+# --- what FastAPI used to do for us ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["limit=0", "limit=501", "limit=-3", "limit=abc", "limit=1.5", "limit="],
+)
+def test_a_bad_limit_is_a_422_that_says_which(client, query):
+    r = client.get(f"/api/beacons/{BEACON_PREFIX.hex()}?{query}")
+    assert r.status_code == 422 and r.json()["detail"].startswith("limit must be")
+
+
+@pytest.mark.parametrize("query", ["hours=0", "hours=-1", "hours=745", "hours=nan", "hours=inf", "hours=soon", "limit=2001"])
+def test_a_bad_track_query_is_a_422(client, query):
+    r = client.get(f"/api/beacons/{BEACON_PREFIX.hex()}/track?{query}")
+    assert r.status_code == 422 and "detail" in r.json()
+
+
+def test_values_at_the_edges_of_the_bounds_are_accepted(client):
+    prefix = BEACON_PREFIX.hex()
+    assert client.get(f"/api/beacons/{prefix}?limit=1").status_code == 200
+    assert client.get(f"/api/beacons/{prefix}?limit=500").status_code == 200
+    assert client.get(f"/api/beacons/{prefix}/track?hours=744&limit=2000").status_code == 200
+    assert client.get(f"/api/beacons/{prefix}/track?hours=0.001").status_code == 200
+    assert client.get("/api/rejects?limit=500").status_code == 200
+
+
+def test_every_error_is_json_with_a_detail_and_still_carries_the_security_headers(client):
+    for r in (client.get("/api/nothing"), client.get("/static/missing.js"), client.post("/api/state"), client.get("/api/beacons/zz"),
+              client.post(f"/api/beacons/{BEACON_PREFIX.hex()}/reset")):
+        assert r.status_code in (404, 405, 401) and set(r.json()) == {"detail"}, r.url
+        assert r.headers["content-type"].startswith("application/json")
+        assert r.headers["x-content-type-options"] == "nosniff" and "script-src 'self'" in r.headers["content-security-policy"], r.url
+    assert client.get("/api/nothing").headers["cache-control"] == "no-store"
+
+
+def test_head_requests_work_for_the_page_and_the_api(client):
+    assert client.head("/").status_code == 200
+    assert client.head("/api/health").status_code == 200
+
+
+def test_a_busy_database_is_a_503_not_a_crash(client, monkeypatch):
+    from beacon_base import views
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(views, "state_view", locked)
+    r = client.get("/api/state")
+    assert r.status_code == 503 and "busy" in r.json()["detail"]
+
+
+def test_the_web_code_does_not_import_fastapi_or_pydantic():
+    """The Docker image copies pure-Python packages to another CPU; pydantic's core is compiled (docs/plan/web-docker.md)."""
+    from pathlib import Path
+
+    import beacon_base
+
+    for source in Path(beacon_base.__file__).parent.glob("*.py"):
+        text = source.read_text()
+        assert "import fastapi" not in text and "from fastapi" not in text and "pydantic" not in text, source.name

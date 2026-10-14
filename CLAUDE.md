@@ -17,7 +17,7 @@ from repeater adverts, plus discovery and auto-add). The remote repeater managem
 hardware with three repeaters in one room, so multi-hop paths are untested. B3 (packaging for a week-long event on a Pi Zero 2 W with no
 internet, in Docker: `docs/plan/service-packaging.md`, `docs/deployment.md`) is built and tested here (watchdog, `beaconctl health`, image, compose
 bundle, guide) and was run on a Pi Zero 2 W through a reboot, power cuts, an unplug/replug and a clock correction; the watchdog has not fired there and the full week has not been run. B4 (the map and API: `docs/plan/web-map.md`, `docs/web.md`) is built and tested on the branch `b4-web-map`
-(estimator and `positions`, `beacon-web`, the token, MBTiles, the Leaflet page, `simulate --walk`); not yet in the Docker image, and not tried with real beacons on the hardware; making offline map tiles from a Geofabrik extract (`docs/map-tiles.md`) is verified, with `beacon-web` shown with no internet.** The plans are the source of truth:
+(estimator and `positions`, `beacon-web` on Starlette, the token, MBTiles, the Leaflet page, `simulate --walk`) and merged; in the Docker image as the compose file's second service `web` (`docs/plan/web-docker.md`: built for arm64 here; run on the Pi Zero 2 W and reported successful 2026-10-13, with `web` at about 28 MiB of its 128 MiB limit), not tried with real beacons on the hardware; making offline map tiles from a Geofabrik extract (`docs/map-tiles.md`) is verified, with `beacon-web` shown with no internet.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): this repo's design: architecture, companion link, data model,
@@ -61,7 +61,7 @@ Three processes, one shared SQLite file (WAL) as the only interface. No IPC, no 
 
 - `beacon-ingest`: systemd service; the only process that opens the serial port; reconnects, provisions the channel,
   drains frames, runs the replay/dedupe pipeline, writes the DB.
-- `beacon-web`: FastAPI HTTP API plus static Leaflet UI; read-mostly; operator actions (reset, edit) behind a token;
+- `beacon-web`: Starlette HTTP API plus static Leaflet UI (Starlette, not FastAPI: pydantic is compiled, and the Docker image copies only pure-Python packages across CPUs); read-mostly; operator actions (reset, edit) behind a token;
   binds to localhost by default.
 - `beaconctl`: CLI for provisioning, status, rejects, reset, clock, listen, simulate.
 
@@ -92,7 +92,7 @@ src/beacon_base/   wire.py       report and name-announcement decoders/encoders,
                    heartbeat.py  the service_status row ingest keeps current; HeartbeatWriter, liveness (monotonic clock)
                    watchdog.py   in-process watchdog: exits the process if the session loop stalls (service.watchdog_s / $BEACON_WATCHDOG_S)
                    estimate.py   placeholder location estimator (range circle / weighted centroid); pure; the pipeline writes its output to `positions`
-                   views.py      the store as JSON-able dicts for the web (no HTTP); api.py the FastAPI app; web.py the beacon-web entry point
+                   views.py      the store as JSON-able dicts for the web (no HTTP); api.py the Starlette app; web.py the beacon-web entry point
                    tiles.py      raster MBTiles reader behind /tiles/{z}/{x}/{y}
                    static/       the map page (index.html, app.js, app.css) and vendored Leaflet; package data, so `pip install .` carries it
 tests/             unit, pipeline, fake-companion session tests, fixtures/ (golden vectors from the firmware repo)
@@ -135,9 +135,11 @@ becomes the baseline). `Verdict.auto_added` / `AdvertEffect.added` say what was 
 **The map** (plan `docs/plan/web-map.md`, guide `docs/web.md`): `beacon-web` only reads the database (a connection per request) and has one write,
 reset, behind a bearer token (`[web]` in `secrets.toml` or `$BEACON_WEB_TOKEN`; no token means read-only). Positions are estimated by ingest inside the
 report's transaction (`Pipeline._locate`, one `positions` row per transmission, replaced as more repeaters report; `beaconctl positions rebuild` redoes
-them) from `Store.hearings`, which uses only enabled, located repeaters. Tiles files: `tiles.py` reads either row numbering (`web.tiles_scheme`; MapProxy writes XYZ rows, the spec says TMS), `beaconctl tiles check` diagnoses one and `tiles write-metadata` renumbers it and writes the metadata and the OpenStreetMap credit (guide `docs/map-tiles.md`). FastAPI and uvicorn are the optional `web` extra. The page builds DOM and text
+them) from `Store.hearings`, which uses only enabled, located repeaters. Tiles files: `tiles.py` reads either row numbering (`web.tiles_scheme`; MapProxy writes XYZ rows, the spec says TMS), `beaconctl tiles check` diagnoses one and `tiles write-metadata` renumbers it and writes the metadata and the OpenStreetMap credit (guide `docs/map-tiles.md`). Starlette and uvicorn are the optional `web` extra (uvicorn without `[standard]`, whose uvloop and httptools are compiled). The page builds DOM and text
 only (names are untrusted; Leaflet reads a *string* tooltip as markup, so tooltips are given elements; `tests/test_static.py` enforces both). The Docker
-image does not carry `beacon-web` yet: pydantic has compiled wheels, which the image's pure-Python build stage cannot copy across CPUs.
+image runs it as the second compose service, `web` (command `web`, the same image, only `./data` mounted, published on `BEACON_WEB_BIND`:`BEACON_WEB_PORT`, default `0.0.0.0:8080`;
+the token is read at start, so `docker compose restart web` after `web token generate`). The image's build stage fails if a compiled library gets in, and
+`tests/test_docker.py` (opt-in) builds it for `linux/arm64` here.
 
 Pipeline rules worth remembering (full text in the base plan): unknown repeater/beacon and disabled entries are stored but
 change nothing (the repeater is checked first, so repeaters are onboarded before beacons); an unknown repeater can never move a high-water mark; a counter below the mark is `replay`, with reason
@@ -155,7 +157,7 @@ deployment migration 1 may still be edited, and the development database deleted
 ## Constraints to keep in mind
 
 - **Linux only.** Targets a Raspberry Pi in the field and the Ubuntu dev machine. Python 3.11+ (dev machine has 3.14),
-  `pyserial`, stdlib `sqlite3`, FastAPI.
+  `pyserial`, stdlib `sqlite3`, Starlette (pure Python: no FastAPI or pydantic).
 - **No internet at runtime**, including map tiles (local MBTiles). Pi clock is set manually after boot, so observation
   times are stamped on the base, with `rx_mono`/`boot_id` kept to repair them after a clock step.
 - **Everything must run without hardware**: fake companion (pty) and synthetic reports drive tests and the UI.
@@ -180,7 +182,7 @@ deployment migration 1 may still be edited, and the development database deleted
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'     # editable install; needs pyserial, pytest, and fastapi/uvicorn/httpx for the web tests
+pip install -e '.[dev]'     # editable install; needs pyserial, pytest, and starlette/uvicorn/httpx2 for the web tests
 pytest                       # ~800 tests, ~2.5 min, no hardware needed (fake companion on a pty)
 beaconctl simulate --provision   # fake companion + synthetic reports (+ matching beacons/repeaters); prints the pty path
 beacon-ingest --port <path>      # store reports; then 'beaconctl status', 'rejects', 'beacon status <name>'

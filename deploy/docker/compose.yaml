@@ -1,8 +1,8 @@
 # Docker Compose file for the base station on a Raspberry Pi. See docs/deployment.md.
 #
 #   docker load -i image-<arch>.tar        # once (load-image.sh picks the right file)
-#   docker compose up -d
-#   ./beaconctl status                     # beaconctl runs inside the container
+#   docker compose up -d                   # starts ingest (the companion) and web (the map)
+#   ./beaconctl status                     # beaconctl runs inside the ingest container
 #
 # Everything the base needs to keep (configuration, secrets, database) is in ./data. For a new event, stop the stack and move ./data away.
 
@@ -38,6 +38,38 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The map and API (docs/web.md). The same image as ingest, with the command "web". It needs only ./data (the database to read, a reset to write,
+  # the configuration, the secrets and the tiles file), not the serial device. It does not depend on ingest: the map says when ingest is down.
+  web:
+    image: beacon-base:${BEACON_VERSION:-latest}
+    command: ["web"]
+    restart: unless-stopped
+    init: true
+    user: "${BEACON_UID:-1000}:${BEACON_GID:-1000}"
+    environment:
+      TZ: "${TZ:-UTC}"
+    ports:
+      # Published on every interface by default, so a laptop or phone on the network can open it; set BEACON_WEB_BIND=127.0.0.1 in .env to keep
+      # it to the Pi. The page is plain HTTP, so the operator token (./beaconctl web token generate) crosses the network in clear.
+      - "${BEACON_WEB_BIND:-0.0.0.0}:${BEACON_WEB_PORT:-8080}:8080"
+    volumes:
+      - ./data:/data
+      - /etc/localtime:/etc/localtime:ro
+    mem_limit: 128m       # needs the memory cgroup on the Pi (cgroup_enable=memory cgroup_memory=1 in /boot/firmware/cmdline.txt)
+    stop_grace_period: 10s
+    healthcheck:
+      # no curl in the image: ask the API from inside with Python
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging:
       driver: json-file
       options:

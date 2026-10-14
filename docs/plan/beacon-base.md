@@ -13,7 +13,7 @@ made while implementing B2 are marked "(B2)".
 
 | # | Decision |
 |---|---|
-| 1 | Python 3.11+ with `pyserial`, stdlib `sqlite3` and FastAPI. Static Leaflet page for the UI. |
+| 1 | Python 3.11+ with `pyserial`, stdlib `sqlite3` and Starlette (FastAPI at first; changed 2026-10-13 so the Docker image stays pure Python, [web-docker.md](web-docker.md)). Static Leaflet page for the UI. |
 | 2 | The base lives in a **separate repository** (the planning docs may move there too). See "Repository and wire format". |
 | 3 | The map needs an **offline tile cache**. The deployment area is fixed, so a tile cache built from a manually set extent is a planned (future) feature. |
 | 4 | **No counter-jump quarantine.** Any limit only reduces damage and does not prevent lockout, so instead the operator gets fast visibility of rejected beacons and a one-step reset. |
