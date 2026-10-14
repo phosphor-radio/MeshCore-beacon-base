@@ -7,7 +7,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 # docs/plan links were written for the firmware repository's layout (see CLAUDE.md), so only the documents meant to be read here are checked
-DOCS = [ROOT / "README.md", ROOT / "CLAUDE.md", ROOT / "docs" / "deployment.md", ROOT / "docs" / "operations.md", ROOT / "docs" / "wire-format.md"]
+DOCS = [ROOT / "README.md", ROOT / "CLAUDE.md", ROOT / "docs" / "deployment.md", ROOT / "docs" / "operations.md", ROOT / "docs" / "wire-format.md", ROOT / "docs" / "web.md", ROOT / "docs" / "map-tiles.md"]
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 
 
@@ -51,3 +51,13 @@ def test_the_guide_uses_only_commands_and_paths_that_exist():
         parser.parse_args(re.sub(r"<[^>]*>", "x", line).split())
         checked += 1
     assert checked >= 6
+
+
+def test_the_tiles_guide_only_uses_beaconctl_commands_that_parse():
+    from beacon_base.cli import build_parser
+
+    guide = (ROOT / "docs" / "map-tiles.md").read_text()
+    commands = re.findall(r"^beaconctl (tiles [^#\n]+?)\s*(?:#.*)?$", guide, flags=re.M)
+    assert any(c.startswith("tiles write-metadata") for c in commands) and any(c.startswith("tiles check") for c in commands)
+    for command in commands:
+        build_parser().parse_args(command.split())

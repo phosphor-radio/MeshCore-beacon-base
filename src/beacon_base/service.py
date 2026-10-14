@@ -14,6 +14,7 @@ from collections import Counter
 
 from . import clock, heartbeat, names
 from .config import Config, ConfigError, load_config
+from .estimate import Estimator
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, RawFrame, ReceivedNames, ReceivedReport
 from .link import DTR_MODES, CompanionError
 from .pipeline import Pipeline
@@ -208,7 +209,7 @@ def run(cfg: Config, stop: threading.Event) -> None:
         raise ConfigError("no report channel key; run 'beaconctl channel generate' first")
     with Store.open(cfg.db_path) as store:
         log.info("database %s (schema %d)", cfg.db_path, store.schema_version())
-        pipeline = Pipeline(store, assume_synced=cfg.clock.assume_synced)
+        pipeline = Pipeline(store, assume_synced=cfg.clock.assume_synced, estimator=Estimator(cfg.estimate, cfg.radio.freq_khz))
         interrupted = store.recover_jobs()
         if interrupted:
             log.warning("%d remote job(s) were running when ingest last stopped; they are marked failed", interrupted)

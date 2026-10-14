@@ -219,3 +219,24 @@ def test_listen_prints_repeater_adverts(capsys):
     recs = [json.loads(l) for l in lines[2:]]
     assert (recs[0]["type"], recs[0]["lat"], recs[0]["live"]) == ("repeater_advert", 40.5, True)
     assert recs[1]["lat"] is None and recs[1]["lon"] is None and recs[1]["live"] is False  # 0, 0 is reported as no position
+
+
+def test_web_token_generate_show_and_refuse_to_replace(cfg_file, tmp_path, capsys):
+    assert main(["-c", cfg_file, "web", "token", "show"]) == 2  # none yet
+    capsys.readouterr()
+    assert main(["-c", cfg_file, "channel", "generate"]) == 0
+    capsys.readouterr()
+    assert main(["-c", cfg_file, "web", "token", "generate"]) == 0
+    token = [line for line in capsys.readouterr().out.splitlines() if line.startswith("web token: ")][0].split(": ", 1)[1]
+    assert len(token) >= 16
+    assert stat.S_IMODE((tmp_path / "secrets.toml").stat().st_mode) == 0o600
+    assert main(["-c", cfg_file, "web", "token", "show"]) == 0
+    assert capsys.readouterr().out.strip() == token
+    assert main(["-c", cfg_file, "web", "token", "generate"]) == 2  # a token is in use: replacing it needs --force
+    assert main(["-c", cfg_file, "web", "token", "generate", "--force"]) == 0
+    assert main(["-c", cfg_file, "channel", "show"]) == 0  # the channel key survived both writes
+
+
+def test_positions_rebuild_runs(cfg_file, capsys):
+    assert main(["-c", cfg_file, "positions", "rebuild"]) == 0
+    assert "0 transmission(s)" in capsys.readouterr().out

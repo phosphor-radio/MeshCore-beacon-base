@@ -12,7 +12,7 @@ import sys
 import threading
 
 from . import __version__, admin, remote_cli
-from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key
+from .config import CHANNEL_KEY_LEN, Config, ConfigError, load_config, parse_channel_key, store_channel_key, store_web_token
 from .ingest import CompanionSession, ConnectionInfo, Handler, HeardRepeater, ReceivedNames, ReceivedReport
 from .link import DTR_MODES, CompanionError
 from .names import sanitize_name
@@ -137,6 +137,22 @@ def cmd_channel_show(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_web_token_generate(args: argparse.Namespace, cfg: Config) -> int:
+    token = secrets.token_urlsafe(24)
+    path = store_web_token(cfg, token, force=args.force)
+    print(f"saved to {path} (mode 0600)")
+    print(f"web token: {token}")
+    print("beacon-web asks for it before the Reset button does anything; restart beacon-web to use it")
+    return 0
+
+
+def cmd_web_token_show(args: argparse.Namespace, cfg: Config) -> int:
+    if cfg.web_token is None:
+        raise ConfigError("no web token; run 'beaconctl web token generate'")
+    print(cfg.web_token)
+    return 0
+
+
 def cmd_listen(args: argparse.Namespace, cfg: Config) -> int:
     cfg = _with_port(cfg, args.port, args.dtr)
     stop = stop_on_signals()
@@ -147,12 +163,16 @@ def cmd_listen(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
+    from .estimate import Estimator
     from .fake_companion import FakeCompanion
     from .simulate import Simulator
 
     stop = stop_on_signals()
     with FakeCompanion() as fake:
-        sim = Simulator(fake, cfg.companion.channel_index, args.beacons, args.repeaters, args.seed)
+        sim = Simulator(
+            fake, cfg.companion.channel_index, args.beacons, args.repeaters, args.seed, walk=args.walk, walk_step_m=args.walk_step,
+            estimator=Estimator(cfg.estimate, cfg.radio.freq_khz),
+        )
         if args.provision:
             with Store.open(cfg.db_path) as store:
                 for beacon_id in sim.beacon_ids:
@@ -163,7 +183,7 @@ def cmd_simulate(args: argparse.Namespace, cfg: Config) -> int:
         print(f"fake companion on {fake.path}")
         print(f"  ingest with:  beacon-ingest --port {fake.path}   (or: beaconctl listen --port ...)")
         for i, beacon_id in enumerate(sim.beacon_ids, 1):
-            print(f"  beacon {i}:    {beacon_id.hex()}")
+            print(f"  beacon {i}:    {beacon_id.hex()}" + ("  (walking round the repeaters)" if args.walk and i == 1 else ""))
         for i, key in enumerate(sim.repeater_keys, 1):
             print(f"  repeater {i}:  {key.hex()}", flush=True)
         sim.announce_names()
@@ -203,6 +223,15 @@ def build_parser() -> argparse.ArgumentParser:
     show = channel.add_parser("show", help="print the channel key, for provisioning a repeater")
     show.set_defaults(func=cmd_channel_show)
 
+    web = sub.add_parser("web", help="beacon-web settings").add_subparsers(dest="web_command", required=True)
+    token = web.add_parser("token", help="the operator token beacon-web asks for before it resets a beacon").add_subparsers(
+        dest="token_command", required=True
+    )
+    gen = token.add_parser("generate", help="create a random token and store it in secrets.toml")
+    gen.add_argument("--force", action="store_true", help="replace an existing token")
+    gen.set_defaults(func=cmd_web_token_generate)
+    token.add_parser("show", help="print the token").set_defaults(func=cmd_web_token_show)
+
     listen = sub.add_parser("listen", help="print decoded reports live")
     listen.add_argument("--port", help="companion serial port (overrides companion.port)")
     listen.add_argument("--dtr", choices=DTR_MODES, help="DTR when opening the port (overrides companion.dtr; see docs/operations.md)")
@@ -222,6 +251,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--beacons", type=int, default=3)
     sim.add_argument("--repeaters", type=int, default=3)
     sim.add_argument("--seed", type=int, default=1)
+    sim.add_argument("--walk", action="store_true", help="carry the first beacon round a course past the repeaters (all located), with RSSI from the distance")
+    sim.add_argument("--walk-step", type=float, default=80.0, metavar="METRES", help="with --walk: how far it moves each tick")
     sim.add_argument("--names-every", type=int, default=12, metavar="N", help="repeat the repeaters' name announcements every N ticks")
     sim.add_argument("--provision", action="store_true", help="also add the simulated beacons and repeaters to the database")
     sim.set_defaults(func=cmd_simulate)
@@ -320,6 +351,32 @@ def _add_admin_commands(sub) -> None:
     p.add_argument("--beacon", metavar="prefix", help="only this beacon (key prefix, six or more hex digits)")
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(func=admin.cmd_rejects)
+
+    tiles = sub.add_parser("tiles", help="map tiles file").add_subparsers(dest="tiles_command", required=True)
+    p = tiles.add_parser("check", help="what a tiles file holds, and whether the map will show it where the repeaters are")
+    p.add_argument("file", nargs="?", help="an MBTiles file (default: web.tiles)")
+    p.add_argument("--scheme", choices=("auto", "tms", "xyz"), help="read the rows this way (default: web.tiles_scheme)")
+    p.set_defaults(func=admin.cmd_tiles_check)
+    p = tiles.add_parser(
+        "write-metadata",
+        help="make a tiles file ready for the map: renumber its rows from the south if they are from the north, and write its metadata",
+        description="Renumber the file's rows from the south (the MBTiles specification) when they are numbered from the north, as MapProxy "
+        "writes them, and write the metadata the map uses: zoom range, bounds and format from the tiles, the credit from --attribution "
+        "(default: OpenStreetMap's). It decides how the rows are numbered from the file's own scheme metadata, else from where your located "
+        "repeaters are; say --rows if neither can. One transaction: a failure leaves the file as it was. Stop beacon-web first, or restart it after.",
+    )
+    p.add_argument("file", help="an MBTiles file with raster tiles")
+    p.add_argument("--name", help="the name of the map (default: the file's, else its file name)")
+    p.add_argument("--attribution", help="the credit shown in the map's corner, HTML (default: OpenStreetMap contributors with a link to the licence)")
+    p.add_argument("--description", help="a description of where the tiles came from")
+    p.add_argument("--rows", choices=("auto", "tms", "xyz"), default="auto", help="how the file numbers its rows now (default: work it out)")
+    p.add_argument("--dry-run", action="store_true", help="show what would be done and change nothing")
+    p.set_defaults(func=admin.cmd_tiles_write_metadata)
+
+    positions = sub.add_parser("positions", help="estimated beacon positions").add_subparsers(dest="positions_command", required=True)
+    p = positions.add_parser("rebuild", help="estimate transmissions again with the repeaters' positions as they are now")
+    p.add_argument("--hours", type=float, help="only transmissions last seen within this many hours (default: all)")
+    p.set_defaults(func=admin.cmd_positions_rebuild)
 
     p = sub.add_parser("time", help="show the clock state; 'set' and 'confirm' fix it")
     p.set_defaults(func=admin.cmd_time)

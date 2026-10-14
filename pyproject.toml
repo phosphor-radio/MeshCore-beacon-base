@@ -13,16 +13,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 dev = [
     "pytest>=8",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",  # the FastAPI test client
 ]
 
 [project.scripts]
 beaconctl = "beacon_base.cli:main"
 beacon-ingest = "beacon_base.service:main"
+beacon-web = "beacon_base.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+beacon_base = ["static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

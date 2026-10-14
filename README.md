@@ -14,7 +14,11 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > three repeaters in one room; paths of more than zero hops have not been tested.
 > For the Raspberry Pi there is a Docker image and compose file (`deploy/docker/`; `build-bundle.sh` makes the folder to carry to a Pi with no
 > internet) and an operator guide, [docs/deployment.md](docs/deployment.md) (B3, [docs/plan/service-packaging.md](docs/plan/service-packaging.md)); the
-> Pi run itself (B3.4) is still to do. No web UI yet (B4). See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
+> Pi run itself (B3.4) is still to do.
+> **The map and API (B4, branch `b4-web-map`) are built and tested here**: `beacon-web` serves a Leaflet map with local tiles, the repeaters, the beacons
+> with a placeholder position estimate, banners for a down ingest, an unset clock and locked-out beacons, and a token-protected Reset
+> ([docs/web.md](docs/web.md), [docs/plan/web-map.md](docs/plan/web-map.md)). Making its offline map tiles from a Geofabrik extract has been verified end to end ([docs/map-tiles.md](docs/map-tiles.md)). It is not in the
+> Docker image yet, and it has not been tried with real beacons walking past real repeaters. See [docs/plan/beacon-base.md](docs/plan/beacon-base.md) and
 > [docs/plan/beacon-names.md](docs/plan/beacon-names.md) and [docs/plan/repeater-onboarding.md](docs/plan/repeater-onboarding.md).
 
 ## How the system works
@@ -41,12 +45,12 @@ also run on an ordinary Ubuntu machine for development.
 
 ## What is in this repo
 
-Three cooperating processes sharing one SQLite database (WAL mode) as their only interface. The web UI does not exist yet:
+Three cooperating processes sharing one SQLite database (WAL mode) as their only interface:
 
 | Process | Job |
 |---|---|
 | `beacon-ingest` | systemd service. Owns the companion's serial port, decodes reports, runs the replay/dedupe pipeline. |
-| `beacon-web` | HTTP API and Leaflet map UI. Separate from ingest, so it can be restarted or left off without losing reports. |
+| `beacon-web` | HTTP API and Leaflet map ([docs/web.md](docs/web.md)). Separate from ingest, so it can be restarted or left off without losing reports. |
 | `beaconctl` | CLI for provisioning (beacons, repeaters, channel key), status, rejects, reset, clock, simulation, and reading or changing repeaters over the mesh. |
 
 Everything must work without hardware: a fake companion and synthetic reports allow the pipeline and UI to be built and
@@ -67,6 +71,8 @@ package. See [utilities/README.md](utilities/README.md).
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): overall project plan, decisions, security model, milestones.
 - [docs/plan/beacon-base.md](docs/plan/beacon-base.md): base design, data model, pipeline, phases B0-B4.
 - [docs/plan/repeater-remote.md](docs/plan/repeater-remote.md): managing repeaters over the mesh (a small fixed set of operations), the ingest heartbeat.
+- [docs/web.md](docs/web.md): the map and API: running `beacon-web`, reading the page, tiles with no internet, the API, safety notes.
+- [docs/map-tiles.md](docs/map-tiles.md): making an offline MBTiles map for your area from a Geofabrik OpenStreetMap extract, and the credit it needs.
 - [docs/wire-format.md](docs/wire-format.md): the report format and the companion frame that carries it.
 - [docs/deployment.md](docs/deployment.md): running the base on a Raspberry Pi in Docker with no internet: building the bundle, first start, the event, troubleshooting.
 - [docs/operations.md](docs/operations.md): running on real hardware: the companion's USB serial (DTR) settings, managing repeaters, troubleshooting.
@@ -102,6 +108,10 @@ beaconctl repeater add --all                 # trust them; position and name com
 beaconctl beacon add --all                   # then the beacons they report (or: beacon add <prefix>)
 beaconctl check                              # sanity-check the setup
 beaconctl status                             # one line per beacon, rejected and silent first
+
+pip install -e '.[web]'                      # the map (included in '.[dev]'); see docs/web.md
+beaconctl web token generate                 # the token the map's Reset button asks for
+beacon-web                                   # http://127.0.0.1:8080/
 ```
 
 `beaconctl` options: `-c <config>` (or `$BEACON_BASE_CONFIG`), `-v` for debug logging. The database defaults to
@@ -127,7 +137,11 @@ beaconctl status                             # one line per beacon, rejected and
 | `health` / `health --companion` | One line and an exit status: 0 when `beacon-ingest` is running (with `--companion`, and the companion connected), 1 otherwise. For a container healthcheck or a script; it does not open the serial port or create a database. |
 | `listen [--port P] [--json] [--count N]` | Bring-up view: print decoded reports and name announcements without storing them. Only one of `listen` and `beacon-ingest` can have the port. |
 | `ingest [--port P]` | Same as `beacon-ingest`. |
-| `simulate [--provision] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. |
+| `simulate [--provision] [--walk] ...` | Run a fake companion on a pseudo-terminal with synthetic reports. `--walk` carries the first beacon round a course past located repeaters, for the map. |
+| `web token generate [--force]` / `web token show` | The operator token `beacon-web` asks for before it resets a beacon, kept in `secrets.toml` next to the channel key. |
+| `tiles check [file] [--scheme S]` | What a map tiles file holds, how it numbers its rows, and whether the map will show it where the repeaters are ([docs/map-tiles.md](docs/map-tiles.md)). |
+| `tiles write-metadata <file> [--name N] [--attribution HTML] [--rows tms\|xyz] [--dry-run]` | Make a tiles file ready for the map: renumber its rows from the south if they are from the north (MapProxy), and write its metadata, the OpenStreetMap credit by default. Echoes the metadata. |
+| `positions rebuild [--hours H]` | Estimate stored transmissions again with the repeaters' positions as they are now (positions are worked out once, when a report arrives). |
 
 ### What the base sets on the companion at startup
 
@@ -394,3 +408,11 @@ Later: location estimation, offline tile-cache builder, repeater timestamps, air
 ## License
 
 Not yet chosen. The firmware fork is MIT licensed.
+
+## Credits
+
+Map data is © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, available under the
+[Open Data Commons Open Database Licence (ODbL)](https://opendatacommons.org/licenses/odbl/1-0/). Regional extracts come from
+[Geofabrik](https://download.geofabrik.de/) ("Data processed by Geofabrik GmbH and created by OpenStreetMap Contributors"). The map page shows the
+credit in its corner and must keep doing so for any tiles made from that data ([docs/map-tiles.md](docs/map-tiles.md)). The map is drawn
+with [Leaflet](https://leafletjs.com/) (BSD 2-Clause, vendored in `src/beacon_base/static/vendor/leaflet/`).

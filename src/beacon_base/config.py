@@ -17,6 +17,8 @@ CONFIG_ENV = "BEACON_BASE_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.config/beacon-base/config.toml")
 SECRETS_FILENAME = "secrets.toml"
 CHANNEL_KEY_LEN = 16
+WEB_TOKEN_ENV = "BEACON_WEB_TOKEN"
+MIN_WEB_TOKEN_LEN = 16
 
 
 class ConfigError(Exception):
@@ -81,6 +83,29 @@ class RemoteConfig:
 
 
 @dataclass(frozen=True)
+class EstimateConfig:
+    """The placeholder location estimator (estimate.py). Radii are only as good as these two numbers; tune them from walk tests."""
+
+    tx_power_dbm: float = 22.0  # the beacon's effective radiated power: transmit power plus antenna gain, less cable loss
+    path_loss_exponent: float = 2.7  # 2 is free space; open ground with people about is nearer 2.5-3
+    min_radius_m: float = 25.0  # no estimate is drawn tighter than this
+    max_radius_m: float = 5000.0
+
+
+@dataclass(frozen=True)
+class WebConfig:
+    """beacon-web (docs/plan/web-map.md)."""
+
+    host: str = "127.0.0.1"  # serving the LAN is an explicit choice; the operator token then travels in clear over HTTP
+    port: int = 8080
+    tiles: str = ""  # a raster MBTiles file; a relative path is relative to the config file's directory. Empty: a plain grid
+    tiles_scheme: str = "auto"  # how the tiles file numbers its rows: "tms" (the MBTiles specification), "xyz", or "auto" (see tiles.py)
+    tiles_attribution: str = ""  # credit shown with the tiles file (HTML); empty uses the file's own `attribution` metadata
+    online_tile_attribution: str = ""  # credit shown with online tiles (HTML); empty is OpenStreetMap's for its own servers, else none
+    online_tile_url: str = ""  # development only: a {z}/{x}/{y} URL template used when there is no tiles file. Never set it in the field
+
+
+@dataclass(frozen=True)
 class ServiceConfig:
     """How beacon-ingest behaves as a long-running service."""
 
@@ -99,13 +124,23 @@ class Config:
     clock: ClockConfig = field(default_factory=ClockConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
     service: ServiceConfig = field(default_factory=ServiceConfig)
+    estimate: EstimateConfig = field(default_factory=EstimateConfig)
+    web: WebConfig = field(default_factory=WebConfig)
+    web_token: str | None = None  # the operator token for beacon-web, from secrets.toml or $BEACON_WEB_TOKEN
 
-    @property
-    def db_path(self) -> Path:
-        path = Path(self.database.path).expanduser()
+    def _relative(self, value: str) -> Path:
+        path = Path(value).expanduser()
         if path.is_absolute() or self.config_path is None:
             return path
         return self.config_path.parent / path
+
+    @property
+    def db_path(self) -> Path:
+        return self._relative(self.database.path)
+
+    @property
+    def tiles_path(self) -> Path | None:
+        return self._relative(self.web.tiles) if self.web.tiles else None
 
 
 def resolve_config_path(explicit: str | os.PathLike[str] | None) -> tuple[Path, bool]:
@@ -164,7 +199,7 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     elif required:
         raise ConfigError(f"config file not found: {path}")
 
-    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "remote", "service", "secrets_file"}
+    unknown = set(data) - {"companion", "radio", "database", "beacon", "clock", "remote", "service", "estimate", "web", "secrets_file"}
     if unknown:
         raise ConfigError(f"{path}: unknown section(s): {', '.join(sorted(unknown))}")
 
@@ -175,12 +210,28 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
     clock = _section(data, "clock", ClockConfig, path)
     remote = _section(data, "remote", RemoteConfig, path)
     service = _section(data, "service", ServiceConfig, path)
+    estimate = _section(data, "estimate", EstimateConfig, path)
+    web = _section(data, "web", WebConfig, path)
     if isinstance(service.watchdog_s, bool) or not isinstance(service.watchdog_s, (int, float)) or service.watchdog_s < 0:
         raise ConfigError("service.watchdog_s must be a number of seconds, 0 or more (0 is off)")
     if not 0 < remote.min_timeout_s <= remote.max_timeout_s or remote.timeout_factor <= 0 or remote.max_job_s <= 0 or remote.step_gap_s < 0:
         raise ConfigError(
             "remote: min_timeout_s must be positive and at most max_timeout_s, timeout_factor and max_job_s positive, step_gap_s not negative"
         )
+    for name in ("tx_power_dbm", "path_loss_exponent", "min_radius_m", "max_radius_m"):
+        value = getattr(estimate, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"estimate.{name} must be a number")
+    if estimate.path_loss_exponent <= 0 or not 0 < estimate.min_radius_m <= estimate.max_radius_m:
+        raise ConfigError("estimate: path_loss_exponent must be positive and min_radius_m positive and at most max_radius_m")
+    if not isinstance(web.host, str) or not web.host or isinstance(web.port, bool) or not isinstance(web.port, int) or not 1 <= web.port <= 65535:
+        raise ConfigError("web.host must be an address and web.port a port number (1-65535)")
+    if web.tiles_scheme not in ("auto", "tms", "xyz"):
+        raise ConfigError(f"web.tiles_scheme must be \"auto\", \"tms\" or \"xyz\", not {web.tiles_scheme!r}")
+    if not all(isinstance(v, str) for v in (web.tiles, web.tiles_attribution, web.online_tile_url, web.online_tile_attribution)):
+        raise ConfigError("web.tiles, web.tiles_attribution, web.online_tile_url and web.online_tile_attribution must be strings")
+    if web.online_tile_url and not all(part in web.online_tile_url for part in ("{z}", "{x}", "{y}")):
+        raise ConfigError("web.online_tile_url must contain {z}, {x} and {y}")
     if isinstance(radio.path_hash_mode, bool) or not isinstance(radio.path_hash_mode, int) or not 0 <= radio.path_hash_mode <= 2:
         raise ConfigError("radio.path_hash_mode must be 0, 1 or 2")
     if companion.dtr not in ("auto", "on", "off"):
@@ -195,12 +246,17 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         raise ConfigError("beacon.interval_s and beacon.silent_intervals must be positive and beacon.jitter in [0, 1)")
 
     spath = secrets_path_for(path, data)
-    key = None
+    key = token = None
     if spath.exists():
         secrets = _read_toml(spath)
         raw_key = secrets.get("channel", {}).get("key")
         if raw_key is not None:
             key = parse_channel_key(str(raw_key))
+        token = secrets.get("web", {}).get("token")
+    env_token = os.environ.get(WEB_TOKEN_ENV, "").strip()
+    token = env_token or (str(token).strip() if token else None) or None
+    if token is not None and len(token) < MIN_WEB_TOKEN_LEN:
+        raise ConfigError(f"the web token must be at least {MIN_WEB_TOKEN_LEN} characters; 'beaconctl web token generate' makes a good one")
     return Config(
         companion=companion,
         radio=radio,
@@ -212,6 +268,9 @@ def load_config(explicit_path: str | os.PathLike[str] | None = None) -> Config:
         clock=clock,
         remote=remote,
         service=service,
+        estimate=estimate,
+        web=web,
+        web_token=token,
     )
 
 
@@ -242,6 +301,18 @@ def write_secrets(path: Path, data: dict[str, dict[str, str]]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def store_web_token(cfg: Config, token: str, force: bool = False) -> Path:
+    """Save the operator token for beacon-web next to the channel key. Refuses to replace one unless force is set."""
+    if cfg.secrets_path is None:
+        raise ConfigError("no secrets path")
+    existing = _read_toml(cfg.secrets_path) if cfg.secrets_path.exists() else {}
+    if existing.get("web", {}).get("token") and not force:
+        raise ConfigError(f"a web token already exists in {cfg.secrets_path} (use --force to replace it)")
+    existing.setdefault("web", {})["token"] = token
+    write_secrets(cfg.secrets_path, existing)
+    return cfg.secrets_path
 
 
 def store_channel_key(cfg: Config, key: bytes, force: bool = False) -> Path:
