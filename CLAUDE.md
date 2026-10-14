@@ -16,7 +16,7 @@ from repeater adverts, plus discovery and auto-add). The remote repeater managem
 `beaconctl repeater remote` (get/set, clock sync, advert, reboot), and the hardware work (pacing, retries, advert diagnostics); used on the
 hardware with three repeaters in one room, so multi-hop paths are untested. B3 (packaging for a week-long event on a Pi Zero 2 W with no
 internet, in Docker: `docs/plan/service-packaging.md`, `docs/deployment.md`) is built and tested here (watchdog, `beaconctl health`, image, compose
-bundle, guide); only the run on the Pi (B3.4) is left. B4 (the map and API: `docs/plan/web-map.md`, `docs/web.md`) is built and tested on the branch `b4-web-map`
+bundle, guide) and was run on a Pi Zero 2 W through a reboot, power cuts, an unplug/replug and a clock correction; the watchdog has not fired there and the full week has not been run. B4 (the map and API: `docs/plan/web-map.md`, `docs/web.md`) is built and tested on the branch `b4-web-map`
 (estimator and `positions`, `beacon-web`, the token, MBTiles, the Leaflet page, `simulate --walk`); not yet in the Docker image, and not tried with real beacons on the hardware; making offline map tiles from a Geofabrik extract (`docs/map-tiles.md`) is verified, with `beacon-web` shown with no internet.** The plans are the source of truth:
 
 - [docs/plan/beacon-project.md](docs/plan/beacon-project.md): whole-project plan, decisions, security model, milestones.

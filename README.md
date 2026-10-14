@@ -14,7 +14,7 @@ rejects replayed or unknown beacons, and (later) estimates and maps where each b
 > three repeaters in one room; paths of more than zero hops have not been tested.
 > For the Raspberry Pi there is a Docker image and compose file (`deploy/docker/`; `build-bundle.sh` makes the folder to carry to a Pi with no
 > internet) and an operator guide, [docs/deployment.md](docs/deployment.md) (B3, [docs/plan/service-packaging.md](docs/plan/service-packaging.md)); the
-> Pi run itself (B3.4) is still to do.
+> run on a Pi Zero 2 W (through a reboot, power cuts, an unplug and replug and a clock correction) is recorded in the plan.
 > **The map and API (B4, branch `b4-web-map`) are built and tested here**: `beacon-web` serves a Leaflet map with local tiles, the repeaters, the beacons
 > with a placeholder position estimate, banners for a down ingest, an unset clock and locked-out beacons, and a token-protected Reset
 > ([docs/web.md](docs/web.md), [docs/plan/web-map.md](docs/plan/web-map.md)). Making its offline map tiles from a Geofabrik extract has been verified end to end ([docs/map-tiles.md](docs/map-tiles.md)). It is not in the
@@ -399,7 +399,7 @@ dropping the base's unscoped flood; see the plan for the fix (a default flood sc
 | B0 | Done. Firmware repo emits golden test vectors for the report format. |
 | B1 | Done and verified on hardware: wire decoder, serial framing, companion startup, `beaconctl listen`. |
 | B2 | Done and verified on hardware: SQLite store, allowlist, high-water mark, dedupe, reset, rejection health states, clock handling. |
-| B3 | Packaging for a week-long event on a Pi Zero 2 W: Docker image and compose bundle, watchdog, health check, operator guide. Done except the run on the Pi (B3.4). No retention or systemd install: each event starts a new database. |
+| B3 | Packaging for a week-long event on a Pi Zero 2 W: Docker image and compose bundle, watchdog, health check, operator guide. Done, and run on a Pi Zero 2 W. No retention or systemd install: each event starts a new database. |
 | B4 | Web API and minimal offline map (MBTiles). |
 | Also | Done and used on hardware: beacon names, repeater onboarding (positions and names from adverts, discovery, auto-add) and remote repeater management over the mesh. |
 

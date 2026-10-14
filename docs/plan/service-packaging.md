@@ -1,6 +1,6 @@
 # Service Hardening and Packaging Plan (B3)
 
-Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run): the steps passed and it ran healthy for 10 hours (2026-10-12); the full day was not waited for, and memory use could not be measured (see the results).** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
+Status: **review questions answered 2026-10-10; B3.1 (watchdog, `beaconctl health`, the clock message) is done; B3.2 (image and compose) is done and tested here; B3.3 (the guide) is done; B3.4 (the Pi run) is done (2026-10-14): the bundle was installed and run on the Pi Zero 2 W through a reboot, power cuts, a companion unplug and replug and a clock set forward by 40 hours, and was still healthy with the memory limit enforced and 10.7 MiB in use (see the results).** This is phase B3 of [beacon-base.md](beacon-base.md). The first draft assumed a
 long-lived systemd install with retention; the review changed that: the base runs for **a week-long event** and is set up afresh each time, the
 Pi has **no internet**, and a **Docker** deployment should be considered. The ingest heartbeat, listed under B3, was already built with the
 remote repeater work ([repeater-remote.md](repeater-remote.md)).
@@ -158,6 +158,19 @@ checks that the documents' relative links resolve, that the files and commands t
   cgroup_memory=1` to the single line in `/boot/firmware/cmdline.txt` (and remove `cgroup_disable=memory` if it is there) and reboot; this has **not** been tried
   on this Pi. Without it, the process's size is visible from the host with `ps -eo rss,args | grep beacon_base.service`, and `free -m` shows the Pi as a whole.
   The guide now says all of this.
+- **Longer run, after the memory cgroup was turned on (2026-10-14):** the setting above works on the Pi Zero 2 W: `docker stats` shows `10.7MiB / 256MiB`
+  (4.2%), so the container is far under the 256 MB limit and the limit is now enforced. CPU 0.9%, 3 processes, `./data` 5.2 MB (two beacons, three repeaters),
+  `healthy`, restart count 0, the companion connected with its last frame 6 s old, both beacons `ok` and heard by three repeaters. The log held the start-up
+  lines and one warning, **`system clock was set (+145346 s); corrected the time of 423 earlier observations`**: the clock had been behind after a power cut,
+  the operator set it forward by about 40 hours, ingest noticed the step by itself and repaired the provisional times, which is the designed behaviour seen on
+  the real hardware for the first time.
+- **Ages after a clock jump are skewed.** Docker's `Up 46 hours`, `beaconctl status`'s `started 2d ago` and `connected 2d ago` are computed from wall-clock times saved
+  before the jump, so they include it (here about 40 hours of the 46). They do not show continuous uptime. The monotonic clock does: `uptime` on the Pi, or
+  `cat /proc/uptime`. The restart count of 0 is also not proof of no restarts: after a Pi reboot Docker starts the container again without counting a policy
+  restart. The guide says both.
+- **Outcome.** The acceptance criterion holds as far as it was exercised: the base came back by itself after a reboot, power cuts and an unplug and replug of the
+  companion, the clock correction worked, the guide was enough to operate it, and memory is small. **Not exercised on the Pi:** the watchdog firing (it is tested
+  against the fakes; no hang occurred), a run of the full week, and multi-hop paths. B3 is complete.
 
 ## Review questions: answers (2026-10-10)
 
